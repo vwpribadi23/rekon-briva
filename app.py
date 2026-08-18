@@ -3,7 +3,7 @@ import pandas as pd
 import re
 import io
 
-# 1. JUDUL & DESKRIPSI BARU
+# 1. JUDUL & DESKRIPSI
 st.set_page_config(page_title="Rekonsiliasi Bank Fastpay", layout="wide")
 st.title("📊 Rekonsiliasi Bank Fastpay")
 st.write("Sistem otomatis mencocokkan data deposit internal dengan mutasi uang masuk di bank.")
@@ -29,7 +29,6 @@ if 'pilihan_bank_terakhir' not in st.session_state:
 # ==========================================
 st.subheader("1. Pengaturan Data")
 
-# Dropdown dengan pilihan default kosong
 opsi_bank = ["", "BRIVA", "BNIVA", "BCAVA", "MANDIRIVA", "BSIVA", "MuamalatVA"]
 pilihan_bank = st.selectbox("Pilih Bank Sumber Mutasi:", opsi_bank)
 
@@ -56,7 +55,7 @@ if pilihan_bank != "" and file_int and file_bnk:
     
     # Tombol Proses Utama
     if st.button(f"🚀 Mulai Croscek Data {pilihan_bank}", type="primary"):
-        st.session_state.sudah_diproses = True # Kunci state
+        st.session_state.sudah_diproses = True 
         
         # --- BLOK LOGIKA BRIVA ---
         if pilihan_bank == "BRIVA":
@@ -68,8 +67,7 @@ if pilihan_bank != "" and file_int and file_bnk:
                     df_int = pd.read_csv(file_int, sep=None, engine='python') if file_int.name.endswith('.csv') else pd.read_excel(file_int)
                     df_bnk = pd.read_csv(file_bnk, sep=None, engine='python') if file_bnk.name.endswith('.csv') else pd.read_excel(file_bnk)
 
-                    # A. Filter Status Internal (Sukses) & Bank (Uang Masuk)
-                    df_int_sukses = df_int[df_int['status'].astype(str).str.upper() == 'SUKSES'].copy()
+                    # A. Filter Bank (Uang Masuk / MUTASI_KREDIT > 0)
                     df_bnk['MUTASI_KREDIT_NUM'] = pd.to_numeric(df_bnk['MUTASI_KREDIT'], errors='coerce').fillna(0)
                     df_bnk_masuk = df_bnk[df_bnk['MUTASI_KREDIT_NUM'] > 0].copy()
 
@@ -79,11 +77,11 @@ if pilihan_bank != "" and file_int and file_bnk:
                         match = re.search(r'(57888\d{5,15})', str(text))
                         return match.group(1) if match else None
 
-                    df_int_sukses['BRIVA_CLEAN'] = df_int_sukses['keterangan'].apply(extract_fastpay)
+                    df_int['BRIVA_CLEAN'] = df_int['keterangan'].apply(extract_fastpay)
                     df_bnk_masuk['BRIVA_CLEAN'] = df_bnk_masuk['DESK_TRAN'].apply(extract_fastpay)
 
                     # Buang data yang tidak memiliki kode awalan 57888
-                    df_int_final = df_int_sukses[df_int_sukses['BRIVA_CLEAN'].notna()].copy()
+                    df_int_final = df_int[df_int['BRIVA_CLEAN'].notna()].copy()
                     df_bnk_final = df_bnk_masuk[df_bnk_masuk['BRIVA_CLEAN'].notna()].copy()
 
                     # C. Rumus Mutlak Penyesuaian Nominal (+ Rp1.000)
@@ -121,7 +119,7 @@ if pilihan_bank != "" and file_int and file_bnk:
                     st.session_state.df_selisih_bnk = pd.DataFrame(unmatched_bank)
                     
             except Exception as e:
-                st.error("Terjadi kesalahan saat memproses data. Pastikan format file sesuai dengan standar mutasi BRIVA.")
+                st.error(f"Terjadi kesalahan teknis: {e}")
                 st.session_state.sudah_diproses = False
                 
         # --- BLOK LOGIKA BANK LAIN ---
@@ -131,7 +129,7 @@ if pilihan_bank != "" and file_int and file_bnk:
 
 
     # ==========================================
-    # 4. TAMPILAN HASIL DI WEB (Muncul jika state = True)
+    # 4. TAMPILAN HASIL DI WEB
     # ==========================================
     if st.session_state.sudah_diproses:
         df_matched = st.session_state.df_matched
@@ -146,13 +144,12 @@ if pilihan_bank != "" and file_int and file_bnk:
         
         st.divider()
         
-        # TAMPILAN TABEL RINCIAN SELISIH
+        # TAMPILAN TABEL RINCIAN SELISIH LANGSUNG DI LAYAR
         col_tabel1, col_tabel2 = st.columns(2)
         
         with col_tabel1:
             st.markdown("#### 🚨 Rincian Issue FMSS")
             if not df_selisih_int.empty:
-                # Menampilkan hanya Kode VA dan Nominal Asli
                 df_tampil_int = df_selisih_int[['BRIVA_CLEAN', 'nominal']].rename(columns={'BRIVA_CLEAN': 'KODE VA', 'nominal': 'NOMINAL'})
                 st.dataframe(df_tampil_int, use_container_width=True, hide_index=True)
             else:
@@ -161,7 +158,6 @@ if pilihan_bank != "" and file_int and file_bnk:
         with col_tabel2:
             st.markdown("#### 🚨 Rincian Issue Bank")
             if not df_selisih_bnk.empty:
-                 # Menampilkan hanya Kode VA dan Nominal Asli Bank
                 df_tampil_bnk = df_selisih_bnk[['BRIVA_CLEAN', 'MUTASI_KREDIT_NUM']].rename(columns={'BRIVA_CLEAN': 'KODE VA', 'MUTASI_KREDIT_NUM': 'NOMINAL'})
                 st.dataframe(df_tampil_bnk, use_container_width=True, hide_index=True)
             else:
@@ -169,7 +165,7 @@ if pilihan_bank != "" and file_int and file_bnk:
                 
         st.divider()
         
-        # Membuat File Excel untuk Didownload (Tetap disediakan jika butuh)
+        # Tombol Download Excel Cadangan
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             if not df_selisih_int.empty:
