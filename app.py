@@ -14,19 +14,28 @@ st.divider()
 # 2. FITUR PEMILIH BANK & UPLOAD
 # ==========================================
 st.subheader("1. Pengaturan Data")
-pilihan_bank = st.selectbox("Pilih Bank Sumber Mutasi:", ["BRIVA", "BCA", "Mandiri", "BNI", "BSI", "Lainnya..."])
+
+# Dropdown dengan pilihan default kosong
+opsi_bank = ["", "BRIVA", "BNIVA", "BCAVA", "MANDIRIVA", "BSIVA", "MuamalatVA"]
+pilihan_bank = st.selectbox("Pilih Bank Sumber Mutasi:", opsi_bank)
 
 st.subheader("2. Unggah File")
 col1, col2 = st.columns(2)
+
 with col1:
-    file_int = st.file_uploader("Unggah CSV Panel Internal (Status Sukses)", type=['csv', 'xlsx'], key='int')
+    # Label diubah menjadi FMSS
+    file_int = st.file_uploader("Unggah CSV Dari FMSS", type=['csv', 'xlsx'], key='int')
+    
 with col2:
-    file_bnk = st.file_uploader(f"Unggah CSV Mutasi Bank ({pilihan_bank})", type=['csv', 'xlsx'], key='bnk')
+    # Label dinamis menyesuaikan pilihan dropdown
+    label_bank = f"Unggah CSV Mutasi Bank ({pilihan_bank})" if pilihan_bank != "" else "Unggah CSV Mutasi Bank"
+    file_bnk = st.file_uploader(label_bank, type=['csv', 'xlsx'], key='bnk')
 
 # ==========================================
 # 3. LOGIKA CROSCEK BERDASARKAN BANK
 # ==========================================
-if file_int and file_bnk:
+# Sistem baru akan merespons jika bank sudah dipilih dan kedua file diunggah
+if pilihan_bank != "" and file_int and file_bnk:
     st.divider()
     
     if st.button(f"🚀 Mulai Croscek Data {pilihan_bank}", type="primary"):
@@ -94,16 +103,16 @@ if file_int and file_bnk:
                     st.subheader("🎯 Ringkasan Rekonsiliasi BRIVA")
                     m1, m2, m3 = st.columns(3)
                     m1.metric("✅ Matched Sempurna", f"{len(df_matched)} Trx")
-                    m2.metric("⚠️ Issue Internal", f"{len(df_selisih_int)} Trx")
+                    m2.metric("⚠️ Issue FMSS", f"{len(df_selisih_int)} Trx")
                     m3.metric("⚠️ Issue Bank", f"{len(df_selisih_bnk)} Trx")
                     
                     # Membuat File Excel untuk Didownload
                     output = io.BytesIO()
                     with pd.ExcelWriter(output, engine='openpyxl') as writer:
                         if not df_selisih_int.empty:
-                            df_selisih_int.drop(columns=['NOMINAL_INT_ADJ'], errors='ignore').to_excel(writer, sheet_name='ISSUE_INTERNAL', index=False)
+                            df_selisih_int.drop(columns=['NOMINAL_INT_ADJ'], errors='ignore').to_excel(writer, sheet_name='ISSUE_FMSS', index=False)
                         else:
-                            pd.DataFrame({'Info': ['Bersih! Tidak ada selisih di Internal']}).to_excel(writer, sheet_name='ISSUE_INTERNAL', index=False)
+                            pd.DataFrame({'Info': ['Bersih! Tidak ada selisih di FMSS']}).to_excel(writer, sheet_name='ISSUE_FMSS', index=False)
                         
                         if not df_selisih_bnk.empty:
                             df_selisih_bnk.drop(columns=['MUTASI_KREDIT_NUM'], errors='ignore').to_excel(writer, sheet_name='ISSUE_BANK', index=False)
@@ -125,9 +134,12 @@ if file_int and file_bnk:
                         type="primary"
                     )
             except Exception as e:
-                st.error(f"Terjadi kesalahan saat memproses data. Pastikan format file sesuai dengan standar mutasi BRIVA.")
+                st.error("Terjadi kesalahan saat memproses data. Pastikan format file sesuai dengan standar mutasi BRIVA.")
                 
-        # --- BLOK LOGIKA BANK LAIN (BELUM DISEPAKATI) ---
+        # --- BLOK LOGIKA BANK LAIN ---
         else:
             st.warning(f"🚧 Modul rekonsiliasi untuk bank **{pilihan_bank}** sedang dalam tahap persiapan.")
             st.info("Karena setiap bank memiliki nama kolom, tata letak, dan aturan admin yang berbeda-beda, kita perlu membedah dan menyepakati aturan bakunya terlebih dahulu seperti yang kita lakukan pada BRIVA.")
+
+elif pilihan_bank == "" and (file_int or file_bnk):
+    st.info("💡 Silakan pilih **Bank Sumber Mutasi** terlebih dahulu pada dropdown di atas.")
