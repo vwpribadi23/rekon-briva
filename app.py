@@ -1,4 +1,4 @@
-import streamlit as st
+# VERSION: v4 FINAL - BNIVA robust VA parser + pre-match diagnostics\nimport streamlit as st
 import pandas as pd
 import re
 import io
@@ -191,21 +191,39 @@ def extract_va(text):
 
 def extract_bniva_va(text):
     """
-    STRICT BNIVA VA.
+    BNIVA VA parser yang toleran terhadap format Description bank.
 
-    Berdasarkan cross-check file BNIVA aktual:
-        988765 + 10 digit
-        total = 16 digit
+    Baseline BNIVA:
+        prefix 988765 + 10 digit = 16 digit VA.
 
-    Jangan mengambil digit tambahan setelah VA.
+    Kenapa tidak memakai (?!\\d)?
+    Karena Description bank kadang menempelkan angka lain setelah VA.
+    Negative lookahead membuat VA valid ikut dianggap INVALID.
+
+    Urutan:
+    1. Cari 988765 + 10 digit dengan kemungkinan separator.
+    2. Jika format tidak persis seperti itu, fallback ke 988765 + 5-15 digit.
     """
     if pd.isna(text):
         return None
 
     text = str(text)
 
+    # Format utama: 988765 + 10 digit.
+    # Separator umum di Description: spasi, -, atau titik.
     match = re.search(
-        r"(?<!\d)(988765\d{10})(?!\d)",
+        r"(?<!\d)(988765[\\s\\-\\.]?\\d{10})",
+        text
+    )
+
+    if match:
+        va = re.sub(r"\\D", "", match.group(1))
+        if len(va) == 16 and va.startswith("988765"):
+            return va
+
+    # Fallback untuk format Description yang tidak standar.
+    match = re.search(
+        r"(988765\\d{5,15})",
         text
     )
 
@@ -855,6 +873,80 @@ if can_process:
                 df_bank_valid = df_bank[
                     df_bank["KODE_VA"].notna()
                 ].copy()
+
+                # ====================================================
+                # PRE-MATCH VALIDATION / DIAGNOSTIC
+                # ====================================================
+                # Jangan biarkan engine menghasilkan 0 match tanpa
+                # mengetahui apakah masalahnya ada di VA parser atau
+                # nominal. Ini hanya observability; tidak mengubah
+                # aturan matching.
+                if pilihan_bank == "BNIVA":
+                    fmss_key_count = (
+                        df_int_valid[
+                            ["KODE_VA", "EXPECTED_BANK"]
+                        ]
+                        .dropna()
+                        .drop_duplicates()
+                        .shape[0]
+                    )
+
+                    bank_key_count = (
+                        df_bank_valid[
+                            ["KODE_VA", "_CREDIT_NUM"]
+                        ]
+                        .dropna()
+                        .drop_duplicates()
+                        .shape[0]
+                    )
+
+                    common_va = len(
+                        set(
+                            df_int_valid["KODE_VA"]
+                            .astype(str)
+                            .str.strip()
+                        )
+                        &
+                        set(
+                            df_bank_valid["KODE_VA"]
+                            .astype(str)
+                            .str.strip()
+                        )
+                    )
+
+                    common_key = len(
+                        set(
+                            zip(
+                                df_int_valid["KODE_VA"].astype(str).str.strip(),
+                                df_int_valid["EXPECTED_BANK"].round().astype("int64")
+                            )
+                        )
+                        &
+                        set(
+                            zip(
+                                df_bank_valid["KODE_VA"].astype(str).str.strip(),
+                                df_bank_valid["_CREDIT_NUM"].round().astype("int64")
+                            )
+                        )
+                    )
+
+                    if common_va == 0:
+                        st.error(
+                            "❌ BNIVA: tidak ada VA yang overlap antara FMSS dan Bank. "
+                            "Masalah ada di ekstraksi VA/format Description, bukan matching nominal."
+                        )
+                    elif common_key == 0:
+                        st.warning(
+                            f"⚠️ BNIVA: {common_va:,} VA overlap, tetapi belum ada "
+                            "kombinasi VA + nominal yang sama. Periksa nominal/fee."
+                        )
+                    else:
+                        st.info(
+                            f"🔎 BNIVA pre-check: FMSS key {fmss_key_count:,} | "
+                            f"Bank key {bank_key_count:,} | "
+                            f"VA overlap {common_va:,} | "
+                            f"Exact key overlap {common_key:,}"
+                        )
 
                 # ====================================================
                 # FAST 1-TO-1 MATCHING
