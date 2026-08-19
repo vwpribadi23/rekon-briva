@@ -1,4 +1,4 @@
-# VERSION: v6 - BNIVA regex fixed (single escaping) + VA normalization\nimport streamlit as st
+import streamlit as st
 import pandas as pd
 import re
 import io
@@ -63,17 +63,12 @@ def find_column(df, candidates, required=True):
             return candidate
 
     mapping = {
-        re.sub(r"\\s+", " ", str(col).replace("\\ufeff", "").strip()).lower(): col
+        str(col).strip().lower(): col
         for col in df.columns
     }
 
     for candidate in candidates:
-        key = re.sub(
-            r"\\s+",
-            " ",
-            str(candidate).replace("\\ufeff", "").strip()
-        ).lower()
-
+        key = str(candidate).strip().lower()
         if key in mapping:
             return mapping[key]
 
@@ -99,12 +94,11 @@ def read_uploaded_file_cached(file_bytes, filename):
                 low_memory=False
             )
         except Exception:
-            # Python engine TIDAK mendukung low_memory.
-            # Jangan kirim parameter tersebut ke fallback.
             return pd.read_csv(
                 io.BytesIO(file_bytes),
                 sep=None,
-                engine="python"
+                engine="python",
+                low_memory=False
             )
 
     if filename_lower.endswith(".xlsx"):
@@ -191,34 +185,21 @@ def extract_va(text):
 
 def extract_bniva_va(text):
     """
-    BNIVA VA parser.
+    STRICT BNIVA VA.
 
-    Format utama BNIVA:
+    Berdasarkan cross-check file BNIVA aktual:
         988765 + 10 digit
+        total = 16 digit
 
-    Parser dibuat toleran terhadap separator/spasi di Description,
-    tetapi hasil KODE_VA selalu dinormalisasi menjadi digit saja.
+    Jangan mengambil digit tambahan setelah VA.
     """
     if pd.isna(text):
         return None
 
     text = str(text)
 
-    # 1) Format utama: 988765 + 10 digit.
-    #    Separator opsional: spasi, -, atau titik.
     match = re.search(
-        r"(?<!\d)(988765[\s\-\.]?\d{10})",
-        text
-    )
-
-    if match:
-        va = re.sub(r"\D", "", match.group(1))
-        if len(va) == 16 and va.startswith("988765"):
-            return va
-
-    # 2) Fallback untuk format Description yang menempel.
-    match = re.search(
-        r"(988765\d{5,15})",
+        r"(?<!\d)(988765\d{10})(?!\d)",
         text
     )
 
@@ -632,17 +613,6 @@ if can_process:
                         .apply(extract_va)
                     )
 
-                # Final normalization: VA selalu string digit tanpa separator.
-                df_int_sukses["KODE_VA"] = (
-                    df_int_sukses["KODE_VA"]
-                    .astype("string")
-                    .str.replace(r"\D", "", regex=True)
-                )
-                df_int_sukses.loc[
-                    df_int_sukses["KODE_VA"].eq(""),
-                    "KODE_VA"
-                ] = None
-
                 df_int_sukses["JENIS_VA"] = (
                     df_int_sukses["KODE_VA"]
                     .apply(classify_va)
@@ -713,41 +683,13 @@ if can_process:
                 ):
                     df = read_uploaded_file(uploaded_file).copy()
 
-                    # Bersihkan BOM / whitespace pada header tanpa
-                    # mengubah isi transaksi.
-                    df.columns = [
-                        str(col).replace("\\ufeff", "").strip()
-                        for col in df.columns
-                    ]
-
-                    # ------------------------------------------------
-                    # BANK COLUMN MAPPING
-                    # ------------------------------------------------
-                    # BNIVA actual file menggunakan:
-                    #   Post Date | Value Date | Branch | Journal No.
-                    #   Description | Debit | Credit | Unnamed: 7
-                    #
-                    # BRIVA existing file umumnya menggunakan:
-                    #   MUTASI_KREDIT / KREDIT
-                    #   DESK_TRAN / KETERANGAN
-                    #   TGL_TRAN / TANGGAL
-                    #
-                    # Karena engine dipakai bersama BNIVA + BRIVA,
-                    # mapping dibuat fleksibel tanpa mengubah logika
-                    # matching sama sekali.
-
                     col_credit = find_column(
                         df,
                         [
                             "MUTASI_KREDIT",
                             "mutasi_kredit",
                             "KREDIT",
-                            "kredit",
-                            "Credit",
-                            "CREDIT",
-                            "credit",
-                            "Credit Amount",
-                            "CREDIT_AMOUNT"
+                            "kredit"
                         ]
                     )
 
@@ -759,11 +701,7 @@ if can_process:
                             "KETERANGAN",
                             "keterangan",
                             "DESCRIPTION",
-                            "description",
-                            "Description",
-                            "DESCRIPTION_TRAN",
-                            "Detail",
-                            "DETAIL"
+                            "description"
                         ]
                     )
 
@@ -777,13 +715,7 @@ if can_process:
                             "TANGGAL",
                             "tanggal",
                             "POSTING_DATE",
-                            "posting_date",
-                            "Post Date",
-                            "POST DATE",
-                            "post date",
-                            "Value Date",
-                            "VALUE DATE",
-                            "value date"
+                            "posting_date"
                         ]
                     )
 
@@ -813,17 +745,6 @@ if can_process:
                         df[col_desc]
                         .apply(va_parser)
                     )
-
-                    # Final normalization: VA selalu string digit.
-                    df["KODE_VA"] = (
-                        df["KODE_VA"]
-                        .astype("string")
-                        .str.replace(r"\D", "", regex=True)
-                    )
-                    df.loc[
-                        df["KODE_VA"].eq(""),
-                        "KODE_VA"
-                    ] = None
 
                     df["JENIS_VA"] = (
                         df["KODE_VA"]
@@ -890,84 +811,6 @@ if can_process:
                 df_bank_valid = df_bank[
                     df_bank["KODE_VA"].notna()
                 ].copy()
-
-                # ====================================================
-                # PRE-MATCH VALIDATION / DIAGNOSTIC
-                # ====================================================
-                # Jangan biarkan engine menghasilkan 0 match tanpa
-                # mengetahui apakah masalahnya ada di VA parser atau
-                # nominal. Ini hanya observability; tidak mengubah
-                # aturan matching.
-                if pilihan_bank == "BNIVA":
-                    fmss_key_count = (
-                        df_int_valid[
-                            ["KODE_VA", "EXPECTED_BANK"]
-                        ]
-                        .dropna()
-                        .drop_duplicates()
-                        .shape[0]
-                    )
-
-                    bank_key_count = (
-                        df_bank_valid[
-                            ["KODE_VA", "_CREDIT_NUM"]
-                        ]
-                        .dropna()
-                        .drop_duplicates()
-                        .shape[0]
-                    )
-
-                    common_va = len(
-                        set(
-                            df_int_valid["KODE_VA"]
-                            .astype(str)
-                            .str.strip()
-                        )
-                        &
-                        set(
-                            df_bank_valid["KODE_VA"]
-                            .astype(str)
-                            .str.strip()
-                        )
-                    )
-
-                    common_key = len(
-                        set(
-                            zip(
-                                df_int_valid["KODE_VA"].astype(str).str.strip(),
-                                df_int_valid["EXPECTED_BANK"].round().astype("int64")
-                            )
-                        )
-                        &
-                        set(
-                            zip(
-                                df_bank_valid["KODE_VA"].astype(str).str.strip(),
-                                df_bank_valid["_CREDIT_NUM"].round().astype("int64")
-                            )
-                        )
-                    )
-
-                    if common_va == 0:
-                        st.error(
-                            "❌ BNIVA: tidak ada VA yang overlap antara FMSS dan Bank. "
-                            "Masalah ada di ekstraksi VA/format Description, bukan matching nominal."
-                        )
-                        st.caption(
-                            f"VA valid FMSS: {df_int_valid['KODE_VA'].notna().sum():,} | "
-                            f"VA valid Bank: {df_bank_valid['KODE_VA'].notna().sum():,}"
-                        )
-                    elif common_key == 0:
-                        st.warning(
-                            f"⚠️ BNIVA: {common_va:,} VA overlap, tetapi belum ada "
-                            "kombinasi VA + nominal yang sama. Periksa nominal/fee."
-                        )
-                    else:
-                        st.info(
-                            f"🔎 BNIVA pre-check: FMSS key {fmss_key_count:,} | "
-                            f"Bank key {bank_key_count:,} | "
-                            f"VA overlap {common_va:,} | "
-                            f"Exact key overlap {common_key:,}"
-                        )
 
                 # ====================================================
                 # FAST 1-TO-1 MATCHING
