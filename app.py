@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import re
 import io
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict, deque
 
 
@@ -326,6 +326,1013 @@ def classify_va_series(series):
     result.loc[mask_57708] = "BRIVA RAJABILLER"
 
     return result
+
+
+# ============================================================
+# BNIVA ENGINE
+# ============================================================
+#
+# PENTING:
+# - Seluruh fungsi BRIVA di atas dan fast_match() lama di bawah
+#   tetap dipertahankan.
+# - BNIVA menggunakan engine terpisah agar tidak mengubah logic BRIVA.
+# - Rule utama BNIVA:
+#       FMSS reff_number 6 digit terakhir == Journal No. Bank
+#       KODE_VA sama
+#       NOMINAL FMSS == CREDIT Bank
+# - Window pencarian bank: D-1 / D / D+1.
+# - Fallback hanya VA + nominal yang UNIQUE setelah strong match selesai.
+# ============================================================
+
+BNIVA_VA_REGEX = r"(?<!\d)(98876\d{11})(?!\d)"
+BNIVA_REFF_REGEX = r"(?i)reff[_\s-]*number\s*=\s*(\d+)"
+
+
+def extract_bniva_va_series(series):
+    """
+    Ekstrak VA BNIVA.
+
+    Rule yang sudah tervalidasi pada sampel:
+        - prefix 98876
+        - panjang 16 digit
+    """
+
+    result = (
+        series.astype("string")
+        .str.extract(
+            BNIVA_VA_REGEX,
+            expand=False
+        )
+    )
+
+    return result.where(
+        result.notna(),
+        None
+    )
+
+
+def classify_bniva_va_series(series):
+
+    result = pd.Series(
+        "INVALID VA",
+        index=series.index,
+        dtype="object"
+    )
+
+    mask_bniva = (
+        series.astype("string")
+        .str.fullmatch(
+            r"98876\d{11}",
+            na=False
+        )
+    )
+
+    result.loc[mask_bniva] = "BNIVA"
+
+    return result
+
+
+def extract_bniva_fmss_journal_series(series):
+    """
+    Mengambil reff_number dari keterangan FMSS,
+    lalu menggunakan 6 digit terakhir sebagai FMSS_JOURNAL.
+
+    Contoh:
+        reff_number = 202608182359956872
+        FMSS_JOURNAL = 956872
+    """
+
+    raw_reff = (
+        series.astype("string")
+        .str.extract(
+            BNIVA_REFF_REGEX,
+            expand=False
+        )
+    )
+
+    journal = (
+        raw_reff.astype("string")
+        .str[-6:]
+    )
+
+    valid_mask = (
+        raw_reff.notna()
+        & raw_reff.astype("string").str.len().ge(6)
+    )
+
+    return journal.where(
+        valid_mask,
+        None
+    )
+
+
+def normalize_bniva_journal_value(value):
+    """
+    Normalisasi Journal No. bank menjadi string 6 digit.
+
+    Contoh:
+        956872   -> "956872"
+        12345    -> "012345"
+        956872.0 -> "956872"
+    """
+
+    if pd.isna(value):
+        return None
+
+    text = str(value).strip()
+
+    if text == "":
+        return None
+
+    # Jika dibaca sebagai float, hilangkan .0 di belakang.
+    if re.fullmatch(r"\d+\.0+", text):
+        text = text.split(".", 1)[0]
+
+    digits = re.sub(
+        r"\D",
+        "",
+        text
+    )
+
+    if digits == "":
+        return None
+
+    if len(digits) < 6:
+        digits = digits.zfill(6)
+
+    elif len(digits) > 6:
+        digits = digits[-6:]
+
+    return digits
+
+
+def normalize_bniva_journal_series(series):
+
+    return series.apply(
+        normalize_bniva_journal_value
+    )
+
+
+def parse_bniva_datetime(series):
+    """
+    Parser khusus format tanggal BNIVA.
+
+    Format sampel:
+        17/08/26 23.15.48
+    """
+
+    if pd.api.types.is_datetime64_any_dtype(series):
+
+        return pd.to_datetime(
+            series,
+            errors="coerce"
+        )
+
+    text = (
+        series.astype("string")
+        .str.strip()
+    )
+
+    parsed = pd.to_datetime(
+        text,
+        format="%d/%m/%y %H.%M.%S",
+        errors="coerce"
+    )
+
+    # Fallback jika export BNI di kemudian hari berubah
+    # menjadi format tanggal yang lebih standar.
+    mask_fallback = parsed.isna()
+
+    if mask_fallback.any():
+
+        parsed_fallback = pd.to_datetime(
+            text[mask_fallback],
+            errors="coerce",
+            dayfirst=True
+        )
+
+        parsed.loc[mask_fallback] = (
+            parsed_fallback
+        )
+
+    return parsed
+
+
+def build_bniva_search_dates(recon_dates):
+    """
+    Membentuk search window D-1 / D / D+1
+    untuk setiap tanggal FMSS yang direkonsiliasi.
+    """
+
+    search_dates = set()
+
+    for recon_date in recon_dates:
+
+        date_value = pd.to_datetime(
+            recon_date
+        ).date()
+
+        search_dates.add(
+            date_value - timedelta(days=1)
+        )
+
+        search_dates.add(
+            date_value
+        )
+
+        search_dates.add(
+            date_value + timedelta(days=1)
+        )
+
+    return search_dates
+
+
+def prepare_bniva_bank_dataframe(
+    uploaded_file,
+    recon_dates,
+    source_bank="BNIVA"
+):
+    """
+    Load dan normalisasi mutasi BNIVA.
+
+    Search pool:
+        tanggal FMSS D-1 / D / D+1
+
+    Hanya credit > 0 yang diproses.
+
+    Transaksi valid neighbor date tetap dipakai sebagai search pool.
+    Transaksi tanpa VA pada neighbor date tidak ikut menambah Invalid VA
+    rekonsiliasi tanggal target.
+    """
+
+    df = read_uploaded_file(
+        uploaded_file
+    )
+
+    col_credit = find_column(
+        df,
+        [
+            "Credit",
+            "CREDIT",
+            "credit",
+            "KREDIT",
+            "kredit",
+            "MUTASI_KREDIT",
+            "mutasi_kredit"
+        ]
+    )
+
+    col_desc = find_column(
+        df,
+        [
+            "Description",
+            "DESCRIPTION",
+            "description",
+            "KETERANGAN",
+            "keterangan",
+            "DESK_TRAN",
+            "desk_tran"
+        ]
+    )
+
+    col_date = find_column(
+        df,
+        [
+            "Post Date",
+            "POST DATE",
+            "post date",
+            "POST_DATE",
+            "post_date",
+            "TANGGAL",
+            "tanggal",
+            "TGL_TRAN",
+            "tgl_tran"
+        ]
+    )
+
+    col_journal = find_column(
+        df,
+        [
+            "Journal No.",
+            "JOURNAL NO.",
+            "Journal No",
+            "JOURNAL NO",
+            "JOURNAL_NO",
+            "journal_no",
+            "JOURNAL",
+            "journal"
+        ]
+    )
+
+    df = df.copy()
+
+    # --------------------------------------------------------
+    # DATE
+    # --------------------------------------------------------
+
+    df["_TANGGAL_DT"] = (
+        parse_bniva_datetime(
+            df[col_date]
+        )
+    )
+
+    df["_TANGGAL_ONLY_DATE"] = (
+        df["_TANGGAL_DT"]
+        .dt.date
+    )
+
+    # --------------------------------------------------------
+    # CREDIT
+    # --------------------------------------------------------
+
+    df["_CREDIT_NUM"] = (
+        clean_numeric(
+            df[col_credit]
+        )
+    )
+
+    # --------------------------------------------------------
+    # SEARCH WINDOW D-1 / D / D+1
+    # --------------------------------------------------------
+
+    search_dates = (
+        build_bniva_search_dates(
+            recon_dates
+        )
+    )
+
+    target_dates = {
+        pd.to_datetime(d).date()
+        for d in recon_dates
+    }
+
+    df = df[
+        df["_TANGGAL_ONLY_DATE"]
+        .isin(search_dates)
+    ].copy()
+
+    # --------------------------------------------------------
+    # HANYA UANG MASUK
+    # --------------------------------------------------------
+
+    df = df[
+        df["_CREDIT_NUM"] > 0
+    ].copy()
+
+    # --------------------------------------------------------
+    # VA
+    # --------------------------------------------------------
+
+    df["KODE_VA"] = (
+        extract_bniva_va_series(
+            df[col_desc]
+        )
+    )
+
+    df["JENIS_VA"] = (
+        classify_bniva_va_series(
+            df["KODE_VA"]
+        )
+    )
+
+    # Neighbor date hanya diperlukan sebagai search pool jika VA valid.
+    # Invalid VA tetap disimpan jika terjadi pada tanggal target D.
+    mask_valid_va = (
+        df["KODE_VA"].notna()
+    )
+
+    mask_target_date = (
+        df["_TANGGAL_ONLY_DATE"]
+        .isin(target_dates)
+    )
+
+    df = df[
+        mask_valid_va
+        | mask_target_date
+    ].copy()
+
+    # --------------------------------------------------------
+    # JOURNAL
+    # --------------------------------------------------------
+
+    df["BANK_JOURNAL"] = (
+        normalize_bniva_journal_series(
+            df[col_journal]
+        )
+    )
+
+    # --------------------------------------------------------
+    # BANK TYPE / SOURCE / DESCRIPTION
+    # --------------------------------------------------------
+
+    df["_BANK_TYPE"] = "BNIVA"
+    df["SOURCE_BANK"] = source_bank
+
+    df["_DESC_VALUE"] = (
+        df[col_desc]
+        .astype(str)
+    )
+
+    return df
+
+
+def get_bniva_date_relation(
+    int_row,
+    bank_row
+):
+    """
+    Label relasi tanggal pasangan BNIVA.
+    """
+
+    try:
+
+        fmss_date = pd.to_datetime(
+            int_row.get("_TANGGAL_DT")
+        ).date()
+
+        bank_date = pd.to_datetime(
+            bank_row.get("_TANGGAL_DT")
+        ).date()
+
+        delta_days = (
+            bank_date - fmss_date
+        ).days
+
+    except Exception:
+
+        return "UNKNOWN"
+
+    if delta_days == -1:
+        return "H-1 RETRY"
+
+    if delta_days == 0:
+        return "SAME DAY"
+
+    if delta_days == 1:
+        return "H+1 CUTOFF"
+
+    return f"{delta_days:+d} DAY"
+
+
+def fast_match_bniva(
+    df_int_valid,
+    df_bank_valid,
+    recon_dates
+):
+    """
+    Matching khusus BNIVA.
+
+    PRIORITAS 1 - STRONG MATCH
+        FMSS_JOURNAL == BANK_JOURNAL
+        KODE_VA sama
+        EXPECTED_BANK == CREDIT bank
+
+    PRIORITAS 2 - FALLBACK
+        KODE_VA sama
+        EXPECTED_BANK == CREDIT bank
+        dan pasangan harus UNIQUE pada remaining rows.
+
+    Matching selalu 1-to-1.
+
+    Bank D-1 dan D+1 digunakan sebagai search pool untuk FMSS D,
+    tetapi unmatched neighbor date tidak dihitung sebagai Issue Bank D.
+    """
+
+    int_records = (
+        df_int_valid
+        .to_dict("records")
+    )
+
+    bank_records = (
+        df_bank_valid
+        .to_dict("records")
+    )
+
+    matched = []
+    unmatched_internal = []
+    unmatched_bank = []
+
+    matched_int_indexes = set()
+    matched_bank_indexes = set()
+
+    # Jika strong key atau fallback key tidak unik,
+    # record diblok dari auto matching agar tidak salah pairing.
+    blocked_int_indexes = set()
+    blocked_bank_indexes = set()
+
+    # --------------------------------------------------------
+    # HELPER ADD MATCH
+    # --------------------------------------------------------
+
+    def add_match(
+        int_idx,
+        bank_idx,
+        match_method,
+        match_confidence
+    ):
+
+        int_row = int_records[int_idx]
+        bank_row = bank_records[bank_idx]
+
+        record = int_row.copy()
+
+        record["MATCH_MUTASI_KREDIT"] = (
+            bank_row.get(
+                "_CREDIT_NUM",
+                0
+            )
+        )
+
+        record["MATCH_DESK_TRAN"] = (
+            bank_row.get(
+                "_DESC_VALUE",
+                ""
+            )
+        )
+
+        record["SOURCE_BANK"] = (
+            bank_row.get(
+                "SOURCE_BANK",
+                "BNIVA"
+            )
+        )
+
+        record["BANK_TYPE"] = (
+            bank_row.get(
+                "_BANK_TYPE",
+                "BNIVA"
+            )
+        )
+
+        record["BANK_JOURNAL"] = (
+            bank_row.get(
+                "BANK_JOURNAL"
+            )
+        )
+
+        record["MATCH_BANK_DATE"] = (
+            bank_row.get(
+                "_TANGGAL_DT"
+            )
+        )
+
+        record["MATCH_METHOD"] = (
+            match_method
+        )
+
+        record["MATCH_CONFIDENCE"] = (
+            match_confidence
+        )
+
+        record["DATE_RELATION"] = (
+            get_bniva_date_relation(
+                int_row,
+                bank_row
+            )
+        )
+
+        # Tetap menggunakan status MATCHED agar
+        # engine dashboard umum tidak perlu berubah.
+        record["STATUS_MATCH"] = (
+            "MATCHED"
+        )
+
+        matched.append(
+            record
+        )
+
+        matched_int_indexes.add(
+            int_idx
+        )
+
+        matched_bank_indexes.add(
+            bank_idx
+        )
+
+    # ========================================================
+    # LEVEL A - STRONG MATCH
+    # Journal + VA + Nominal
+    # ========================================================
+
+    int_strong_index = defaultdict(list)
+    bank_strong_index = defaultdict(list)
+
+    for int_idx, int_row in enumerate(
+        int_records
+    ):
+
+        journal = int_row.get(
+            "FMSS_JOURNAL"
+        )
+
+        if (
+            journal is None
+            or str(journal).strip() == ""
+        ):
+            continue
+
+        key = (
+            str(journal),
+            str(int_row.get("KODE_VA")),
+            float(
+                int_row.get(
+                    "EXPECTED_BANK",
+                    0
+                )
+            )
+        )
+
+        int_strong_index[key].append(
+            int_idx
+        )
+
+    for bank_idx, bank_row in enumerate(
+        bank_records
+    ):
+
+        journal = bank_row.get(
+            "BANK_JOURNAL"
+        )
+
+        if (
+            journal is None
+            or str(journal).strip() == ""
+        ):
+            continue
+
+        key = (
+            str(journal),
+            str(bank_row.get("KODE_VA")),
+            float(
+                bank_row.get(
+                    "_CREDIT_NUM",
+                    0
+                )
+            )
+        )
+
+        bank_strong_index[key].append(
+            bank_idx
+        )
+
+    for key, int_indexes in (
+        int_strong_index.items()
+    ):
+
+        bank_indexes = (
+            bank_strong_index.get(
+                key,
+                []
+            )
+        )
+
+        # Auto match hanya jika kedua sisi unique.
+        if (
+            len(int_indexes) == 1
+            and len(bank_indexes) == 1
+        ):
+
+            add_match(
+                int_indexes[0],
+                bank_indexes[0],
+                "JOURNAL_VA_NOMINAL",
+                "STRONG"
+            )
+
+        # Exact strong key tetapi duplicate/ambigu.
+        elif len(bank_indexes) > 0:
+
+            blocked_int_indexes.update(
+                int_indexes
+            )
+
+            blocked_bank_indexes.update(
+                bank_indexes
+            )
+
+    # ========================================================
+    # LEVEL B - FALLBACK MATCH
+    # VA + Nominal harus UNIQUE pada remaining rows
+    # ========================================================
+
+    int_fallback_index = defaultdict(list)
+    bank_fallback_index = defaultdict(list)
+
+    for int_idx, int_row in enumerate(
+        int_records
+    ):
+
+        if int_idx in matched_int_indexes:
+            continue
+
+        if int_idx in blocked_int_indexes:
+            continue
+
+        key = (
+            str(int_row.get("KODE_VA")),
+            float(
+                int_row.get(
+                    "EXPECTED_BANK",
+                    0
+                )
+            )
+        )
+
+        int_fallback_index[key].append(
+            int_idx
+        )
+
+    for bank_idx, bank_row in enumerate(
+        bank_records
+    ):
+
+        if bank_idx in matched_bank_indexes:
+            continue
+
+        if bank_idx in blocked_bank_indexes:
+            continue
+
+        key = (
+            str(bank_row.get("KODE_VA")),
+            float(
+                bank_row.get(
+                    "_CREDIT_NUM",
+                    0
+                )
+            )
+        )
+
+        bank_fallback_index[key].append(
+            bank_idx
+        )
+
+    for key, int_indexes in (
+        int_fallback_index.items()
+    ):
+
+        bank_indexes = (
+            bank_fallback_index.get(
+                key,
+                []
+            )
+        )
+
+        if (
+            len(int_indexes) == 1
+            and len(bank_indexes) == 1
+        ):
+
+            add_match(
+                int_indexes[0],
+                bank_indexes[0],
+                "VA_NOMINAL_UNIQUE",
+                "FALLBACK"
+            )
+
+        elif len(bank_indexes) > 0:
+
+            blocked_int_indexes.update(
+                int_indexes
+            )
+
+            blocked_bank_indexes.update(
+                bank_indexes
+            )
+
+    # ========================================================
+    # FMSS YANG BELUM MATCH
+    # ========================================================
+
+    for int_idx, int_row in enumerate(
+        int_records
+    ):
+
+        if int_idx in matched_int_indexes:
+            continue
+
+        record = int_row.copy()
+
+        record["MATCH_METHOD"] = ""
+        record["MATCH_CONFIDENCE"] = ""
+        record["DATE_RELATION"] = ""
+
+        # ----------------------------------------------------
+        # AMBIGUOUS
+        # ----------------------------------------------------
+
+        if int_idx in blocked_int_indexes:
+
+            record["STATUS_MATCH"] = (
+                "AMBIGUOUS_MATCH"
+            )
+
+            unmatched_internal.append(
+                record
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # DIAGNOSTIK JOURNAL
+        # ----------------------------------------------------
+
+        fmss_journal = int_row.get(
+            "FMSS_JOURNAL"
+        )
+
+        same_journal_bank = []
+
+        if (
+            fmss_journal is not None
+            and str(fmss_journal).strip() != ""
+        ):
+
+            for bank_idx, bank_row in enumerate(
+                bank_records
+            ):
+
+                if bank_idx in matched_bank_indexes:
+                    continue
+
+                if (
+                    str(
+                        bank_row.get(
+                            "BANK_JOURNAL"
+                        )
+                    )
+                    == str(fmss_journal)
+                ):
+
+                    same_journal_bank.append(
+                        bank_row
+                    )
+
+        if same_journal_bank:
+
+            same_journal_va = [
+                bank_row
+                for bank_row
+                in same_journal_bank
+                if str(
+                    bank_row.get(
+                        "KODE_VA"
+                    )
+                ) == str(
+                    int_row.get(
+                        "KODE_VA"
+                    )
+                )
+            ]
+
+            same_journal_nominal = [
+                bank_row
+                for bank_row
+                in same_journal_bank
+                if float(
+                    bank_row.get(
+                        "_CREDIT_NUM",
+                        0
+                    )
+                ) == float(
+                    int_row.get(
+                        "EXPECTED_BANK",
+                        0
+                    )
+                )
+            ]
+
+            if same_journal_va:
+
+                record["STATUS_MATCH"] = (
+                    "NOMINAL_MISMATCH"
+                )
+
+            elif same_journal_nominal:
+
+                record["STATUS_MATCH"] = (
+                    "VA_MISMATCH"
+                )
+
+            else:
+
+                record["STATUS_MATCH"] = (
+                    "JOURNAL_CONFLICT"
+                )
+
+        else:
+
+            record["STATUS_MATCH"] = (
+                "FMSS_ONLY"
+            )
+
+        unmatched_internal.append(
+            record
+        )
+
+    # ========================================================
+    # BANK YANG BELUM MATCH
+    # ========================================================
+    #
+    # Neighbor date D-1 / D+1 hanya berfungsi sebagai search pool.
+    # Unmatched neighbor date TIDAK dihitung sebagai Issue Bank D.
+    # ========================================================
+
+    target_dates = {
+        pd.to_datetime(d).date()
+        for d in recon_dates
+    }
+
+    fmss_available_dates = set(
+        pd.to_datetime(
+            df_int_valid["_TANGGAL_DT"],
+            errors="coerce"
+        )
+        .dropna()
+        .dt.date
+    )
+
+    for bank_idx, bank_row in enumerate(
+        bank_records
+    ):
+
+        if bank_idx in matched_bank_indexes:
+            continue
+
+        bank_datetime = pd.to_datetime(
+            bank_row.get(
+                "_TANGGAL_DT"
+            ),
+            errors="coerce"
+        )
+
+        if pd.isna(bank_datetime):
+            continue
+
+        bank_date = (
+            bank_datetime.date()
+        )
+
+        # Jangan hitung unmatched D-1 / D+1 sebagai issue tanggal D.
+        if bank_date not in target_dates:
+            continue
+
+        record = bank_row.copy()
+
+        if bank_idx in blocked_bank_indexes:
+
+            record["STATUS_MATCH"] = (
+                "AMBIGUOUS_MATCH - BNIVA"
+            )
+
+        else:
+
+            required_fmss_dates = {
+                bank_date - timedelta(days=1),
+                bank_date,
+                bank_date + timedelta(days=1)
+            }
+
+            # BANK_ONLY hanya boleh disebut pasti jika FMSS neighbor
+            # untuk D-1 / D / D+1 memang tersedia di file FMSS.
+            if required_fmss_dates.issubset(
+                fmss_available_dates
+            ):
+
+                record["STATUS_MATCH"] = (
+                    "BANK_ONLY - BNIVA"
+                )
+
+            else:
+
+                record["STATUS_MATCH"] = (
+                    "BANK_UNVERIFIED - BNIVA"
+                )
+
+        unmatched_bank.append(
+            record
+        )
+
+    # ========================================================
+    # DATAFRAME
+    # ========================================================
+
+    df_matched = pd.DataFrame(
+        matched
+    )
+
+    df_selisih_int = pd.DataFrame(
+        unmatched_internal
+    )
+
+    df_selisih_bnk = pd.DataFrame(
+        unmatched_bank
+    )
+
+    return (
+        df_matched,
+        df_selisih_int,
+        df_selisih_bnk
+    )
 
 
 # ============================================================
@@ -1013,21 +2020,49 @@ if can_process:
                 # EXTRACT VA FMSS - VECTORIZED
                 # =================================================
 
-                df_int_sukses["KODE_VA"] = (
-                    extract_va_series(
-                        df_int_sukses[
-                            col_keterangan_int
-                        ]
-                    )
-                )
+                if pilihan_bank == "BNIVA":
 
-                df_int_sukses["JENIS_VA"] = (
-                    classify_va_series(
-                        df_int_sukses[
-                            "KODE_VA"
-                        ]
+                    df_int_sukses["KODE_VA"] = (
+                        extract_bniva_va_series(
+                            df_int_sukses[
+                                col_keterangan_int
+                            ]
+                        )
                     )
-                )
+
+                    df_int_sukses["JENIS_VA"] = (
+                        classify_bniva_va_series(
+                            df_int_sukses[
+                                "KODE_VA"
+                            ]
+                        )
+                    )
+
+                    df_int_sukses["FMSS_JOURNAL"] = (
+                        extract_bniva_fmss_journal_series(
+                            df_int_sukses[
+                                col_keterangan_int
+                            ]
+                        )
+                    )
+
+                else:
+
+                    df_int_sukses["KODE_VA"] = (
+                        extract_va_series(
+                            df_int_sukses[
+                                col_keterangan_int
+                            ]
+                        )
+                    )
+
+                    df_int_sukses["JENIS_VA"] = (
+                        classify_va_series(
+                            df_int_sukses[
+                                "KODE_VA"
+                            ]
+                        )
+                    )
 
                 # =================================================
                 # INVALID VA FMSS
@@ -1149,6 +2184,23 @@ if can_process:
                         df_57708
                     )
 
+                elif pilihan_bank == "BNIVA":
+
+                    # ---------------------------------------------
+                    # BNIVA
+                    # Engine khusus, terpisah dari BRIVA.
+                    # ---------------------------------------------
+
+                    df_bniva = prepare_bniva_bank_dataframe(
+                        file_bnk_general,
+                        recon_dates,
+                        "BNIVA"
+                    )
+
+                    bank_sources.append(
+                        df_bniva
+                    )
+
                 else:
 
                     # ---------------------------------------------
@@ -1208,14 +2260,28 @@ if can_process:
                 # FAST MATCHING ENGINE
                 # =================================================
 
-                (
-                    df_matched,
-                    df_selisih_int,
-                    df_selisih_bnk
-                ) = fast_match(
-                    df_int_valid,
-                    df_bank_valid
-                )
+                if pilihan_bank == "BNIVA":
+
+                    (
+                        df_matched,
+                        df_selisih_int,
+                        df_selisih_bnk
+                    ) = fast_match_bniva(
+                        df_int_valid,
+                        df_bank_valid,
+                        recon_dates
+                    )
+
+                else:
+
+                    (
+                        df_matched,
+                        df_selisih_int,
+                        df_selisih_bnk
+                    ) = fast_match(
+                        df_int_valid,
+                        df_bank_valid
+                    )
 
                 # =================================================
                 # SUMMARY
