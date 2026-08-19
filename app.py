@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import re
 import io
-from collections import defaultdict
+from datetime import datetime
 
 # ============================================================
 # CONFIG
@@ -10,6 +10,7 @@ from collections import defaultdict
 
 st.set_page_config(
     page_title="Rekonsiliasi Bank Fastpay",
+    page_icon="📊",
     layout="wide"
 )
 
@@ -26,29 +27,67 @@ st.divider()
 # SESSION STATE
 # ============================================================
 
-defaults = {
+DEFAULT_STATE = {
     "sudah_diproses": False,
     "df_matched": pd.DataFrame(),
     "df_selisih_int": pd.DataFrame(),
     "df_selisih_bnk": pd.DataFrame(),
     "df_invalid_int": pd.DataFrame(),
     "df_invalid_bnk": pd.DataFrame(),
-    "pilihan_bank_terakhir": "",
+    "recon_dates": [],
+    "summary": {},
+    "pilihan_bank_terakhir": ""
 }
 
-for key, value in defaults.items():
+for key, value in DEFAULT_STATE.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
 
 # ============================================================
-# HELPER
+# HELPER FUNCTIONS
 # ============================================================
 
-def read_file(uploaded_file):
+def find_column(df, candidates, required=True):
     """
-    Membaca CSV/XLSX dengan seluruh kolom sebagai object/string
-    agar VA tidak berubah menjadi angka.
+    Mencari nama kolom berdasarkan exact match / case-insensitive.
+    """
+
+    if df is None or df.empty:
+        if required:
+            raise ValueError(
+                f"Data kosong. Tidak dapat mencari kolom: {candidates}"
+            )
+        return None
+
+    # Exact
+    for candidate in candidates:
+        if candidate in df.columns:
+            return candidate
+
+    # Case insensitive
+    mapping = {
+        str(col).strip().lower(): col
+        for col in df.columns
+    }
+
+    for candidate in candidates:
+        key = str(candidate).strip().lower()
+        if key in mapping:
+            return mapping[key]
+
+    if required:
+        raise ValueError(
+            f"Kolom tidak ditemukan. Dicari salah satu dari: {candidates}. "
+            f"Kolom tersedia: {list(df.columns)}"
+        )
+
+    return None
+
+
+def read_uploaded_file(uploaded_file):
+    """
+    Membaca CSV / XLSX secara aman.
     """
 
     uploaded_file.seek(0)
@@ -59,107 +98,57 @@ def read_file(uploaded_file):
         return pd.read_csv(
             uploaded_file,
             sep=None,
-            engine="python",
-            dtype=str
+            engine="python"
         )
 
-    return pd.read_excel(
-        uploaded_file,
-        dtype=str
+    elif filename.endswith(".xlsx"):
+        return pd.read_excel(uploaded_file)
+
+    else:
+        raise ValueError(
+            f"Format file tidak didukung: {uploaded_file.name}"
+        )
+
+
+def clean_numeric(series):
+    """
+    Normalisasi nominal menjadi numeric.
+    Menangani format angka umum.
+    """
+
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce").fillna(0)
+
+    cleaned = (
+        series.astype(str)
+        .str.replace("Rp", "", regex=False)
+        .str.replace(" ", "", regex=False)
+        .str.replace(",", "", regex=False)
     )
 
+    return pd.to_numeric(
+        cleaned,
+        errors="coerce"
+    ).fillna(0)
 
-def normalize_columns(df):
+
+def parse_datetime(series):
     """
-    Normalisasi nama kolom.
+    Parsing tanggal/waktu secara aman.
     """
 
-    df = df.copy()
-
-    df.columns = (
-        df.columns
-        .astype(str)
-        .str.strip()
-        .str.upper()
+    return pd.to_datetime(
+        series,
+        errors="coerce"
     )
-
-    return df
-
-
-def clean_text(value):
-    if pd.isna(value):
-        return ""
-
-    return str(value).strip()
-
-
-def parse_nominal(value):
-    """
-    Parser nominal yang tahan terhadap:
-    1000000
-    1.000.000
-    1,000,000
-    Rp 1.000.000
-    """
-
-    if pd.isna(value):
-        return 0.0
-
-    s = str(value).strip()
-
-    if not s:
-        return 0.0
-
-    # Hilangkan Rp, spasi
-    s = re.sub(r"(?i)rp", "", s)
-    s = s.replace(" ", "")
-
-    # Jika ada koma dan titik
-    if "." in s and "," in s:
-
-        # Indonesia: 1.000.000,50
-        if s.rfind(",") > s.rfind("."):
-            s = s.replace(".", "")
-            s = s.replace(",", ".")
-
-        # English: 1,000,000.50
-        else:
-            s = s.replace(",", "")
-
-    # Hanya titik
-    elif "." in s:
-
-        # Jika titik terlihat sebagai separator ribuan
-        parts = s.split(".")
-
-        if all(len(x) == 3 for x in parts[1:]):
-            s = "".join(parts)
-
-    # Hanya koma
-    elif "," in s:
-
-        parts = s.split(",")
-
-        if all(len(x) == 3 for x in parts[1:]):
-            s = "".join(parts)
-        else:
-            s = s.replace(",", ".")
-
-    try:
-        return float(s)
-    except:
-        return 0.0
 
 
 def extract_va(text):
     """
-    Mengenali:
-    57888xxxxxxxx
-    57708xxxxxxxx
+    Mengambil VA Fastpay / Rajabiller.
 
-    Prefix:
-    57888 = BRIVA FASTPAY
-    57708 = BRIVA RAJABILLER
+    57888 = BRIVA Fastpay
+    57708 = BRIVA Rajabiller
     """
 
     if pd.isna(text):
@@ -167,11 +156,9 @@ def extract_va(text):
 
     text = str(text)
 
-    # Hilangkan karakter aneh yang mungkin mengganggu
-    text = text.strip()
-
+    # Cari 57888 atau 57708 + 5 sampai 15 digit berikutnya
     match = re.search(
-        r"(57888\d{5,15}|57708\d{5,15})",
+        r"(57(?:888|708)\d{5,15})",
         text
     )
 
@@ -182,9 +169,8 @@ def extract_va(text):
 
 
 def classify_va(va):
-
-    if not va:
-        return "INVALID"
+    if pd.isna(va) or va is None or str(va).strip() == "":
+        return "INVALID VA"
 
     va = str(va)
 
@@ -194,20 +180,80 @@ def classify_va(va):
     if va.startswith("57708"):
         return "BRIVA RAJABILLER"
 
-    return "INVALID"
+    return "UNKNOWN"
 
 
-def find_column(df, candidates):
+def classify_bank_transaction(description):
+    """
+    Klasifikasi sederhana transaksi bank.
+    Tidak digunakan sebagai syarat matching.
+    """
 
-    for col in candidates:
-        if col in df.columns:
-            return col
+    text = str(description).upper()
 
-    return None
+    if "ATM" in text:
+        return "ATM / MANUAL"
+
+    if "TRF BERSAMA" in text:
+        return "TRANSFER / MANUAL"
+
+    if "BRIVA" in text:
+        return "BRIVA"
+
+    if "BFVA" in text:
+        return "BFVA"
+
+    if "VA" in text:
+        return "VA"
+
+    return "OTHER"
+
+
+def safe_date_string(dates):
+    if not dates:
+        return "-"
+
+    sorted_dates = sorted(dates)
+
+    if len(sorted_dates) == 1:
+        return sorted_dates[0].strftime("%d %B %Y")
+
+    return (
+        f"{sorted_dates[0].strftime('%d %B %Y')} "
+        f"s/d {sorted_dates[-1].strftime('%d %B %Y')}"
+    )
+
+
+def format_rupiah(value):
+    try:
+        value = float(value)
+    except:
+        value = 0
+
+    return "Rp {:,.0f}".format(value).replace(",", ".")
+
+
+def classify_issue_bank(description):
+    """
+    Klasifikasi issue Bank Only agar lebih mudah diinvestigasi.
+    """
+
+    category = classify_bank_transaction(description)
+
+    if category in ["ATM / MANUAL", "TRANSFER / MANUAL"]:
+        return "BANK_ONLY - MANUAL/ATM"
+
+    if category == "BRIVA":
+        return "BANK_ONLY - BRIVA"
+
+    if category == "BFVA":
+        return "BANK_ONLY - BFVA"
+
+    return "BANK_ONLY - OTHER"
 
 
 # ============================================================
-# 1. PENGATURAN BANK
+# UI - PILIH BANK
 # ============================================================
 
 st.subheader("1. Pengaturan Data")
@@ -228,8 +274,7 @@ pilihan_bank = st.selectbox(
 )
 
 
-# Reset ketika bank berubah
-
+# Reset hasil jika bank berubah
 if pilihan_bank != st.session_state.pilihan_bank_terakhir:
 
     st.session_state.sudah_diproses = False
@@ -239,12 +284,14 @@ if pilihan_bank != st.session_state.pilihan_bank_terakhir:
     st.session_state.df_selisih_bnk = pd.DataFrame()
     st.session_state.df_invalid_int = pd.DataFrame()
     st.session_state.df_invalid_bnk = pd.DataFrame()
+    st.session_state.recon_dates = []
+    st.session_state.summary = {}
 
     st.session_state.pilihan_bank_terakhir = pilihan_bank
 
 
 # ============================================================
-# 2. UPLOAD
+# UI - UPLOAD
 # ============================================================
 
 st.subheader("2. Unggah File")
@@ -254,27 +301,27 @@ if pilihan_bank == "BRIVA":
     col1, col2, col3 = st.columns(3)
 
     with col1:
-
+        st.markdown("### 📄 FMSS")
         file_int = st.file_uploader(
-            "📄 FMSS",
+            "Upload data FMSS",
             type=["csv", "xlsx"],
             key="fmss_briva"
         )
 
     with col2:
-
-        file_bnk_fastpay = st.file_uploader(
-            "🏦 BRIVA Fastpay — 57888",
+        st.markdown("### 🏦 BRIVA Fastpay — 57888")
+        file_bnk_57888 = st.file_uploader(
+            "Upload mutasi BRIVA 57888",
             type=["csv", "xlsx"],
-            key="briva_fastpay"
+            key="briva_57888"
         )
 
     with col3:
-
-        file_bnk_rajabiller = st.file_uploader(
-            "🏦 BRIVA Rajabiller — 57708",
+        st.markdown("### 🏦 BRIVA Rajabiller — 57708")
+        file_bnk_57708 = st.file_uploader(
+            "Upload mutasi BRIVA 57708",
             type=["csv", "xlsx"],
-            key="briva_rajabiller"
+            key="briva_57708"
         )
 
 else:
@@ -282,388 +329,627 @@ else:
     col1, col2 = st.columns(2)
 
     with col1:
-
+        st.markdown("### 📄 FMSS")
         file_int = st.file_uploader(
-            "📄 FMSS",
+            "Upload data FMSS",
             type=["csv", "xlsx"],
             key="fmss_general"
         )
 
     with col2:
-
-        file_bnk = st.file_uploader(
-            f"🏦 Mutasi Bank {pilihan_bank}",
+        st.markdown(f"### 🏦 Mutasi {pilihan_bank}")
+        file_bnk_general = st.file_uploader(
+            f"Upload mutasi {pilihan_bank}",
             type=["csv", "xlsx"],
             key="bank_general"
         )
 
+    file_bnk_57888 = None
+    file_bnk_57708 = None
+
 
 # ============================================================
-# 3. BRIVA
+# KONFIGURASI FEE BRIVA
 # ============================================================
 
-if (
-    pilihan_bank == "BRIVA"
-    and file_int
-    and file_bnk_fastpay
-    and file_bnk_rajabiller
-):
-
-    st.divider()
+if pilihan_bank == "BRIVA":
 
     st.subheader("3. Konfigurasi Fee")
 
-    c1, c2 = st.columns(2)
+    col_fee1, col_fee2 = st.columns(2)
 
-    with c1:
-
-        fee_fastpay = st.number_input(
+    with col_fee1:
+        fee_57888 = st.number_input(
             "Fee Fastpay (57888)",
             min_value=0,
             value=1000,
-            step=100
+            step=100,
+            format="%d"
         )
 
-    with c2:
-
-        fee_rajabiller = st.number_input(
+    with col_fee2:
+        fee_57708 = st.number_input(
             "Fee Rajabiller (57708)",
             min_value=0,
             value=1000,
-            step=100
+            step=100,
+            format="%d"
         )
 
     st.caption(
-        "Rumus matching: Nominal FMSS + Fee = Nominal Kredit Bank"
+        "Rumus pencocokan: Nominal FMSS + Fee = Nominal mutasi bank."
     )
 
+else:
+
+    fee_57888 = 1000
+    fee_57708 = 1000
+
+
+# ============================================================
+# BUTTON PROSES
+# ============================================================
+
+can_process = False
+
+if pilihan_bank == "BRIVA":
+
+    if file_int and file_bnk_57888 and file_bnk_57708:
+        can_process = True
+
+else:
+
+    if file_int and file_bnk_general:
+        can_process = True
+
+
+if can_process:
+
+    st.divider()
+
     if st.button(
-        "🚀 Mulai Croscek Data BRIVA",
-        type="primary"
+        f"🚀 Mulai Croscek Data {pilihan_bank}",
+        type="primary",
+        use_container_width=True
     ):
+
+        st.session_state.sudah_diproses = False
 
         try:
 
             with st.spinner(
-                "Sedang memproses rekonsiliasi BRIVA..."
+                "Sedang memproses rekonsiliasi..."
             ):
 
                 # ====================================================
-                # READ FILE
+                # LOAD FMSS
                 # ====================================================
 
-                df_int = normalize_columns(
-                    read_file(file_int)
+                df_int = read_uploaded_file(file_int)
+
+                # Cari kolom FMSS
+                col_status = find_column(
+                    df_int,
+                    ["status", "STATUS"]
                 )
 
-                df_fastpay = normalize_columns(
-                    read_file(file_bnk_fastpay)
-                )
-
-                df_rajabiller = normalize_columns(
-                    read_file(file_bnk_rajabiller)
-                )
-
-
-                # ====================================================
-                # VALIDASI KOLOM FMSS
-                # ====================================================
-
-                required_int = [
-                    "STATUS",
-                    "KETERANGAN",
-                    "NOMINAL"
-                ]
-
-                missing_int = [
-                    x for x in required_int
-                    if x not in df_int.columns
-                ]
-
-                if missing_int:
-
-                    raise Exception(
-                        "Kolom FMSS tidak ditemukan: "
-                        + ", ".join(missing_int)
-                    )
-
-
-                # ====================================================
-                # VALIDASI KOLOM BANK
-                # ====================================================
-
-                def prepare_bank(df, source):
-
-                    desk_col = find_column(
-                        df,
-                        [
-                            "DESK_TRAN",
-                            "DESCRIPTION",
-                            "KETERANGAN",
-                            "DESKRIPSI",
-                            "REMARK",
-                            "NARRATIVE"
-                        ]
-                    )
-
-                    kredit_col = find_column(
-                        df,
-                        [
-                            "MUTASI_KREDIT",
-                            "KREDIT",
-                            "CREDIT",
-                            "MUTASI CREDIT",
-                            "AMOUNT"
-                        ]
-                    )
-
-                    if desk_col is None:
-
-                        raise Exception(
-                            f"Kolom deskripsi pada file "
-                            f"{source} tidak ditemukan."
-                        )
-
-                    if kredit_col is None:
-
-                        raise Exception(
-                            f"Kolom kredit pada file "
-                            f"{source} tidak ditemukan."
-                        )
-
-                    result = df.copy()
-
-                    result["BANK_SOURCE"] = source
-
-                    result["BANK_DESK"] = (
-                        result[desk_col]
-                        .astype(str)
-                        .str.strip()
-                    )
-
-                    result["BANK_NOMINAL"] = (
-                        result[kredit_col]
-                        .apply(parse_nominal)
-                    )
-
-                    result["VA"] = (
-                        result["BANK_DESK"]
-                        .apply(extract_va)
-                    )
-
-                    result["JENIS_VA"] = (
-                        result["VA"]
-                        .apply(classify_va)
-                    )
-
-                    return result
-
-
-                # ====================================================
-                # PREPARE BANK
-                # ====================================================
-
-                bank_fastpay = prepare_bank(
-                    df_fastpay,
-                    "BRIVA FASTPAY"
-                )
-
-                bank_rajabiller = prepare_bank(
-                    df_rajabiller,
-                    "BRIVA RAJABILLER"
-                )
-
-
-                # ====================================================
-                # COMBINE BANK
-                # ====================================================
-
-                df_bank = pd.concat(
+                col_keterangan_int = find_column(
+                    df_int,
                     [
-                        bank_fastpay,
-                        bank_rajabiller
-                    ],
-                    ignore_index=True
+                        "keterangan",
+                        "KETERANGAN",
+                        "description",
+                        "DESKRIPSI"
+                    ]
                 )
 
+                col_nominal_int = find_column(
+                    df_int,
+                    [
+                        "nominal",
+                        "NOMINAL",
+                        "amount",
+                        "AMOUNT"
+                    ]
+                )
+
+                col_tanggal_int = find_column(
+                    df_int,
+                    [
+                        "tanggal_transfer",
+                        "TANGGAL_TRANSFER",
+                        "tanggal",
+                        "TANGGAL",
+                        "tgl_transfer",
+                        "TGL_TRANSFER"
+                    ]
+                )
 
                 # ====================================================
-                # FMSS SUKSES
+                # FILTER FMSS SUKSES
                 # ====================================================
 
-                df_int = df_int[
-                    df_int["STATUS"]
+                df_int = df_int.copy()
+
+                df_int["_STATUS_CLEAN"] = (
+                    df_int[col_status]
                     .astype(str)
-                    .str.upper()
                     .str.strip()
-                    == "SUKSES"
+                    .str.upper()
+                )
+
+                df_int_sukses = df_int[
+                    df_int["_STATUS_CLEAN"] == "SUKSES"
                 ].copy()
 
+                # ====================================================
+                # TANGGAL REKONSILIASI
+                # ====================================================
+
+                df_int_sukses["_TANGGAL_DT"] = parse_datetime(
+                    df_int_sukses[col_tanggal_int]
+                )
+
+                df_int_sukses = df_int_sukses[
+                    df_int_sukses["_TANGGAL_DT"].notna()
+                ].copy()
+
+                if df_int_sukses.empty:
+                    raise ValueError(
+                        "Tidak ada transaksi FMSS SUKSES "
+                        "dengan tanggal yang valid."
+                    )
+
+                recon_dates = sorted(
+                    df_int_sukses["_TANGGAL_DT"]
+                    .dt.date
+                    .dropna()
+                    .unique()
+                )
+
+                st.session_state.recon_dates = recon_dates
 
                 # ====================================================
                 # EXTRACT VA FMSS
                 # ====================================================
 
-                df_int["VA"] = (
-                    df_int["KETERANGAN"]
+                df_int_sukses["KODE_VA"] = (
+                    df_int_sukses[col_keterangan_int]
                     .apply(extract_va)
                 )
 
-                df_int["JENIS_VA"] = (
-                    df_int["VA"]
+                df_int_sukses["JENIS_VA"] = (
+                    df_int_sukses["KODE_VA"]
                     .apply(classify_va)
                 )
 
+                # ====================================================
+                # INVALID VA FMSS
+                # ====================================================
+
+                df_invalid_int = df_int_sukses[
+                    df_int_sukses["KODE_VA"].isna()
+                ].copy()
+
+                # Hanya transaksi yang punya VA valid yang masuk
+                # engine matching
+                df_int_valid = df_int_sukses[
+                    df_int_sukses["KODE_VA"].notna()
+                ].copy()
 
                 # ====================================================
                 # NOMINAL FMSS
                 # ====================================================
 
-                df_int["NOMINAL_FMSS"] = (
-                    df_int["NOMINAL"]
-                    .apply(parse_nominal)
+                df_int_valid["NOMINAL_ASLI"] = clean_numeric(
+                    df_int_valid[col_nominal_int]
                 )
 
-
                 # ====================================================
-                # FEE BERDASARKAN JENIS VA
-                # ====================================================
-
-                def calculate_fee(jenis):
-
-                    if jenis == "BRIVA FASTPAY":
-                        return float(fee_fastpay)
-
-                    if jenis == "BRIVA RAJABILLER":
-                        return float(fee_rajabiller)
-
-                    return 0.0
-
-
-                df_int["FEE"] = (
-                    df_int["JENIS_VA"]
-                    .apply(calculate_fee)
-                )
-
-                df_int["NOMINAL_MATCH"] = (
-                    df_int["NOMINAL_FMSS"]
-                    + df_int["FEE"]
-                )
-
-
-                # ====================================================
-                # INVALID VA
+                # BANK PROCESSING
                 # ====================================================
 
-                invalid_int = df_int[
-                    df_int["VA"].isna()
-                ].copy()
+                bank_sources = []
 
-                invalid_bank = df_bank[
-                    df_bank["VA"].isna()
-                ].copy()
+                if pilihan_bank == "BRIVA":
 
+                    # -----------------------------------------------
+                    # BRIVA 57888
+                    # -----------------------------------------------
 
-                # Hanya data yang memiliki VA valid
-                int_valid = df_int[
-                    df_int["VA"].notna()
-                ].copy()
-
-                bank_valid = df_bank[
-                    df_bank["VA"].notna()
-                    &
-                    (df_bank["BANK_NOMINAL"] > 0)
-                ].copy()
-
-
-                # ====================================================
-                # 1-TO-1 MATCHING
-                # ====================================================
-
-                # Index bank berdasarkan:
-                # VA + NOMINAL
-
-                bank_pool = defaultdict(list)
-
-                for idx, row in bank_valid.iterrows():
-
-                    key = (
-                        str(row["VA"]),
-                        round(
-                            float(row["BANK_NOMINAL"]),
-                            2
-                        )
+                    df_57888 = read_uploaded_file(
+                        file_bnk_57888
                     )
 
-                    bank_pool[key].append(idx)
+                    col_credit_57888 = find_column(
+                        df_57888,
+                        [
+                            "MUTASI_KREDIT",
+                            "mutasi_kredit",
+                            "KREDIT",
+                            "kredit"
+                        ]
+                    )
 
+                    col_desc_57888 = find_column(
+                        df_57888,
+                        [
+                            "DESK_TRAN",
+                            "desk_tran",
+                            "KETERANGAN",
+                            "keterangan",
+                            "DESCRIPTION",
+                            "description"
+                        ]
+                    )
+
+                    col_date_57888 = find_column(
+                        df_57888,
+                        [
+                            "TGL_TRAN",
+                            "tgl_tran",
+                            "TANGGAL_TRAN",
+                            "tanggal_tran",
+                            "TANGGAL",
+                            "tanggal"
+                        ]
+                    )
+
+                    df_57888 = df_57888.copy()
+
+                    df_57888["_BANK_TYPE"] = (
+                        df_57888[col_desc_57888]
+                        .apply(classify_bank_transaction)
+                    )
+
+                    df_57888["_TANGGAL_DT"] = parse_datetime(
+                        df_57888[col_date_57888]
+                    )
+
+                    df_57888["_CREDIT_NUM"] = clean_numeric(
+                        df_57888[col_credit_57888]
+                    )
+
+                    # HANYA TRANSAKSI PADA TANGGAL REKONSILIASI
+                    df_57888 = df_57888[
+                        df_57888["_TANGGAL_DT"]
+                        .dt.date
+                        .isin(recon_dates)
+                    ].copy()
+
+                    # HANYA UANG MASUK
+                    df_57888 = df_57888[
+                        df_57888["_CREDIT_NUM"] > 0
+                    ].copy()
+
+                    df_57888["KODE_VA"] = (
+                        df_57888[col_desc_57888]
+                        .apply(extract_va)
+                    )
+
+                    df_57888["JENIS_VA"] = (
+                        df_57888["KODE_VA"]
+                        .apply(classify_va)
+                    )
+
+                    df_57888["SOURCE_BANK"] = (
+                        "BRIVA FASTPAY 57888"
+                    )
+
+                    bank_sources.append(df_57888)
+
+                    # -----------------------------------------------
+                    # BRIVA 57708
+                    # -----------------------------------------------
+
+                    df_57708 = read_uploaded_file(
+                        file_bnk_57708
+                    )
+
+                    col_credit_57708 = find_column(
+                        df_57708,
+                        [
+                            "MUTASI_KREDIT",
+                            "mutasi_kredit",
+                            "KREDIT",
+                            "kredit"
+                        ]
+                    )
+
+                    col_desc_57708 = find_column(
+                        df_57708,
+                        [
+                            "DESK_TRAN",
+                            "desk_tran",
+                            "KETERANGAN",
+                            "keterangan",
+                            "DESCRIPTION",
+                            "description"
+                        ]
+                    )
+
+                    col_date_57708 = find_column(
+                        df_57708,
+                        [
+                            "TGL_TRAN",
+                            "tgl_tran",
+                            "TANGGAL_TRAN",
+                            "tanggal_tran",
+                            "TANGGAL",
+                            "tanggal"
+                        ]
+                    )
+
+                    df_57708 = df_57708.copy()
+
+                    df_57708["_BANK_TYPE"] = (
+                        df_57708[col_desc_57708]
+                        .apply(classify_bank_transaction)
+                    )
+
+                    df_57708["_TANGGAL_DT"] = parse_datetime(
+                        df_57708[col_date_57708]
+                    )
+
+                    df_57708["_CREDIT_NUM"] = clean_numeric(
+                        df_57708[col_credit_57708]
+                    )
+
+                    # HANYA TANGGAL REKONSILIASI
+                    df_57708 = df_57708[
+                        df_57708["_TANGGAL_DT"]
+                        .dt.date
+                        .isin(recon_dates)
+                    ].copy()
+
+                    # HANYA UANG MASUK
+                    df_57708 = df_57708[
+                        df_57708["_CREDIT_NUM"] > 0
+                    ].copy()
+
+                    df_57708["KODE_VA"] = (
+                        df_57708[col_desc_57708]
+                        .apply(extract_va)
+                    )
+
+                    df_57708["JENIS_VA"] = (
+                        df_57708["KODE_VA"]
+                        .apply(classify_va)
+                    )
+
+                    df_57708["SOURCE_BANK"] = (
+                        "BRIVA RAJABILLER 57708"
+                    )
+
+                    bank_sources.append(df_57708)
+
+                else:
+
+                    # =================================================
+                    # BANK LAIN
+                    # =================================================
+
+                    df_general = read_uploaded_file(
+                        file_bnk_general
+                    )
+
+                    col_credit = find_column(
+                        df_general,
+                        [
+                            "MUTASI_KREDIT",
+                            "mutasi_kredit",
+                            "KREDIT",
+                            "kredit"
+                        ]
+                    )
+
+                    col_desc = find_column(
+                        df_general,
+                        [
+                            "DESK_TRAN",
+                            "desk_tran",
+                            "KETERANGAN",
+                            "keterangan",
+                            "DESCRIPTION",
+                            "description"
+                        ]
+                    )
+
+                    col_date = find_column(
+                        df_general,
+                        [
+                            "TGL_TRAN",
+                            "tgl_tran",
+                            "TANGGAL_TRAN",
+                            "tanggal_tran",
+                            "TANGGAL",
+                            "tanggal"
+                        ]
+                    )
+
+                    df_general["_BANK_TYPE"] = (
+                        df_general[col_desc]
+                        .apply(classify_bank_transaction)
+                    )
+
+                    df_general["_TANGGAL_DT"] = parse_datetime(
+                        df_general[col_date]
+                    )
+
+                    df_general["_CREDIT_NUM"] = clean_numeric(
+                        df_general[col_credit]
+                    )
+
+                    df_general = df_general[
+                        df_general["_TANGGAL_DT"]
+                        .dt.date
+                        .isin(recon_dates)
+                    ].copy()
+
+                    df_general = df_general[
+                        df_general["_CREDIT_NUM"] > 0
+                    ].copy()
+
+                    df_general["KODE_VA"] = (
+                        df_general[col_desc]
+                        .apply(extract_va)
+                    )
+
+                    df_general["JENIS_VA"] = (
+                        df_general["KODE_VA"]
+                        .apply(classify_va)
+                    )
+
+                    df_general["SOURCE_BANK"] = pilihan_bank
+
+                    bank_sources.append(df_general)
+
+                # ====================================================
+                # COMBINE BANK DATA
+                # ====================================================
+
+                if bank_sources:
+
+                    df_bank = pd.concat(
+                        bank_sources,
+                        ignore_index=True
+                    )
+
+                else:
+
+                    df_bank = pd.DataFrame()
+
+                # ====================================================
+                # BANK INVALID VA
+                # ====================================================
+
+                df_invalid_bnk = df_bank[
+                    df_bank["KODE_VA"].isna()
+                ].copy()
+
+                # HANYA VA YANG VALID UNTUK MATCHING
+                df_bank_valid = df_bank[
+                    df_bank["KODE_VA"].notna()
+                ].copy()
+
+                # ====================================================
+                # MATCHING ENGINE
+                # ====================================================
+
+                # Pisahkan FMSS berdasarkan prefix
+                # supaya 57888 tidak pernah dibandingkan
+                # dengan 57708.
+
+                df_int_valid["EXPECTED_BANK"] = (
+                    df_int_valid["NOMINAL_ASLI"]
+                )
+
+                df_int_valid.loc[
+                    df_int_valid["JENIS_VA"] == "BRIVA FASTPAY",
+                    "EXPECTED_BANK"
+                ] = (
+                    df_int_valid.loc[
+                        df_int_valid["JENIS_VA"] == "BRIVA FASTPAY",
+                        "NOMINAL_ASLI"
+                    ] + fee_57888
+                )
+
+                df_int_valid.loc[
+                    df_int_valid["JENIS_VA"] == "BRIVA RAJABILLER",
+                    "EXPECTED_BANK"
+                ] = (
+                    df_int_valid.loc[
+                        df_int_valid["JENIS_VA"] == "BRIVA RAJABILLER",
+                        "NOMINAL_ASLI"
+                    ] + fee_57708
+                )
+
+                # ----------------------------------------------------
+                # Buat list bank yang bisa dicoret
+                # ----------------------------------------------------
+
+                bank_records = df_bank_valid.to_dict(
+                    "records"
+                )
 
                 matched = []
-                unmatched_int = []
+                unmatched_internal = []
 
-                used_bank_index = set()
+                # ----------------------------------------------------
+                # 1-to-1 matching
+                # ----------------------------------------------------
 
+                for _, int_row in df_int_valid.iterrows():
 
-                for _, int_row in int_valid.iterrows():
+                    matched_index = None
 
-                    key = (
-                        str(int_row["VA"]),
-                        round(
-                            float(int_row["NOMINAL_MATCH"]),
-                            2
+                    for i, bank_row in enumerate(bank_records):
+
+                        same_va = (
+                            str(int_row["KODE_VA"])
+                            == str(bank_row["KODE_VA"])
                         )
-                    )
 
-                    candidates = bank_pool.get(
-                        key,
-                        []
-                    )
+                        same_nominal = (
+                            float(int_row["EXPECTED_BANK"])
+                            == float(bank_row["_CREDIT_NUM"])
+                        )
 
-                    # Cari bank row yang belum dipakai
+                        if same_va and same_nominal:
 
-                    selected_idx = None
-
-                    for candidate in candidates:
-
-                        if candidate not in used_bank_index:
-
-                            selected_idx = candidate
+                            matched_index = i
                             break
 
+                    if matched_index is not None:
 
-                    # ==================================================
-                    # MATCH
-                    # ==================================================
-
-                    if selected_idx is not None:
-
-                        bank_row = bank_valid.loc[
-                            selected_idx
-                        ]
-
-                        used_bank_index.add(
-                            selected_idx
+                        bank_row = bank_records.pop(
+                            matched_index
                         )
 
                         record = int_row.to_dict()
 
-                        record["MATCH_BANK_SOURCE"] = (
-                            bank_row["BANK_SOURCE"]
+                        record["MATCH_MUTASI_KREDIT"] = (
+                            bank_row["_CREDIT_NUM"]
                         )
 
-                        record["MATCH_BANK_VA"] = (
-                            bank_row["VA"]
+                        record["MATCH_DESK_TRAN"] = (
+                            bank_row.get(
+                                col_desc_57888
+                                if (
+                                    pilihan_bank == "BRIVA"
+                                    and bank_row.get(
+                                        "SOURCE_BANK"
+                                    )
+                                    == "BRIVA FASTPAY 57888"
+                                )
+                                else col_desc_57708
+                                if (
+                                    pilihan_bank == "BRIVA"
+                                    and bank_row.get(
+                                        "SOURCE_BANK"
+                                    )
+                                    == "BRIVA RAJABILLER 57708"
+                                )
+                                else "DESK_TRAN",
+                                ""
+                            )
                         )
 
-                        record["MATCH_BANK_NOMINAL"] = (
-                            bank_row["BANK_NOMINAL"]
+                        record["SOURCE_BANK"] = (
+                            bank_row.get(
+                                "SOURCE_BANK",
+                                pilihan_bank
+                            )
                         )
 
-                        record["MATCH_BANK_DESK"] = (
-                            bank_row["BANK_DESK"]
+                        record["BANK_TYPE"] = (
+                            bank_row.get(
+                                "_BANK_TYPE",
+                                ""
+                            )
                         )
 
-                        record["MATCH_STATUS"] = "MATCHED"
+                        record["STATUS_MATCH"] = "MATCHED"
 
                         matched.append(record)
 
@@ -671,29 +957,39 @@ if (
 
                         record = int_row.to_dict()
 
-                        record["MATCH_STATUS"] = (
+                        record["STATUS_MATCH"] = (
                             "FMSS_ONLY"
                         )
 
-                        unmatched_int.append(record)
-
+                        unmatched_internal.append(
+                            record
+                        )
 
                 # ====================================================
-                # BANK UNMATCHED
+                # BANK YANG TERSISA = BANK ONLY
                 # ====================================================
 
-                unmatched_bank = bank_valid[
-                    ~bank_valid.index.isin(
-                        used_bank_index
+                unmatched_bank = []
+
+                for bank_row in bank_records:
+
+                    record = bank_row.copy()
+
+                    record["STATUS_MATCH"] = (
+                        classify_issue_bank(
+                            bank_row.get(
+                                "_BANK_TYPE",
+                                ""
+                            )
+                        )
                     )
-                ].copy()
 
-
-                unmatched_bank["ISSUE"] = "BANK_ONLY"
-
+                    unmatched_bank.append(
+                        record
+                    )
 
                 # ====================================================
-                # OUTPUT
+                # DATAFRAME HASIL
                 # ====================================================
 
                 df_matched = pd.DataFrame(
@@ -701,70 +997,115 @@ if (
                 )
 
                 df_selisih_int = pd.DataFrame(
-                    unmatched_int
+                    unmatched_internal
                 )
 
-                df_selisih_bnk = (
+                df_selisih_bnk = pd.DataFrame(
                     unmatched_bank
-                    .copy()
                 )
 
-
                 # ====================================================
-                # TAMBAHKAN ISSUE
-                # ====================================================
-
-                if not df_selisih_int.empty:
-
-                    df_selisih_int["ISSUE"] = (
-                        "FMSS_ONLY"
-                    )
-
-
-                # ====================================================
-                # SAVE SESSION
+                # SUMMARY
                 # ====================================================
 
-                st.session_state.df_matched = (
+                matched_count = len(
                     df_matched
                 )
 
-                st.session_state.df_selisih_int = (
+                fmss_only_count = len(
                     df_selisih_int
                 )
 
-                st.session_state.df_selisih_bnk = (
+                bank_only_count = len(
                     df_selisih_bnk
                 )
 
-                st.session_state.df_invalid_int = (
-                    invalid_int
+                invalid_int_count = len(
+                    df_invalid_int
                 )
 
-                st.session_state.df_invalid_bnk = (
-                    invalid_bank
+                invalid_bnk_count = len(
+                    df_invalid_bnk
                 )
+
+                matched_nominal = (
+                    df_matched["NOMINAL_ASLI"].sum()
+                    if (
+                        not df_matched.empty
+                        and "NOMINAL_ASLI"
+                        in df_matched.columns
+                    )
+                    else 0
+                )
+
+                fmss_only_nominal = (
+                    df_selisih_int["NOMINAL_ASLI"].sum()
+                    if (
+                        not df_selisih_int.empty
+                        and "NOMINAL_ASLI"
+                        in df_selisih_int.columns
+                    )
+                    else 0
+                )
+
+                bank_only_nominal = (
+                    df_selisih_bnk["_CREDIT_NUM"].sum()
+                    if (
+                        not df_selisih_bnk.empty
+                        and "_CREDIT_NUM"
+                        in df_selisih_bnk.columns
+                    )
+                    else 0
+                )
+
+                summary = {
+                    "matched_count": matched_count,
+                    "fmss_only_count": fmss_only_count,
+                    "bank_only_count": bank_only_count,
+                    "invalid_int_count": invalid_int_count,
+                    "invalid_bnk_count": invalid_bnk_count,
+                    "matched_nominal": matched_nominal,
+                    "fmss_only_nominal": fmss_only_nominal,
+                    "bank_only_nominal": bank_only_nominal
+                }
+
+                # ====================================================
+                # SAVE SESSION STATE
+                # ====================================================
+
+                st.session_state.df_matched = df_matched
+                st.session_state.df_selisih_int = (
+                    df_selisih_int
+                )
+                st.session_state.df_selisih_bnk = (
+                    df_selisih_bnk
+                )
+                st.session_state.df_invalid_int = (
+                    df_invalid_int
+                )
+                st.session_state.df_invalid_bnk = (
+                    df_invalid_bnk
+                )
+                st.session_state.summary = summary
 
                 st.session_state.sudah_diproses = True
 
-
         except Exception as e:
-
-            st.error(
-                f"❌ Gagal memproses data: {str(e)}"
-            )
 
             st.session_state.sudah_diproses = False
 
+            st.error(
+                "❌ Terjadi kesalahan saat memproses data."
+            )
+
+            st.exception(e)
+
 
 # ============================================================
-# 4. HASIL BRIVA
+# HASIL REKONSILIASI
 # ============================================================
 
-if (
-    pilihan_bank == "BRIVA"
-    and st.session_state.sudah_diproses
-):
+if st.session_state.sudah_diproses:
 
     df_matched = st.session_state.df_matched
     df_selisih_int = st.session_state.df_selisih_int
@@ -772,175 +1113,162 @@ if (
     df_invalid_int = st.session_state.df_invalid_int
     df_invalid_bnk = st.session_state.df_invalid_bnk
 
-
-    # ========================================================
-    # SUMMARY TRANSAKSI
-    # ========================================================
+    summary = st.session_state.summary
 
     st.divider()
 
+    # ========================================================
+    # HEADER
+    # ========================================================
+
     st.subheader(
-        "🎯 Ringkasan Rekonsiliasi BRIVA"
+        f"🎯 Ringkasan Rekonsiliasi {pilihan_bank}"
     )
+
+    st.caption(
+        f"Periode rekonsiliasi: "
+        f"**{safe_date_string(st.session_state.recon_dates)}**"
+    )
+
+    # ========================================================
+    # METRIC
+    # ========================================================
 
     m1, m2, m3, m4 = st.columns(4)
 
     m1.metric(
         "✅ Matched Sempurna",
-        f"{len(df_matched):,} Trx"
+        f"{summary['matched_count']:,} Trx"
     )
 
     m2.metric(
         "⚠️ Issue FMSS",
-        f"{len(df_selisih_int):,} Trx"
+        f"{summary['fmss_only_count']:,} Trx"
     )
 
     m3.metric(
         "⚠️ Issue Bank",
-        f"{len(df_selisih_bnk):,} Trx"
+        f"{summary['bank_only_count']:,} Trx"
     )
 
     m4.metric(
         "🚨 Invalid VA",
-        f"{len(df_invalid_int) + len(df_invalid_bnk):,} Trx"
+        f"{summary['invalid_int_count'] + summary['invalid_bnk_count']:,} Trx"
     )
-
 
     # ========================================================
-    # SUMMARY NOMINAL
+    # MATCH RATE
     # ========================================================
 
-    st.subheader(
-        "💰 Ringkasan Nominal"
+    total_fmss_valid = (
+        len(df_matched)
+        + len(df_selisih_int)
     )
 
-    matched_nominal = (
-        df_matched["NOMINAL_FMSS"].sum()
-        if not df_matched.empty
+    total_bank_valid = (
+        len(df_matched)
+        + len(df_selisih_bnk)
+    )
+
+    fmss_match_rate = (
+        len(df_matched)
+        / total_fmss_valid
+        * 100
+        if total_fmss_valid > 0
         else 0
     )
 
-    issue_int_nominal = (
-        df_selisih_int["NOMINAL_FMSS"].sum()
-        if not df_selisih_int.empty
+    bank_match_rate = (
+        len(df_matched)
+        / total_bank_valid
+        * 100
+        if total_bank_valid > 0
         else 0
     )
 
-    issue_bank_nominal = (
-        df_selisih_bnk["BANK_NOMINAL"].sum()
-        if not df_selisih_bnk.empty
-        else 0
+    st.divider()
+
+    r1, r2 = st.columns(2)
+
+    r1.metric(
+        "📈 Match Rate FMSS",
+        f"{fmss_match_rate:.4f}%"
     )
+
+    r2.metric(
+        "📈 Match Rate Bank",
+        f"{bank_match_rate:.4f}%"
+    )
+
+    # ========================================================
+    # NOMINAL SUMMARY
+    # ========================================================
+
+    st.subheader("💰 Ringkasan Nominal")
 
     n1, n2, n3 = st.columns(3)
 
     n1.metric(
         "Matched",
-        f"Rp {matched_nominal:,.0f}"
+        format_rupiah(
+            summary["matched_nominal"]
+        )
     )
 
     n2.metric(
         "Issue FMSS",
-        f"Rp {issue_int_nominal:,.0f}"
+        format_rupiah(
+            summary["fmss_only_nominal"]
+        )
     )
 
     n3.metric(
         "Issue Bank",
-        f"Rp {issue_bank_nominal:,.0f}"
+        format_rupiah(
+            summary["bank_only_nominal"]
+        )
     )
 
-
     # ========================================================
-    # BREAKDOWN JENIS VA
+    # ISSUE FMSS / BANK
     # ========================================================
 
     st.divider()
 
-    st.subheader(
-        "🏦 Breakdown BRIVA"
-    )
-
-    b1, b2 = st.columns(2)
-
-    with b1:
-
-        st.markdown(
-            "#### BRIVA Fastpay — 57888"
-        )
-
-        fast_matched = (
-            df_matched[
-                df_matched["JENIS_VA"]
-                == "BRIVA FASTPAY"
-            ]
-            if not df_matched.empty
-            else pd.DataFrame()
-        )
-
-        st.metric(
-            "Matched",
-            f"{len(fast_matched):,} Trx"
-        )
-
-    with b2:
-
-        st.markdown(
-            "#### BRIVA Rajabiller — 57708"
-        )
-
-        raj_matched = (
-            df_matched[
-                df_matched["JENIS_VA"]
-                == "BRIVA RAJABILLER"
-            ]
-            if not df_matched.empty
-            else pd.DataFrame()
-        )
-
-        st.metric(
-            "Matched",
-            f"{len(raj_matched):,} Trx"
-        )
-
+    col_issue1, col_issue2 = st.columns(2)
 
     # ========================================================
-    # ISSUE TABLE
+    # ISSUE FMSS
     # ========================================================
 
-    st.divider()
+    with col_issue1:
 
-    c1, c2 = st.columns(2)
-
-    with c1:
-
-        st.markdown(
-            "### 🚨 Issue FMSS"
-        )
+        st.subheader("🚨 Issue FMSS")
 
         if not df_selisih_int.empty:
 
-            tampil = df_selisih_int[
-                [
-                    "VA",
-                    "JENIS_VA",
-                    "NOMINAL_FMSS",
-                    "FEE",
-                    "NOMINAL_MATCH",
-                    "ISSUE"
-                ]
-            ].copy()
+            display_int = pd.DataFrame()
 
-            tampil.columns = [
-                "KODE VA",
-                "JENIS VA",
-                "NOMINAL",
-                "FEE",
-                "NOMINAL MATCH",
-                "ISSUE"
-            ]
+            display_int["KODE VA"] = (
+                df_selisih_int["KODE_VA"]
+            )
+
+            display_int["JENIS VA"] = (
+                df_selisih_int["JENIS_VA"]
+            )
+
+            display_int["NOMINAL"] = (
+                df_selisih_int["NOMINAL_ASLI"]
+            )
+
+            display_int["EXPECTED BANK"] = (
+                df_selisih_int["EXPECTED_BANK"]
+            )
+
+            display_int["ISSUE"] = "FMSS_ONLY"
 
             st.dataframe(
-                tampil,
+                display_int,
                 use_container_width=True,
                 hide_index=True
             )
@@ -948,38 +1276,48 @@ if (
         else:
 
             st.success(
-                "Tidak ada issue FMSS."
+                "Tidak ada issue FMSS. "
+                "Semua transaksi FMSS memiliki pasangan bank."
             )
 
+    # ========================================================
+    # ISSUE BANK
+    # ========================================================
 
-    with c2:
+    with col_issue2:
 
-        st.markdown(
-            "### 🚨 Issue Bank"
-        )
+        st.subheader("🚨 Issue Bank")
 
         if not df_selisih_bnk.empty:
 
-            tampil = df_selisih_bnk[
-                [
-                    "VA",
-                    "JENIS_VA",
-                    "BANK_NOMINAL",
-                    "BANK_SOURCE",
-                    "ISSUE"
-                ]
-            ].copy()
+            display_bnk = pd.DataFrame()
 
-            tampil.columns = [
-                "KODE VA",
-                "JENIS VA",
-                "NOMINAL",
-                "SUMBER BANK",
-                "ISSUE"
-            ]
+            display_bnk["KODE VA"] = (
+                df_selisih_bnk["KODE_VA"]
+            )
+
+            display_bnk["JENIS VA"] = (
+                df_selisih_bnk["JENIS_VA"]
+            )
+
+            display_bnk["NOMINAL"] = (
+                df_selisih_bnk["_CREDIT_NUM"]
+            )
+
+            display_bnk["SOURCE BANK"] = (
+                df_selisih_bnk["SOURCE_BANK"]
+            )
+
+            display_bnk["TYPE"] = (
+                df_selisih_bnk["_BANK_TYPE"]
+            )
+
+            display_bnk["ISSUE"] = (
+                df_selisih_bnk["STATUS_MATCH"]
+            )
 
             st.dataframe(
-                tampil,
+                display_bnk,
                 use_container_width=True,
                 hide_index=True
             )
@@ -987,214 +1325,359 @@ if (
         else:
 
             st.success(
-                "Tidak ada issue Bank."
+                "Tidak ada issue Bank. "
+                "Semua transaksi bank memiliki pasangan FMSS."
             )
-
 
     # ========================================================
     # INVALID VA
     # ========================================================
 
-    if (
-        not df_invalid_int.empty
-        or not df_invalid_bnk.empty
+    st.divider()
+
+    with st.expander(
+        "⚠️ Transaksi dengan VA Tidak Teridentifikasi",
+        expanded=False
     ):
 
-        with st.expander(
-            "⚠️ Transaksi dengan VA Tidak Teridentifikasi"
-        ):
+        iv1, iv2 = st.columns(2)
 
-            c1, c2 = st.columns(2)
+        # ----------------------------------------------------
+        # INVALID FMSS
+        # ----------------------------------------------------
 
-            with c1:
+        with iv1:
 
-                st.markdown(
-                    "#### FMSS Invalid VA"
+            st.markdown("### FMSS Invalid VA")
+
+            if not df_invalid_int.empty:
+
+                cols = [
+                    col
+                    for col in [
+                        col_tanggal_int,
+                        col_nominal_int,
+                        col_keterangan_int
+                    ]
+                    if col in df_invalid_int.columns
+                ]
+
+                st.dataframe(
+                    df_invalid_int[cols],
+                    use_container_width=True,
+                    hide_index=True
                 )
 
-                if not df_invalid_int.empty:
+            else:
 
-                    st.dataframe(
-                        df_invalid_int[
-                            [
-                                "KETERANGAN",
-                                "NOMINAL_FMSS"
-                            ]
-                        ],
-                        use_container_width=True,
-                        hide_index=True
-                    )
-
-                else:
-
-                    st.success(
-                        "Tidak ada FMSS invalid VA."
-                    )
-
-            with c2:
-
-                st.markdown(
-                    "#### Bank Invalid VA"
+                st.success(
+                    "Tidak ada FMSS invalid VA."
                 )
 
-                if not df_invalid_bnk.empty:
+        # ----------------------------------------------------
+        # INVALID BANK
+        # ----------------------------------------------------
 
-                    st.dataframe(
-                        df_invalid_bnk[
-                            [
-                                "BANK_SOURCE",
-                                "BANK_DESK",
-                                "BANK_NOMINAL"
-                            ]
-                        ],
-                        use_container_width=True,
-                        hide_index=True
-                    )
+        with iv2:
 
-                else:
+            st.markdown("### Bank Invalid VA")
 
-                    st.success(
-                        "Tidak ada Bank invalid VA."
-                    )
+            if not df_invalid_bnk.empty:
 
+                invalid_cols = []
+
+                # Cari kolom tanggal/description yang tersedia
+                for col in [
+                    "_TANGGAL_DT",
+                    "_BANK_TYPE",
+                    "SOURCE_BANK"
+                ]:
+                    if col in df_invalid_bnk.columns:
+                        invalid_cols.append(col)
+
+                if "KODE_VA" in df_invalid_bnk.columns:
+                    invalid_cols.append("KODE_VA")
+
+                if "_CREDIT_NUM" in df_invalid_bnk.columns:
+                    invalid_cols.append("_CREDIT_NUM")
+
+                st.dataframe(
+                    df_invalid_bnk[invalid_cols],
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+            else:
+
+                st.success(
+                    "Tidak ada Bank invalid VA."
+                )
 
     # ========================================================
-    # DOWNLOAD EXCEL
+    # DOWNLOAD REPORT
     # ========================================================
 
     st.divider()
 
-    st.subheader(
-        "📥 Download Laporan"
-    )
+    st.subheader("📥 Download Laporan")
 
     output = io.BytesIO()
 
-    with pd.ExcelWriter(
-        output,
-        engine="openpyxl"
-    ) as writer:
+    try:
 
-        if not df_matched.empty:
+        with pd.ExcelWriter(
+            output,
+            engine="openpyxl"
+        ) as writer:
 
-            df_matched.to_excel(
+            # ------------------------------------------------
+            # SUMMARY
+            # ------------------------------------------------
+
+            summary_export = pd.DataFrame({
+                "METRIC": [
+                    "Bank",
+                    "Periode Rekonsiliasi",
+                    "Matched",
+                    "FMSS Only",
+                    "Bank Only",
+                    "FMSS Invalid VA",
+                    "Bank Invalid VA",
+                    "Match Rate FMSS",
+                    "Match Rate Bank",
+                    "Nominal Matched",
+                    "Nominal FMSS Only",
+                    "Nominal Bank Only"
+                ],
+                "VALUE": [
+                    pilihan_bank,
+                    safe_date_string(
+                        st.session_state.recon_dates
+                    ),
+                    summary["matched_count"],
+                    summary["fmss_only_count"],
+                    summary["bank_only_count"],
+                    summary["invalid_int_count"],
+                    summary["invalid_bnk_count"],
+                    f"{fmss_match_rate:.4f}%",
+                    f"{bank_match_rate:.4f}%",
+                    summary["matched_nominal"],
+                    summary["fmss_only_nominal"],
+                    summary["bank_only_nominal"]
+                ]
+            })
+
+            summary_export.to_excel(
                 writer,
-                sheet_name="MATCHED_OK",
+                sheet_name="SUMMARY",
                 index=False
             )
 
-        else:
+            # ------------------------------------------------
+            # MATCHED
+            # ------------------------------------------------
 
-            pd.DataFrame(
-                {
+            if not df_matched.empty:
+
+                export_matched = df_matched.copy()
+
+                export_matched = export_matched.drop(
+                    columns=[
+                        "_STATUS_CLEAN",
+                        "_TANGGAL_DT"
+                    ],
+                    errors="ignore"
+                )
+
+                export_matched.to_excel(
+                    writer,
+                    sheet_name="MATCHED_OK",
+                    index=False
+                )
+
+            else:
+
+                pd.DataFrame({
                     "INFO": [
                         "Tidak ada data matched."
                     ]
-                }
-            ).to_excel(
-                writer,
-                sheet_name="MATCHED_OK",
-                index=False
-            )
+                }).to_excel(
+                    writer,
+                    sheet_name="MATCHED_OK",
+                    index=False
+                )
 
+            # ------------------------------------------------
+            # FMSS ONLY
+            # ------------------------------------------------
 
-        if not df_selisih_int.empty:
+            if not df_selisih_int.empty:
 
-            df_selisih_int.to_excel(
-                writer,
-                sheet_name="ISSUE_FMSS",
-                index=False
-            )
+                export_fmss = df_selisih_int.copy()
 
-        else:
+                export_fmss = export_fmss.drop(
+                    columns=[
+                        "_STATUS_CLEAN",
+                        "_TANGGAL_DT"
+                    ],
+                    errors="ignore"
+                )
 
-            pd.DataFrame(
-                {
+                export_fmss.to_excel(
+                    writer,
+                    sheet_name="ISSUE_FMSS",
+                    index=False
+                )
+
+            else:
+
+                pd.DataFrame({
                     "INFO": [
                         "Tidak ada issue FMSS."
                     ]
-                }
-            ).to_excel(
-                writer,
-                sheet_name="ISSUE_FMSS",
-                index=False
-            )
+                }).to_excel(
+                    writer,
+                    sheet_name="ISSUE_FMSS",
+                    index=False
+                )
 
+            # ------------------------------------------------
+            # BANK ONLY
+            # ------------------------------------------------
 
-        if not df_selisih_bnk.empty:
+            if not df_selisih_bnk.empty:
 
-            df_selisih_bnk.to_excel(
-                writer,
-                sheet_name="ISSUE_BANK",
-                index=False
-            )
+                export_bank = df_selisih_bnk.copy()
 
-        else:
+                export_bank = export_bank.drop(
+                    columns=[
+                        "_TANGGAL_DT"
+                    ],
+                    errors="ignore"
+                )
 
-            pd.DataFrame(
-                {
+                export_bank.to_excel(
+                    writer,
+                    sheet_name="ISSUE_BANK",
+                    index=False
+                )
+
+            else:
+
+                pd.DataFrame({
                     "INFO": [
                         "Tidak ada issue Bank."
                     ]
-                }
-            ).to_excel(
-                writer,
-                sheet_name="ISSUE_BANK",
-                index=False
-            )
+                }).to_excel(
+                    writer,
+                    sheet_name="ISSUE_BANK",
+                    index=False
+                )
 
+            # ------------------------------------------------
+            # INVALID FMSS
+            # ------------------------------------------------
 
-        if not df_invalid_int.empty:
+            if not df_invalid_int.empty:
 
-            df_invalid_int.to_excel(
-                writer,
-                sheet_name="INVALID_FMSS",
-                index=False
-            )
+                export_invalid_int = (
+                    df_invalid_int.copy()
+                )
 
+                export_invalid_int.to_excel(
+                    writer,
+                    sheet_name="INVALID_FMSS",
+                    index=False
+                )
 
-        if not df_invalid_bnk.empty:
+            else:
 
-            df_invalid_bnk.to_excel(
-                writer,
-                sheet_name="INVALID_BANK",
-                index=False
-            )
+                pd.DataFrame({
+                    "INFO": [
+                        "Tidak ada FMSS invalid VA."
+                    ]
+                }).to_excel(
+                    writer,
+                    sheet_name="INVALID_FMSS",
+                    index=False
+                )
 
+            # ------------------------------------------------
+            # INVALID BANK
+            # ------------------------------------------------
 
-    st.download_button(
-        label="📥 Download Laporan Lengkap (.xlsx)",
-        data=output.getvalue(),
-        file_name="Laporan_Rekonsiliasi_BRIVA.xlsx",
-        mime=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        ),
-        type="primary"
-    )
+            if not df_invalid_bnk.empty:
+
+                export_invalid_bnk = (
+                    df_invalid_bnk.copy()
+                )
+
+                export_invalid_bnk.to_excel(
+                    writer,
+                    sheet_name="INVALID_BANK",
+                    index=False
+                )
+
+            else:
+
+                pd.DataFrame({
+                    "INFO": [
+                        "Tidak ada Bank invalid VA."
+                    ]
+                }).to_excel(
+                    writer,
+                    sheet_name="INVALID_BANK",
+                    index=False
+                )
+
+        output.seek(0)
+
+        st.download_button(
+            label="📥 Download Laporan Lengkap (.xlsx)",
+            data=output.getvalue(),
+            file_name=(
+                f"Laporan_Rekonsiliasi_"
+                f"{pilihan_bank}_"
+                f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            ),
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+            type="primary",
+            use_container_width=True
+        )
+
+    except Exception as e:
+
+        st.error(
+            "❌ Gagal membuat file Excel."
+        )
+
+        st.exception(e)
 
 
 # ============================================================
-# 5. BANK LAIN
+# INFO JIKA BELUM LENGKAP
 # ============================================================
 
-elif (
-    pilihan_bank != ""
-    and pilihan_bank != "BRIVA"
-    and file_int
-    and file_bnk
-):
-
-    st.divider()
-
-    st.warning(
-        f"🚧 Modul rekonsiliasi {pilihan_bank} "
-        "belum diaktifkan pada versi ini."
-    )
-
-
-elif pilihan_bank == "":
+elif pilihan_bank == "BRIVA":
 
     st.info(
-        "💡 Silakan pilih Bank Sumber Mutasi terlebih dahulu."
+        "💡 Upload **3 file** terlebih dahulu: "
+        "FMSS, Mutasi BRIVA 57888, dan Mutasi BRIVA 57708."
     )
+
+elif pilihan_bank != "":
+
+    st.info(
+        f"💡 Upload **2 file** terlebih dahulu: "
+        f"FMSS dan Mutasi {pilihan_bank}."
+    )
+
+else:
+
+    if file_int if "file_int" in locals() else False:
+        st.info(
+            "💡 Silakan pilih **Bank Sumber Mutasi** terlebih dahulu."
+        )
