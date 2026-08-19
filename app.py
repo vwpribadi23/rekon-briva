@@ -94,11 +94,12 @@ def read_uploaded_file_cached(file_bytes, filename):
                 low_memory=False
             )
         except Exception:
+            # Python engine TIDAK mendukung low_memory.
+            # Jangan kirim parameter tersebut ke fallback.
             return pd.read_csv(
                 io.BytesIO(file_bytes),
                 sep=None,
-                engine="python",
-                low_memory=False
+                engine="python"
             )
 
     if filename_lower.endswith(".xlsx"):
