@@ -5,9 +5,11 @@ import io
 import traceback
 from datetime import datetime
 
+
 # ============================================================
 # PAGE CONFIG
 # ============================================================
+
 st.set_page_config(
     page_title="Rekonsiliasi Bank Fastpay",
     layout="wide"
@@ -38,19 +40,28 @@ def extract_va_code(text, prefix: str):
     return match.group(1) if match else None
 
 
-def extractor_regex_prefix(df, source_col, prefix, **_):
+def extractor_regex_prefix(
+    df,
+    source_col,
+    prefix,
+    **_
+):
     return df[source_col].apply(
         lambda x: extract_va_code(x, prefix)
     )
 
 
-def extractor_dedicated_column(df, source_col, **_):
+def extractor_dedicated_column(
+    df,
+    source_col,
+    **_
+):
     s = df[source_col].astype(str).str.strip()
 
     return s.replace({
-        'nan': None,
-        'None': None,
-        '': None
+        "nan": None,
+        "None": None,
+        "": None
     })
 
 
@@ -62,6 +73,7 @@ def extractor_split_delimiter(
     **_
 ):
     def _split(x):
+
         if pd.isna(x):
             return None
 
@@ -70,6 +82,7 @@ def extractor_split_delimiter(
         try:
             value = parts[index].strip()
             return value if value else None
+
         except IndexError:
             return None
 
@@ -83,7 +96,11 @@ EXTRACTOR_REGISTRY = {
 }
 
 
-def apply_extractor(df: pd.DataFrame, spec: dict) -> pd.Series:
+def apply_extractor(
+    df: pd.DataFrame,
+    spec: dict
+) -> pd.Series:
+
     if spec["fn"] not in EXTRACTOR_REGISTRY:
         raise ValueError(
             f"Extractor '{spec['fn']}' belum tersedia."
@@ -97,7 +114,10 @@ def apply_extractor(df: pd.DataFrame, spec: dict) -> pd.Series:
         if k != "fn"
     }
 
-    return fn(df, **kwargs)
+    return fn(
+        df,
+        **kwargs
+    )
 
 
 # ============================================================
@@ -107,6 +127,7 @@ def apply_extractor(df: pd.DataFrame, spec: dict) -> pd.Series:
 BANK_CONFIGS = {
 
     "BRIVA": {
+
         "configured": True,
 
         "internal_extractor": {
@@ -162,23 +183,43 @@ INTERNAL_REQUIRED_COLS = [
 # UTILITIES
 # ============================================================
 
-def parse_nominal(series: pd.Series) -> pd.Series:
+def parse_nominal(
+    series: pd.Series
+) -> pd.Series:
 
     if pd.api.types.is_numeric_dtype(series):
+
         return series.fillna(0)
 
     cleaned = (
-        series.astype(str)
-        .str.replace(r'Rp\.?', '', regex=True)
-        .str.replace(' ', '', regex=False)
-        .str.replace('.', '', regex=False)
-        .str.replace(',', '.', regex=False)
+        series
+        .astype(str)
+        .str.replace(
+            r"Rp\.?",
+            "",
+            regex=True
+        )
+        .str.replace(
+            " ",
+            "",
+            regex=False
+        )
+        .str.replace(
+            ".",
+            "",
+            regex=False
+        )
+        .str.replace(
+            ",",
+            ".",
+            regex=False
+        )
         .str.strip()
     )
 
     return pd.to_numeric(
         cleaned,
-        errors='coerce'
+        errors="coerce"
     ).fillna(0)
 
 
@@ -189,11 +230,13 @@ def validate_columns(
 ):
 
     missing = [
-        c for c in required_cols
+        c
+        for c in required_cols
         if c not in df.columns
     ]
 
     if missing:
+
         raise ValueError(
             f"File **{source_label}** tidak memiliki "
             f"kolom wajib: {', '.join(missing)}.\n\n"
@@ -207,13 +250,16 @@ def read_any(uploaded_file):
     uploaded_file.seek(0)
 
     if uploaded_file.name.lower().endswith(".csv"):
+
         return pd.read_csv(
             uploaded_file,
             sep=None,
             engine="python"
         )
 
-    return pd.read_excel(uploaded_file)
+    return pd.read_excel(
+        uploaded_file
+    )
 
 
 def generate_reconciliation_id():
@@ -235,34 +281,64 @@ def tally_1_to_1(
     di = df_int.copy()
     db = df_bnk.copy()
 
-    # Occurrence number memastikan duplicate VA + nominal
-    # tetap dicocokkan 1-to-1.
+    # --------------------------------------------------------
+    # Occurrence number
+    # Digunakan agar transaksi duplicate tetap
+    # dicocokkan satu-lawan-satu.
+    # --------------------------------------------------------
+
     di["_occ"] = (
-        di.groupby(
-            ["VA_CODE", "NOMINAL_MATCH"]
-        ).cumcount()
+        di
+        .groupby(
+            [
+                "VA_CODE",
+                "NOMINAL_MATCH"
+            ]
+        )
+        .cumcount()
     )
 
     db["_occ"] = (
-        db.groupby(
-            ["VA_CODE", "NOMINAL_MATCH"]
-        ).cumcount()
+        db
+        .groupby(
+            [
+                "VA_CODE",
+                "NOMINAL_MATCH"
+            ]
+        )
+        .cumcount()
     )
+
+    # --------------------------------------------------------
+    # Prefix column
+    # --------------------------------------------------------
 
     di = di.add_prefix("INT__")
     db = db.add_prefix("BNK__")
 
-    di = di.rename(columns={
-        "INT__VA_CODE": "VA_CODE",
-        "INT__NOMINAL_MATCH": "NOMINAL_MATCH",
-        "INT___occ": "_occ"
-    })
+    # --------------------------------------------------------
+    # Rename matching key
+    # --------------------------------------------------------
 
-    db = db.rename(columns={
-        "BNK__VA_CODE": "VA_CODE",
-        "BNK__NOMINAL_MATCH": "NOMINAL_MATCH",
-        "BNK___occ": "_occ"
-    })
+    di = di.rename(
+        columns={
+            "INT__VA_CODE": "VA_CODE",
+            "INT__NOMINAL_MATCH": "NOMINAL_MATCH",
+            "INT___occ": "_occ"
+        }
+    )
+
+    db = db.rename(
+        columns={
+            "BNK__VA_CODE": "VA_CODE",
+            "BNK__NOMINAL_MATCH": "NOMINAL_MATCH",
+            "BNK___occ": "_occ"
+        }
+    )
+
+    # --------------------------------------------------------
+    # Outer merge
+    # --------------------------------------------------------
 
     merged = di.merge(
         db,
@@ -287,7 +363,11 @@ def tally_1_to_1(
         merged["_merge"] == "right_only"
     ].copy()
 
-    return matched, only_int, only_bnk
+    return (
+        matched,
+        only_int,
+        only_bnk
+    )
 
 
 # ============================================================
@@ -302,37 +382,67 @@ def classify_unmatched(
     only_int = only_int.copy()
     only_bnk = only_bnk.copy()
 
+    # --------------------------------------------------------
+    # VA yang masih muncul di kedua sisi berarti:
+    # VA sama tetapi nominal matching berbeda.
+    # --------------------------------------------------------
+
     bank_remaining_va = set(
-        only_bnk["VA_CODE"].dropna()
+        only_bnk[
+            "VA_CODE"
+        ]
+        .dropna()
     )
 
     int_remaining_va = set(
-        only_int["VA_CODE"].dropna()
+        only_int[
+            "VA_CODE"
+        ]
+        .dropna()
     )
 
     if not only_int.empty:
 
-        only_int["ISSUE_TYPE"] = (
-            only_int["VA_CODE"]
-            .isin(bank_remaining_va)
-            .map({
-                True: "AMOUNT_MISMATCH",
-                False: "FMSS_ONLY"
-            })
+        only_int[
+            "ISSUE_TYPE"
+        ] = (
+            only_int[
+                "VA_CODE"
+            ]
+            .isin(
+                bank_remaining_va
+            )
+            .map(
+                {
+                    True: "AMOUNT_MISMATCH",
+                    False: "FMSS_ONLY"
+                }
+            )
         )
 
     if not only_bnk.empty:
 
-        only_bnk["ISSUE_TYPE"] = (
-            only_bnk["VA_CODE"]
-            .isin(int_remaining_va)
-            .map({
-                True: "AMOUNT_MISMATCH",
-                False: "BANK_ONLY"
-            })
+        only_bnk[
+            "ISSUE_TYPE"
+        ] = (
+            only_bnk[
+                "VA_CODE"
+            ]
+            .isin(
+                int_remaining_va
+            )
+            .map(
+                {
+                    True: "AMOUNT_MISMATCH",
+                    False: "BANK_ONLY"
+                }
+            )
         )
 
-    return only_int, only_bnk
+    return (
+        only_int,
+        only_bnk
+    )
 
 
 # ============================================================
@@ -347,9 +457,9 @@ def process_reconciliation(
     df_carry_over: pd.DataFrame = None
 ):
 
-    # --------------------------------------------------------
+    # ========================================================
     # VALIDATE INPUT
-    # --------------------------------------------------------
+    # ========================================================
 
     validate_columns(
         df_int_raw,
@@ -358,8 +468,14 @@ def process_reconciliation(
     )
 
     bank_required = [
-        config["bank_extractor"]["source_col"],
-        config["bank_credit_col"]
+        config[
+            "bank_extractor"
+        ][
+            "source_col"
+        ],
+        config[
+            "bank_credit_col"
+        ]
     ]
 
     validate_columns(
@@ -368,12 +484,14 @@ def process_reconciliation(
         "Mutasi Bank"
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # INTERNAL DATA
-    # --------------------------------------------------------
+    # ========================================================
 
     df_int_success = df_int_raw[
-        df_int_raw["status"]
+        df_int_raw[
+            "status"
+        ]
         .astype(str)
         .str.upper()
         == "SUKSES"
@@ -385,15 +503,19 @@ def process_reconciliation(
 
     total_internal_success_amount = (
         parse_nominal(
-            df_int_success["nominal"]
+            df_int_success[
+                "nominal"
+            ]
         ).sum()
     )
 
-    df_int_success["SUMBER_DATA"] = "BARU"
+    df_int_success[
+        "SUMBER_DATA"
+    ] = "BARU"
 
-    # --------------------------------------------------------
+    # ========================================================
     # CARRY OVER
-    # --------------------------------------------------------
+    # ========================================================
 
     carry_count = 0
 
@@ -408,13 +530,17 @@ def process_reconciliation(
             "Carry-over FMSS"
         )
 
-        df_carry = df_carry_over.copy()
-
-        df_carry["SUMBER_DATA"] = (
-            "CARRY_OVER"
+        df_carry = (
+            df_carry_over.copy()
         )
 
-        carry_count = len(df_carry)
+        df_carry[
+            "SUMBER_DATA"
+        ] = "CARRY_OVER"
+
+        carry_count = len(
+            df_carry
+        )
 
         df_int_success = pd.concat(
             [
@@ -424,53 +550,90 @@ def process_reconciliation(
             ignore_index=True
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # INTERNAL NORMALIZATION
+    # ========================================================
+
+    df_int_success[
+        "VA_CODE"
+    ] = apply_extractor(
+        df_int_success,
+        config[
+            "internal_extractor"
+        ]
+    )
+
+    df_int_success[
+        "NOMINAL_ORIGINAL"
+    ] = parse_nominal(
+        df_int_success[
+            "nominal"
+        ]
+    )
+
+    df_int_success[
+        "NOMINAL_MATCH"
+    ] = (
+        df_int_success[
+            "NOMINAL_ORIGINAL"
+        ]
+        + config[
+            "fee_adjustment"
+        ]
+    )
+
+    # --------------------------------------------------------
+    # Invalid VA FMSS
     # --------------------------------------------------------
 
-    df_int_success["VA_CODE"] = (
-        apply_extractor(
-            df_int_success,
-            config["internal_extractor"]
+    invalid_internal = (
+        df_int_success[
+            df_int_success[
+                "VA_CODE"
+            ].isna()
+        ].copy()
+    )
+
+    # --------------------------------------------------------
+    # Valid FMSS
+    # --------------------------------------------------------
+
+    valid_internal = (
+        df_int_success[
+            df_int_success[
+                "VA_CODE"
+            ].notna()
+        ]
+        .reset_index(
+            drop=True
         )
     )
 
-    df_int_success["NOMINAL_ORIGINAL"] = (
-        parse_nominal(
-            df_int_success["nominal"]
-        )
-    )
-
-    df_int_success["NOMINAL_MATCH"] = (
-        df_int_success["NOMINAL_ORIGINAL"]
-        + config["fee_adjustment"]
-    )
-
-    invalid_internal = df_int_success[
-        df_int_success["VA_CODE"].isna()
-    ].copy()
-
-    valid_internal = df_int_success[
-        df_int_success["VA_CODE"].notna()
-    ].reset_index(drop=True)
-
-    # --------------------------------------------------------
+    # ========================================================
     # BANK DATA
-    # --------------------------------------------------------
+    # ========================================================
 
-    df_bnk = df_bnk_raw.copy()
-
-    df_bnk["NOMINAL_KREDIT_NUM"] = (
-        parse_nominal(
-            df_bnk[
-                config["bank_credit_col"]
-            ]
-        )
+    df_bnk = (
+        df_bnk_raw.copy()
     )
 
-    df_bnk_credit = df_bnk[
-        df_bnk["NOMINAL_KREDIT_NUM"] > 0
-    ].copy()
+    df_bnk[
+        "NOMINAL_KREDIT_NUM"
+    ] = parse_nominal(
+        df_bnk[
+            config[
+                "bank_credit_col"
+            ]
+        ]
+    )
+
+    df_bnk_credit = (
+        df_bnk[
+            df_bnk[
+                "NOMINAL_KREDIT_NUM"
+            ] > 0
+        ].copy()
+    )
 
     total_bank_credit = len(
         df_bnk_credit
@@ -482,28 +645,57 @@ def process_reconciliation(
         ].sum()
     )
 
-    df_bnk_credit["VA_CODE"] = (
-        apply_extractor(
-            df_bnk_credit,
-            config["bank_extractor"]
+    # ========================================================
+    # EXTRACT BANK VA
+    # ========================================================
+
+    df_bnk_credit[
+        "VA_CODE"
+    ] = apply_extractor(
+        df_bnk_credit,
+        config[
+            "bank_extractor"
+        ]
+    )
+
+    # --------------------------------------------------------
+    # Invalid VA Bank
+    # --------------------------------------------------------
+
+    invalid_bank = (
+        df_bnk_credit[
+            df_bnk_credit[
+                "VA_CODE"
+            ].isna()
+        ].copy()
+    )
+
+    # --------------------------------------------------------
+    # Valid Bank
+    # --------------------------------------------------------
+
+    valid_bank = (
+        df_bnk_credit[
+            df_bnk_credit[
+                "VA_CODE"
+            ].notna()
+        ]
+        .reset_index(
+            drop=True
         )
     )
 
-    invalid_bank = df_bnk_credit[
-        df_bnk_credit["VA_CODE"].isna()
-    ].copy()
-
-    valid_bank = df_bnk_credit[
-        df_bnk_credit["VA_CODE"].notna()
-    ].reset_index(drop=True)
-
-    valid_bank["NOMINAL_MATCH"] = (
-        valid_bank["NOMINAL_KREDIT_NUM"]
+    valid_bank[
+        "NOMINAL_MATCH"
+    ] = (
+        valid_bank[
+            "NOMINAL_KREDIT_NUM"
+        ]
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # DATA QUALITY CHECK
-    # --------------------------------------------------------
+    # ========================================================
 
     if valid_internal.empty:
 
@@ -519,41 +711,53 @@ def process_reconciliation(
             "dengan VA valid."
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # MATCH
-    # --------------------------------------------------------
+    # ========================================================
 
-    matched, only_int, only_bnk = (
-        tally_1_to_1(
-            valid_internal,
-            valid_bank
-        )
+    (
+        matched,
+        only_int,
+        only_bnk
+    ) = tally_1_to_1(
+        valid_internal,
+        valid_bank
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # CLASSIFICATION
-    # --------------------------------------------------------
+    # ========================================================
 
-    only_int, only_bnk = (
-        classify_unmatched(
-            only_int,
-            only_bnk
-        )
+    (
+        only_int,
+        only_bnk
+    ) = classify_unmatched(
+        only_int,
+        only_bnk
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # MATCH METADATA
-    # --------------------------------------------------------
+    # ========================================================
 
     if not matched.empty:
 
-        matched["MATCH_STATUS"] = "MATCHED"
+        matched[
+            "MATCH_STATUS"
+        ] = "MATCHED"
 
-        matched["MATCH_AMOUNT"] = (
-            matched["NOMINAL_MATCH"]
+        matched[
+            "MATCH_AMOUNT"
+        ] = (
+            matched[
+                "NOMINAL_MATCH"
+            ]
         )
 
-        # Date audit
+        # ----------------------------------------------------
+        # Date / cutoff audit
+        # ----------------------------------------------------
+
         int_date_col = config.get(
             "internal_date_col"
         )
@@ -581,42 +785,50 @@ def process_reconciliation(
             ):
 
                 d_int = pd.to_datetime(
-                    matched[int_key],
+                    matched[
+                        int_key
+                    ],
                     errors="coerce"
                 )
 
                 d_bank = pd.to_datetime(
-                    matched[bank_key],
+                    matched[
+                        bank_key
+                    ],
                     errors="coerce"
                 )
 
                 matched[
                     "SELISIH_HARI"
                 ] = (
-                    d_bank - d_int
+                    d_bank
+                    - d_int
                 ).dt.days
 
                 matched[
                     "MATCH_TIMING"
-                ] = matched[
-                    "SELISIH_HARI"
-                ].apply(
-                    lambda x:
-                        "UNKNOWN"
-                        if pd.isna(x)
-                        else (
-                            "SAME_DAY"
-                            if x == 0
+                ] = (
+                    matched[
+                        "SELISIH_HARI"
+                    ]
+                    .apply(
+                        lambda x:
+                            "UNKNOWN"
+                            if pd.isna(x)
                             else (
-                                "H+1"
-                                if x == 1
+                                "SAME_DAY"
+                                if x == 0
                                 else (
-                                    "H+2+"
-                                    if x > 1
-                                    else "BANK_BEFORE"
+                                    "H+1"
+                                    if x == 1
+                                    else (
+                                        "H+2+"
+                                        if x > 1
+                                        else "BANK_BEFORE"
+                                    )
                                 )
                             )
-                        )
+                    )
                 )
 
             else:
@@ -635,9 +847,9 @@ def process_reconciliation(
             "RECONCILIATION_ID"
         ] = reconciliation_id
 
-    # --------------------------------------------------------
+    # ========================================================
     # ISSUE METADATA
-    # --------------------------------------------------------
+    # ========================================================
 
     if not only_int.empty:
 
@@ -651,26 +863,34 @@ def process_reconciliation(
             "RECONCILIATION_ID"
         ] = reconciliation_id
 
-    # --------------------------------------------------------
+    # ========================================================
     # SUMMARY
-    # --------------------------------------------------------
+    # ========================================================
 
-    matched_count = len(matched)
+    matched_count = len(
+        matched
+    )
 
     matched_amount = (
-        matched["NOMINAL_MATCH"].sum()
+        matched[
+            "NOMINAL_MATCH"
+        ].sum()
         if not matched.empty
         else 0
     )
 
     issue_fmss_amount = (
-        only_int["NOMINAL_MATCH"].sum()
+        only_int[
+            "NOMINAL_MATCH"
+        ].sum()
         if not only_int.empty
         else 0
     )
 
     issue_bank_amount = (
-        only_bnk["NOMINAL_MATCH"].sum()
+        only_bnk[
+            "NOMINAL_MATCH"
+        ].sum()
         if not only_bnk.empty
         else 0
     )
@@ -691,14 +911,6 @@ def process_reconciliation(
         else 0
     )
 
-    amount_match_rate = (
-        matched_amount
-        / valid_internal["NOMINAL_MATCH"].sum()
-        * 100
-        if valid_internal["NOMINAL_MATCH"].sum()
-        else 0
-    )
-
     expected_amount = (
         valid_internal[
             "NOMINAL_MATCH"
@@ -716,8 +928,18 @@ def process_reconciliation(
         - expected_amount
     )
 
+    amount_match_rate = (
+        matched_amount
+        / expected_amount
+        * 100
+        if expected_amount
+        else 0
+    )
+
     summary = {
-        "reconciliation_id": reconciliation_id,
+
+        "reconciliation_id":
+            reconciliation_id,
 
         "total_internal_success":
             total_internal_success,
@@ -729,11 +951,13 @@ def process_reconciliation(
             len(invalid_internal),
 
         "internal_invalid_va_amount":
-            invalid_internal[
-                "NOMINAL_ORIGINAL"
-            ].sum()
-            if not invalid_internal.empty
-            else 0,
+            (
+                invalid_internal[
+                    "NOMINAL_ORIGINAL"
+                ].sum()
+                if not invalid_internal.empty
+                else 0
+            ),
 
         "total_bank_credit":
             total_bank_credit,
@@ -745,11 +969,13 @@ def process_reconciliation(
             len(invalid_bank),
 
         "bank_invalid_va_amount":
-            invalid_bank[
-                "NOMINAL_KREDIT_NUM"
-            ].sum()
-            if not invalid_bank.empty
-            else 0,
+            (
+                invalid_bank[
+                    "NOMINAL_KREDIT_NUM"
+                ].sum()
+                if not invalid_bank.empty
+                else 0
+            ),
 
         "eligible_internal_count":
             eligible_internal_count,
@@ -808,34 +1034,49 @@ def process_reconciliation(
 # SESSION STATE
 # ============================================================
 
-for key, default in [
+DEFAULT_SESSION = {
 
-    ("sudah_diproses", False),
+    "sudah_diproses": False,
 
-    ("df_matched", pd.DataFrame()),
+    "df_matched":
+        pd.DataFrame(),
 
-    ("df_selisih_int", pd.DataFrame()),
+    "df_selisih_int":
+        pd.DataFrame(),
 
-    ("df_selisih_bnk", pd.DataFrame()),
+    "df_selisih_bnk":
+        pd.DataFrame(),
 
-    ("df_invalid_int", pd.DataFrame()),
+    "df_invalid_int":
+        pd.DataFrame(),
 
-    ("df_invalid_bnk", pd.DataFrame()),
+    "df_invalid_bnk":
+        pd.DataFrame(),
 
-    ("summary", {}),
+    "summary":
+        {},
 
-    ("pilihan_bank_terakhir", ""),
+    "pilihan_bank_terakhir":
+        "",
+}
 
-]:
+
+for key, default in DEFAULT_SESSION.items():
+
     if key not in st.session_state:
-        st.session_state[key] = default
+
+        st.session_state[
+            key
+        ] = default
 
 
 # ============================================================
-# 1. PENGATURAN
+# 1. PENGATURAN DATA
 # ============================================================
 
-st.subheader("1. Pengaturan Data")
+st.subheader(
+    "1. Pengaturan Data"
+)
 
 opsi_bank = [
     ""
@@ -847,6 +1088,10 @@ pilihan_bank = st.selectbox(
     "Pilih Bank Sumber Mutasi:",
     opsi_bank
 )
+
+# ------------------------------------------------------------
+# Reset result jika bank berubah
+# ------------------------------------------------------------
 
 if (
     pilihan_bank
@@ -871,20 +1116,30 @@ mode_dev = st.checkbox(
 )
 
 
+# ============================================================
+# FEE OVERRIDE
+# ============================================================
+
 fee_override = None
 fee_reason = ""
-
 
 if (
     pilihan_bank
     and BANK_CONFIGS
-    .get(pilihan_bank, {})
-    .get("configured")
+    .get(
+        pilihan_bank,
+        {}
+    )
+    .get(
+        "configured"
+    )
 ):
 
-    config_preview = BANK_CONFIGS[
-        pilihan_bank
-    ]
+    config_preview = (
+        BANK_CONFIGS[
+            pilihan_bank
+        ]
+    )
 
     default_fee = int(
         config_preview[
@@ -893,7 +1148,7 @@ if (
     )
 
     fee_override = st.number_input(
-        "Fee/selisih admin "
+        "Fee / selisih admin "
         f"{pilihan_bank}",
         value=default_fee,
         step=500,
@@ -904,13 +1159,16 @@ if (
         )
     )
 
-    if fee_override != default_fee:
+    if (
+        fee_override
+        != default_fee
+    ):
 
         fee_reason = st.text_input(
             "Alasan perubahan fee",
             placeholder=(
-                "Contoh: Tarif admin periode "
-                "Agustus 2026"
+                "Contoh: Tarif admin "
+                "periode Agustus 2026"
             )
         )
 
@@ -924,10 +1182,12 @@ if (
 
 
 # ============================================================
-# 2. UPLOAD
+# 2. UPLOAD FILE
 # ============================================================
 
-st.subheader("2. Unggah File")
+st.subheader(
+    "2. Unggah File"
+)
 
 col1, col2 = st.columns(2)
 
@@ -935,7 +1195,10 @@ with col1:
 
     file_int = st.file_uploader(
         "Unggah CSV/XLSX Dari FMSS",
-        type=["csv", "xlsx"],
+        type=[
+            "csv",
+            "xlsx"
+        ],
         key="int"
     )
 
@@ -951,10 +1214,17 @@ with col2:
 
     file_bnk = st.file_uploader(
         label_bank,
-        type=["csv", "xlsx"],
+        type=[
+            "csv",
+            "xlsx"
+        ],
         key="bnk"
     )
 
+
+# ============================================================
+# CARRY OVER
+# ============================================================
 
 with st.expander(
     "📤 Selisih FMSS dari proses sebelumnya "
@@ -968,7 +1238,10 @@ with st.expander(
 
     file_carry = st.file_uploader(
         "Unggah ISSUE_FMSS sebelumnya",
-        type=["csv", "xlsx"],
+        type=[
+            "csv",
+            "xlsx"
+        ],
         key="carry"
     )
 
@@ -985,11 +1258,15 @@ if (
 
     st.divider()
 
-    config = BANK_CONFIGS[
-        pilihan_bank
-    ]
+    config = (
+        BANK_CONFIGS[
+            pilihan_bank
+        ]
+    )
 
-    if not config.get("configured"):
+    if not config.get(
+        "configured"
+    ):
 
         st.warning(
             f"🚧 Modul {pilihan_bank} "
@@ -1004,9 +1281,15 @@ if (
             type="primary"
         ):
 
+            # ------------------------------------------------
+            # Validate fee override
+            # ------------------------------------------------
+
             if (
                 fee_override
-                != config["fee_adjustment"]
+                != config[
+                    "fee_adjustment"
+                ]
                 and not fee_reason.strip()
             ):
 
@@ -1024,9 +1307,17 @@ if (
                         "rekonsiliasi..."
                     ):
 
+                        # ------------------------------------
+                        # Reconciliation ID
+                        # ------------------------------------
+
                         recon_id = (
                             generate_reconciliation_id()
                         )
+
+                        # ------------------------------------
+                        # Read files
+                        # ------------------------------------
 
                         df_int_raw = read_any(
                             file_int
@@ -1037,20 +1328,33 @@ if (
                         )
 
                         df_carry_raw = (
-                            read_any(file_carry)
+                            read_any(
+                                file_carry
+                            )
                             if file_carry
                             else None
                         )
 
-                        active_config = dict(
-                            config
+                        # ------------------------------------
+                        # Active config
+                        # ------------------------------------
+
+                        active_config = (
+                            config.copy()
                         )
 
-                        if fee_override is not None:
+                        if (
+                            fee_override
+                            is not None
+                        ):
 
                             active_config[
                                 "fee_adjustment"
                             ] = fee_override
+
+                        # ------------------------------------
+                        # Process
+                        # ------------------------------------
 
                         (
                             matched,
@@ -1062,11 +1366,19 @@ if (
                         ) = process_reconciliation(
 
                             df_int_raw,
+
                             df_bnk_raw,
+
                             active_config,
+
                             recon_id,
+
                             df_carry_raw
                         )
+
+                        # ------------------------------------
+                        # Additional audit information
+                        # ------------------------------------
 
                         summary[
                             "bank"
@@ -1074,8 +1386,11 @@ if (
 
                         summary[
                             "processing_time"
-                        ] = datetime.now().strftime(
-                            "%Y-%m-%d %H:%M:%S"
+                        ] = (
+                            datetime.now()
+                            .strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            )
                         )
 
                         summary[
@@ -1086,13 +1401,19 @@ if (
                             "fee_reason"
                         ] = (
                             fee_reason
-                            if fee_override
-                            != config[
-                                "fee_adjustment"
-                            ]
+                            if (
+                                fee_override
+                                != config[
+                                    "fee_adjustment"
+                                ]
+                            )
                             else
                             "DEFAULT_CONFIG"
                         )
+
+                        # ------------------------------------
+                        # Save session
+                        # ------------------------------------
 
                         st.session_state[
                             "df_matched"
@@ -1165,38 +1486,56 @@ if st.session_state[
     "sudah_diproses"
 ]:
 
-    df_matched = st.session_state[
-        "df_matched"
-    ]
+    df_matched = (
+        st.session_state[
+            "df_matched"
+        ]
+    )
 
-    df_selisih_int = st.session_state[
-        "df_selisih_int"
-    ]
+    df_selisih_int = (
+        st.session_state[
+            "df_selisih_int"
+        ]
+    )
 
-    df_selisih_bnk = st.session_state[
-        "df_selisih_bnk"
-    ]
+    df_selisih_bnk = (
+        st.session_state[
+            "df_selisih_bnk"
+        ]
+    )
 
-    df_invalid_int = st.session_state[
-        "df_invalid_int"
-    ]
+    df_invalid_int = (
+        st.session_state[
+            "df_invalid_int"
+        ]
+    )
 
-    df_invalid_bnk = st.session_state[
-        "df_invalid_bnk"
-    ]
+    df_invalid_bnk = (
+        st.session_state[
+            "df_invalid_bnk"
+        ]
+    )
 
-    summary = st.session_state[
-        "summary"
-    ]
+    summary = (
+        st.session_state[
+            "summary"
+        ]
+    )
+
+
+    # ========================================================
+    # RECON SUMMARY
+    # ========================================================
 
     st.subheader(
         f"🎯 Ringkasan Rekonsiliasi "
         f"{pilihan_bank}"
     )
 
-    # --------------------------------------------------------
-    # KPI TRANSACTION
-    # --------------------------------------------------------
+
+    # ========================================================
+    # TRANSACTION KPI
+    # ========================================================
 
     k1, k2, k3, k4 = st.columns(4)
 
@@ -1221,9 +1560,9 @@ if st.session_state[
     )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # FINANCIAL KPI
-    # --------------------------------------------------------
+    # ========================================================
 
     st.markdown(
         "### 💰 Financial Reconciliation"
@@ -1252,9 +1591,9 @@ if st.session_state[
     )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # MATCH RATE
-    # --------------------------------------------------------
+    # ========================================================
 
     r1, r2 = st.columns(2)
 
@@ -1269,23 +1608,40 @@ if st.session_state[
     )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # HEALTH STATUS
-    # --------------------------------------------------------
+    # ========================================================
 
     match_rate = (
-        summary["transaction_match_rate"]
+        summary[
+            "transaction_match_rate"
+        ]
     )
 
     amount_rate = (
-        summary["amount_match_rate"]
+        summary[
+            "amount_match_rate"
+        ]
     )
+
+    invalid_int_count = (
+        summary[
+            "internal_invalid_va_count"
+        ]
+    )
+
+    invalid_bank_count = (
+        summary[
+            "bank_invalid_va_count"
+        ]
+    )
+
 
     if (
         match_rate >= 99.5
         and amount_rate >= 99.5
-        and summary["internal_invalid_va_count"] == 0
-        and summary["bank_invalid_va_count"] == 0
+        and invalid_int_count == 0
+        and invalid_bank_count == 0
     ):
 
         st.success(
@@ -1314,9 +1670,9 @@ if st.session_state[
         )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # DATA QUALITY
-    # --------------------------------------------------------
+    # ========================================================
 
     with st.expander(
         "🔎 Data Quality & Completeness"
@@ -1362,9 +1718,9 @@ if st.session_state[
         )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # CUTOFF
-    # --------------------------------------------------------
+    # ========================================================
 
     if (
         "MATCH_TIMING"
@@ -1435,12 +1791,20 @@ if st.session_state[
             display_int = (
                 df_selisih_int[
                     cols
-                ].rename(
+                ]
+                .rename(
                     columns={
-                        "VA_CODE": "KODE VA",
-                        "INT__nominal": "NOMINAL",
-                        "ISSUE_TYPE": "ISSUE",
-                        "INT__SUMBER_DATA": "SUMBER"
+                        "VA_CODE":
+                            "KODE VA",
+
+                        "INT__nominal":
+                            "NOMINAL",
+
+                        "ISSUE_TYPE":
+                            "ISSUE",
+
+                        "INT__SUMBER_DATA":
+                            "SUMBER"
                     }
                 )
             )
@@ -1471,7 +1835,8 @@ if st.session_state[
         if not df_selisih_bnk.empty:
 
             bank_credit_col_prefixed = (
-                f"BNK__{config['bank_credit_col']}"
+                f"BNK__"
+                f"{config['bank_credit_col']}"
             )
 
             display_bank = (
@@ -1481,12 +1846,17 @@ if st.session_state[
                         bank_credit_col_prefixed,
                         "ISSUE_TYPE"
                     ]
-                ].rename(
+                ]
+                .rename(
                     columns={
-                        "VA_CODE": "KODE VA",
+                        "VA_CODE":
+                            "KODE VA",
+
                         bank_credit_col_prefixed:
                             "NOMINAL",
-                        "ISSUE_TYPE": "ISSUE"
+
+                        "ISSUE_TYPE":
+                            "ISSUE"
                     }
                 )
             )
@@ -1509,7 +1879,8 @@ if st.session_state[
     # ========================================================
 
     with st.expander(
-        "⚠️ Transaksi dengan VA Tidak Teridentifikasi"
+        "⚠️ Transaksi dengan VA "
+        "Tidak Teridentifikasi"
     ):
 
         iv1, iv2 = st.columns(2)
@@ -1566,23 +1937,26 @@ if st.session_state[
         "### 📥 Download Laporan"
     )
 
-    drop_cols = [
-        "NOMINAL_MATCH",
-        "_occ",
-        "_merge"
-    ]
+
+    # --------------------------------------------------------
+    # Prepare FMSS issue export
+    # --------------------------------------------------------
 
     issue_fmss_export = (
         df_selisih_int
         .drop(
-            columns=drop_cols,
+            columns=[
+                "NOMINAL_MATCH",
+                "_occ",
+                "_merge"
+            ],
             errors="ignore"
         )
         .copy()
     )
 
     issue_fmss_export.columns = [
-        c.replace(
+        str(c).replace(
             "INT__",
             ""
         )
@@ -1590,232 +1964,558 @@ if st.session_state[
     ]
 
 
+    # --------------------------------------------------------
+    # Prepare matched export
+    # --------------------------------------------------------
+
     matched_export = (
         df_matched
         .drop(
-            columns=drop_cols,
+            columns=[
+                "NOMINAL_MATCH",
+                "_occ",
+                "_merge"
+            ],
             errors="ignore"
         )
         .copy()
     )
 
+
+    # --------------------------------------------------------
+    # Prepare bank issue export
+    # --------------------------------------------------------
 
     issue_bank_export = (
         df_selisih_bnk
         .drop(
-            columns=drop_cols,
+            columns=[
+                "NOMINAL_MATCH",
+                "_occ",
+                "_merge"
+            ],
             errors="ignore"
         )
         .copy()
     )
 
 
+    # ========================================================
+    # CREATE EXCEL
+    #
+    # IMPORTANT:
+    # Gunakan XlsxWriter, bukan OpenPyXL.
+    # ========================================================
+
     output = io.BytesIO()
 
-    with pd.ExcelWriter(
-        output,
-        engine="openpyxl"
-    ):
+    try:
+
+        with pd.ExcelWriter(
+            output,
+            engine="xlsxwriter"
+        ) as writer:
+
+            workbook = writer.book
+
+            # ------------------------------------------------
+            # Excel formats
+            # ------------------------------------------------
+
+            header_format = workbook.add_format({
+                "bold": True,
+                "border": 1,
+                "align": "center",
+                "valign": "vcenter"
+            })
+
+            money_format = workbook.add_format({
+                "num_format": '#,##0'
+            })
+
+            percent_format = workbook.add_format({
+                "num_format": '0.00%'
+            })
+
+            title_format = workbook.add_format({
+                "bold": True,
+                "font_size": 14
+            })
+
+
+            # =================================================
+            # SUMMARY
+            # =================================================
+
+            summary_df = pd.DataFrame([
+                {
+                    "RECONCILIATION_ID":
+                        summary[
+                            "reconciliation_id"
+                        ],
+
+                    "BANK":
+                        summary[
+                            "bank"
+                        ],
+
+                    "PROCESSING_TIME":
+                        summary[
+                            "processing_time"
+                        ],
+
+                    "EXPECTED_AMOUNT":
+                        summary[
+                            "expected_amount"
+                        ],
+
+                    "ACTUAL_BANK_AMOUNT":
+                        summary[
+                            "actual_amount"
+                        ],
+
+                    "MATCHED_AMOUNT":
+                        summary[
+                            "matched_amount"
+                        ],
+
+                    "AMOUNT_DIFFERENCE":
+                        summary[
+                            "amount_difference"
+                        ],
+
+                    "TRANSACTION_MATCH_RATE":
+                        summary[
+                            "transaction_match_rate"
+                        ] / 100,
+
+                    "AMOUNT_MATCH_RATE":
+                        summary[
+                            "amount_match_rate"
+                        ] / 100,
+
+                    "FMSS_ISSUE_COUNT":
+                        summary[
+                            "issue_fmss_count"
+                        ],
+
+                    "FMSS_ISSUE_AMOUNT":
+                        summary[
+                            "issue_fmss_amount"
+                        ],
+
+                    "BANK_ISSUE_COUNT":
+                        summary[
+                            "issue_bank_count"
+                        ],
+
+                    "BANK_ISSUE_AMOUNT":
+                        summary[
+                            "issue_bank_amount"
+                        ],
+
+                    "FMSS_INVALID_VA":
+                        summary[
+                            "internal_invalid_va_count"
+                        ],
+
+                    "BANK_INVALID_VA":
+                        summary[
+                            "bank_invalid_va_count"
+                        ],
+
+                    "CARRY_OVER_COUNT":
+                        summary[
+                            "carry_over_count"
+                        ],
+
+                    "FEE_ADJUSTMENT":
+                        summary[
+                            "fee_adjustment"
+                        ],
+
+                    "FEE_REASON":
+                        summary[
+                            "fee_reason"
+                        ],
+                }
+            ])
+
+
+            summary_df.to_excel(
+                writer,
+                sheet_name="SUMMARY",
+                index=False
+            )
+
+            ws_summary = (
+                writer.sheets[
+                    "SUMMARY"
+                ]
+            )
+
+            # Header formatting
+            for col_num, value in enumerate(
+                summary_df.columns
+            ):
+
+                ws_summary.write(
+                    0,
+                    col_num,
+                    value,
+                    header_format
+                )
+
+            ws_summary.freeze_panes(
+                1,
+                0
+            )
+
+            ws_summary.set_column(
+                0,
+                len(summary_df.columns) - 1,
+                20
+            )
+
+            # Amount columns
+            amount_columns = [
+                "EXPECTED_AMOUNT",
+                "ACTUAL_BANK_AMOUNT",
+                "MATCHED_AMOUNT",
+                "AMOUNT_DIFFERENCE",
+                "FMSS_ISSUE_AMOUNT",
+                "BANK_ISSUE_AMOUNT",
+                "FEE_ADJUSTMENT"
+            ]
+
+            for col_name in amount_columns:
+
+                if (
+                    col_name
+                    in summary_df.columns
+                ):
+
+                    idx = (
+                        summary_df.columns
+                        .get_loc(
+                            col_name
+                        )
+                    )
+
+                    ws_summary.set_column(
+                        idx,
+                        idx,
+                        20,
+                        money_format
+                    )
+
+            # Percentage columns
+            for col_name in [
+                "TRANSACTION_MATCH_RATE",
+                "AMOUNT_MATCH_RATE"
+            ]:
+
+                idx = (
+                    summary_df.columns
+                    .get_loc(
+                        col_name
+                    )
+                )
+
+                ws_summary.set_column(
+                    idx,
+                    idx,
+                    22,
+                    percent_format
+                )
+
+
+            # =================================================
+            # ISSUE FMSS
+            # =================================================
+
+            if not issue_fmss_export.empty:
+
+                issue_fmss_export.to_excel(
+                    writer,
+                    sheet_name="ISSUE_FMSS",
+                    index=False
+                )
+
+            else:
+
+                pd.DataFrame({
+                    "Info": [
+                        "Bersih! Tidak ada selisih FMSS."
+                    ]
+                }).to_excel(
+                    writer,
+                    sheet_name="ISSUE_FMSS",
+                    index=False
+                )
+
+            ws_fmss = (
+                writer.sheets[
+                    "ISSUE_FMSS"
+                ]
+            )
+
+            ws_fmss.freeze_panes(
+                1,
+                0
+            )
+
+            ws_fmss.autofilter(
+                0,
+                0,
+                max(
+                    len(
+                        issue_fmss_export
+                    ),
+                    1
+                ),
+                max(
+                    len(
+                        issue_fmss_export.columns
+                    ) - 1,
+                    0
+                )
+            )
+
+
+            # =================================================
+            # ISSUE BANK
+            # =================================================
+
+            if not issue_bank_export.empty:
+
+                issue_bank_export.to_excel(
+                    writer,
+                    sheet_name="ISSUE_BANK",
+                    index=False
+                )
+
+            else:
+
+                pd.DataFrame({
+                    "Info": [
+                        "Bersih! Tidak ada selisih Bank."
+                    ]
+                }).to_excel(
+                    writer,
+                    sheet_name="ISSUE_BANK",
+                    index=False
+                )
+
+            ws_bank = (
+                writer.sheets[
+                    "ISSUE_BANK"
+                ]
+            )
+
+            ws_bank.freeze_panes(
+                1,
+                0
+            )
+
+            ws_bank.autofilter(
+                0,
+                0,
+                max(
+                    len(
+                        issue_bank_export
+                    ),
+                    1
+                ),
+                max(
+                    len(
+                        issue_bank_export.columns
+                    ) - 1,
+                    0
+                )
+            )
+
+
+            # =================================================
+            # MATCHED
+            # =================================================
+
+            if not matched_export.empty:
+
+                matched_export.to_excel(
+                    writer,
+                    sheet_name="MATCHED_OK",
+                    index=False
+                )
+
+            else:
+
+                pd.DataFrame({
+                    "Info": [
+                        "Tidak ada data matched."
+                    ]
+                }).to_excel(
+                    writer,
+                    sheet_name="MATCHED_OK",
+                    index=False
+                )
+
+            ws_matched = (
+                writer.sheets[
+                    "MATCHED_OK"
+                ]
+            )
+
+            ws_matched.freeze_panes(
+                1,
+                0
+            )
+
+            ws_matched.autofilter(
+                0,
+                0,
+                max(
+                    len(
+                        matched_export
+                    ),
+                    1
+                ),
+                max(
+                    len(
+                        matched_export.columns
+                    ) - 1,
+                    0
+                )
+            )
+
+
+            # =================================================
+            # INVALID VA FMSS
+            # =================================================
+
+            if not df_invalid_int.empty:
+
+                df_invalid_int.to_excel(
+                    writer,
+                    sheet_name="INVALID_VA_FMSS",
+                    index=False
+                )
+
+                ws_invalid_int = (
+                    writer.sheets[
+                        "INVALID_VA_FMSS"
+                    ]
+                )
+
+                ws_invalid_int.freeze_panes(
+                    1,
+                    0
+                )
+
+
+            # =================================================
+            # INVALID VA BANK
+            # =================================================
+
+            if not df_invalid_bnk.empty:
+
+                df_invalid_bnk.to_excel(
+                    writer,
+                    sheet_name="INVALID_VA_BANK",
+                    index=False
+                )
+
+                ws_invalid_bnk = (
+                    writer.sheets[
+                        "INVALID_VA_BANK"
+                    ]
+                )
+
+                ws_invalid_bnk.freeze_panes(
+                    1,
+                    0
+                )
+
 
         # ----------------------------------------------------
-        # SUMMARY
+        # IMPORTANT:
+        # Ambil bytes setelah ExcelWriter selesai.
         # ----------------------------------------------------
 
-        summary_df = pd.DataFrame([
-            {
-                "RECONCILIATION_ID":
-                    summary["reconciliation_id"],
-
-                "BANK":
-                    summary["bank"],
-
-                "PROCESSING_TIME":
-                    summary["processing_time"],
-
-                "EXPECTED_AMOUNT":
-                    summary["expected_amount"],
-
-                "ACTUAL_BANK_AMOUNT":
-                    summary["actual_amount"],
-
-                "MATCHED_AMOUNT":
-                    summary["matched_amount"],
-
-                "AMOUNT_DIFFERENCE":
-                    summary["amount_difference"],
-
-                "TRANSACTION_MATCH_RATE":
-                    summary["transaction_match_rate"],
-
-                "AMOUNT_MATCH_RATE":
-                    summary["amount_match_rate"],
-
-                "FMSS_ISSUE_COUNT":
-                    summary["issue_fmss_count"],
-
-                "FMSS_ISSUE_AMOUNT":
-                    summary["issue_fmss_amount"],
-
-                "BANK_ISSUE_COUNT":
-                    summary["issue_bank_count"],
-
-                "BANK_ISSUE_AMOUNT":
-                    summary["issue_bank_amount"],
-
-                "FMSS_INVALID_VA":
-                    summary["internal_invalid_va_count"],
-
-                "BANK_INVALID_VA":
-                    summary["bank_invalid_va_count"],
-
-                "CARRY_OVER_COUNT":
-                    summary["carry_over_count"],
-
-                "FEE_ADJUSTMENT":
-                    summary["fee_adjustment"],
-
-                "FEE_REASON":
-                    summary["fee_reason"],
-            }
-        ])
-
-        summary_df.to_excel(
-            writer,
-            sheet_name="SUMMARY",
-            index=False
+        excel_data = (
+            output.getvalue()
         )
 
 
-        # ----------------------------------------------------
-        # ISSUE FMSS
-        # ----------------------------------------------------
+        # ====================================================
+        # DOWNLOAD BUTTON
+        # ====================================================
 
-        if not issue_fmss_export.empty:
+        st.download_button(
 
-            issue_fmss_export.to_excel(
-                writer,
-                sheet_name="ISSUE_FMSS",
-                index=False
+            label=(
+                "📥 Download Laporan "
+                "Rekonsiliasi Lengkap (.xlsx)"
+            ),
+
+            data=excel_data,
+
+            file_name=(
+                f"Laporan_Rekonsiliasi_"
+                f"{pilihan_bank}_"
+                f"{summary['reconciliation_id']}.xlsx"
+            ),
+
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+
+            type="primary"
+        )
+
+        st.success(
+            "✅ Laporan Excel berhasil dibuat "
+            "dan siap didownload."
+        )
+
+        st.caption(
+            "💡 Sheet ISSUE_FMSS dapat digunakan "
+            "sebagai carry-over pada proses "
+            "rekonsiliasi berikutnya."
+        )
+
+
+    except Exception as e:
+
+        st.error(
+            "❌ Rekonsiliasi berhasil diproses, "
+            "tetapi laporan Excel gagal dibuat."
+        )
+
+        if mode_dev:
+
+            st.code(
+                traceback.format_exc()
             )
 
         else:
 
-            pd.DataFrame({
-                "Info": [
-                    "Bersih! Tidak ada selisih FMSS."
-                ]
-            }).to_excel(
-                writer,
-                sheet_name="ISSUE_FMSS",
-                index=False
+            st.caption(
+                f"Technical detail: {e}"
             )
 
 
-        # ----------------------------------------------------
-        # ISSUE BANK
-        # ----------------------------------------------------
-
-        if not issue_bank_export.empty:
-
-            issue_bank_export.to_excel(
-                writer,
-                sheet_name="ISSUE_BANK",
-                index=False
-            )
-
-        else:
-
-            pd.DataFrame({
-                "Info": [
-                    "Bersih! Tidak ada selisih Bank."
-                ]
-            }).to_excel(
-                writer,
-                sheet_name="ISSUE_BANK",
-                index=False
-            )
-
-
-        # ----------------------------------------------------
-        # MATCHED
-        # ----------------------------------------------------
-
-        if not matched_export.empty:
-
-            matched_export.to_excel(
-                writer,
-                sheet_name="MATCHED_OK",
-                index=False
-            )
-
-        else:
-
-            pd.DataFrame({
-                "Info": [
-                    "Tidak ada data matched."
-                ]
-            }).to_excel(
-                writer,
-                sheet_name="MATCHED_OK",
-                index=False
-            )
-
-
-        # ----------------------------------------------------
-        # INVALID VA
-        # ----------------------------------------------------
-
-        if not df_invalid_int.empty:
-
-            df_invalid_int.to_excel(
-                writer,
-                sheet_name="INVALID_VA_FMSS",
-                index=False
-            )
-
-        if not df_invalid_bnk.empty:
-
-            df_invalid_bnk.to_excel(
-                writer,
-                sheet_name="INVALID_VA_BANK",
-                index=False
-            )
-
-
-    st.download_button(
-
-        label=(
-            "📥 Download Laporan "
-            "Rekonsiliasi Lengkap (.xlsx)"
-        ),
-
-        data=output.getvalue(),
-
-        file_name=(
-            f"Laporan_Rekonsiliasi_"
-            f"{pilihan_bank}_"
-            f"{summary['reconciliation_id']}.xlsx"
-        ),
-
-        mime=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        ),
-
-        type="primary"
-    )
-
-
-    st.caption(
-        "💡 Sheet ISSUE_FMSS dapat digunakan "
-        "sebagai carry-over pada proses "
-        "rekonsiliasi berikutnya."
-    )
-
+# ============================================================
+# EMPTY STATE
+# ============================================================
 
 elif (
     pilihan_bank == ""
-    and (file_int or file_bnk)
+    and (
+        file_int
+        or file_bnk
+    )
 ):
 
     st.info(
