@@ -1,4 +1,5 @@
-# VERSION: v4 FINAL - BNIVA robust VA parser + pre-match diagnostics\nimport streamlit as st
+# VERSION: v4 FINAL - BNIVA robust VA parser + pre-match diagnostics
+import streamlit as st
 import pandas as pd
 import re
 import io
