@@ -63,12 +63,17 @@ def find_column(df, candidates, required=True):
             return candidate
 
     mapping = {
-        str(col).strip().lower(): col
+        re.sub(r"\\s+", " ", str(col).replace("\\ufeff", "").strip()).lower(): col
         for col in df.columns
     }
 
     for candidate in candidates:
-        key = str(candidate).strip().lower()
+        key = re.sub(
+            r"\\s+",
+            " ",
+            str(candidate).replace("\\ufeff", "").strip()
+        ).lower()
+
         if key in mapping:
             return mapping[key]
 
@@ -684,13 +689,41 @@ if can_process:
                 ):
                     df = read_uploaded_file(uploaded_file).copy()
 
+                    # Bersihkan BOM / whitespace pada header tanpa
+                    # mengubah isi transaksi.
+                    df.columns = [
+                        str(col).replace("\\ufeff", "").strip()
+                        for col in df.columns
+                    ]
+
+                    # ------------------------------------------------
+                    # BANK COLUMN MAPPING
+                    # ------------------------------------------------
+                    # BNIVA actual file menggunakan:
+                    #   Post Date | Value Date | Branch | Journal No.
+                    #   Description | Debit | Credit | Unnamed: 7
+                    #
+                    # BRIVA existing file umumnya menggunakan:
+                    #   MUTASI_KREDIT / KREDIT
+                    #   DESK_TRAN / KETERANGAN
+                    #   TGL_TRAN / TANGGAL
+                    #
+                    # Karena engine dipakai bersama BNIVA + BRIVA,
+                    # mapping dibuat fleksibel tanpa mengubah logika
+                    # matching sama sekali.
+
                     col_credit = find_column(
                         df,
                         [
                             "MUTASI_KREDIT",
                             "mutasi_kredit",
                             "KREDIT",
-                            "kredit"
+                            "kredit",
+                            "Credit",
+                            "CREDIT",
+                            "credit",
+                            "Credit Amount",
+                            "CREDIT_AMOUNT"
                         ]
                     )
 
@@ -702,7 +735,11 @@ if can_process:
                             "KETERANGAN",
                             "keterangan",
                             "DESCRIPTION",
-                            "description"
+                            "description",
+                            "Description",
+                            "DESCRIPTION_TRAN",
+                            "Detail",
+                            "DETAIL"
                         ]
                     )
 
@@ -716,7 +753,13 @@ if can_process:
                             "TANGGAL",
                             "tanggal",
                             "POSTING_DATE",
-                            "posting_date"
+                            "posting_date",
+                            "Post Date",
+                            "POST DATE",
+                            "post date",
+                            "Value Date",
+                            "VALUE DATE",
+                            "value date"
                         ]
                     )
 
