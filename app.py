@@ -1,1644 +1,1433 @@
 import streamlit as st
 import pandas as pd
-import io
 import re
-import traceback
-from datetime import datetime
+import io
+from openpyxl import Workbook
 
 
 # ============================================================
-# PAGE CONFIG
+# 1. PAGE CONFIG
 # ============================================================
 
 st.set_page_config(
     page_title="Rekonsiliasi Bank Fastpay",
+    page_icon="📊",
     layout="wide"
 )
 
 st.title("📊 Rekonsiliasi Bank Fastpay")
-
 st.write(
     "Dashboard rekonsiliasi otomatis antara data deposit FMSS "
-    "dengan mutasi BRIVA Fastpay dan BRIVA Rajabiller."
+    "dengan mutasi bank."
 )
 
 st.divider()
 
 
 # ============================================================
-# KONFIGURASI PREFIX
-# ============================================================
-
-PREFIX_FASTPAY = "57888"
-PREFIX_RAJABILLER = "57708"
-
-TYPE_FASTPAY = "BRIVA FASTPAY"
-TYPE_RAJABILLER = "BRIVA RAJABILLER"
-
-
-# ============================================================
-# KONFIGURASI FEE
-# ============================================================
-#
-# Default:
-# FMSS nominal + Rp1.000 = nominal bank
-#
-# Jika ternyata Rajabiller memiliki fee berbeda,
-# tinggal ubah angka di UI.
-#
-
-DEFAULT_FEE_FASTPAY = 1000
-DEFAULT_FEE_RAJABILLER = 1000
-
-
-# ============================================================
-# SESSION STATE
+# 2. SESSION STATE
 # ============================================================
 
 DEFAULT_STATE = {
-
-    "processed": False,
-
-    "result_fastpay": {},
-    "result_rajabiller": {},
-
-    "invalid_fmss": pd.DataFrame(),
-    "invalid_bank_fastpay": pd.DataFrame(),
-    "invalid_bank_rajabiller": pd.DataFrame(),
-
-    "summary": {},
-
-    "last_process_id": "",
-
+    "sudah_diproses": False,
+    "df_matched": pd.DataFrame(),
+    "df_issue_fmss": pd.DataFrame(),
+    "df_issue_bank": pd.DataFrame(),
+    "df_invalid_fmss": pd.DataFrame(),
+    "df_invalid_bank": pd.DataFrame(),
+    "pilihan_bank_terakhir": "",
 }
 
-
 for key, value in DEFAULT_STATE.items():
-
     if key not in st.session_state:
-
         st.session_state[key] = value
 
 
 # ============================================================
-# HELPER - READ FILE
+# 3. HELPER FUNCTIONS
 # ============================================================
 
-def read_file(uploaded_file):
+def reset_result():
+    st.session_state.sudah_diproses = False
+    st.session_state.df_matched = pd.DataFrame()
+    st.session_state.df_issue_fmss = pd.DataFrame()
+    st.session_state.df_issue_bank = pd.DataFrame()
+    st.session_state.df_invalid_fmss = pd.DataFrame()
+    st.session_state.df_invalid_bank = pd.DataFrame()
+
+
+def read_uploaded_file(uploaded_file):
+    """
+    Membaca CSV/XLSX secara fleksibel.
+    """
+    if uploaded_file is None:
+        return pd.DataFrame()
 
     uploaded_file.seek(0)
 
     filename = uploaded_file.name.lower()
 
     if filename.endswith(".csv"):
-
-        return pd.read_csv(
-            uploaded_file,
-            sep=None,
-            engine="python"
-        )
+        try:
+            return pd.read_csv(
+                uploaded_file,
+                sep=None,
+                engine="python",
+                dtype=str
+            )
+        except Exception:
+            uploaded_file.seek(0)
+            return pd.read_csv(
+                uploaded_file,
+                dtype=str
+            )
 
     elif filename.endswith(".xlsx"):
-
         return pd.read_excel(
-            uploaded_file
+            uploaded_file,
+            dtype=str
         )
 
-    else:
-
-        raise ValueError(
-            f"Format file tidak didukung: {filename}"
-        )
+    raise ValueError(
+        f"Format file tidak didukung: {uploaded_file.name}"
+    )
 
 
-# ============================================================
-# HELPER - VALIDATE COLUMN
-# ============================================================
+def normalize_columns(df):
+    """
+    Normalisasi nama kolom agar lebih aman.
+    """
+    df = df.copy()
 
-def validate_columns(
-    df,
-    required_columns,
-    source_name
-):
-
-    missing = [
-        col
-        for col in required_columns
-        if col not in df.columns
+    df.columns = [
+        str(col).strip()
+        for col in df.columns
     ]
 
-    if missing:
-
-        raise ValueError(
-            f"{source_name} tidak memiliki kolom wajib: "
-            f"{', '.join(missing)}"
-        )
+    return df
 
 
-# ============================================================
-# HELPER - PARSE NOMINAL
-# ============================================================
+def find_column(df, candidates):
+    """
+    Mencari nama kolom berdasarkan kandidat.
+    """
+    normalized = {
+        str(col).strip().lower(): col
+        for col in df.columns
+    }
 
-def parse_nominal(series):
+    for candidate in candidates:
+        key = candidate.strip().lower()
 
-    if pd.api.types.is_numeric_dtype(series):
+        if key in normalized:
+            return normalized[key]
 
-        return pd.to_numeric(
-            series,
-            errors="coerce"
-        ).fillna(0)
+    return None
 
-    text = (
-        series
-        .astype(str)
-        .str.strip()
+
+def numeric_value(series):
+    """
+    Konversi angka dengan aman.
+    Mendukung format:
+    1,000
+    1.000
+    1000
+    Rp 1.000
+    """
+    if series is None:
+        return pd.Series(dtype=float)
+
+    s = series.astype(str).str.strip()
+
+    s = (
+        s.str.replace("Rp", "", regex=False)
+         .str.replace("rp", "", regex=False)
+         .str.replace(" ", "", regex=False)
     )
 
-    # Format Indonesia:
-    # 1.999.000
-    # 1.999.000,00
-
-    text = (
-        text
-        .str.replace(
-            "Rp",
-            "",
-            regex=False
-        )
-        .str.replace(
-            "rp",
-            "",
-            regex=False
-        )
-        .str.replace(
-            " ",
-            "",
-            regex=False
-        )
-    )
-
-    text = (
-        text
-        .str.replace(
-            ".",
-            "",
-            regex=False
-        )
-        .str.replace(
-            ",",
-            ".",
-            regex=False
-        )
-    )
+    # Jika terdapat format Indonesia 1.999.000
+    # ubah menjadi 1999000
+    s = s.str.replace(",", "", regex=False)
+    s = s.str.replace(".", "", regex=False)
 
     return pd.to_numeric(
-        text,
+        s,
         errors="coerce"
     ).fillna(0)
 
 
-# ============================================================
-# HELPER - EXTRACT VA
-# ============================================================
+def extract_va(text):
+    """
+    Mengenali dua prefix BRIVA:
 
-def extract_va(
-    text,
-    prefixes
-):
+    57888 = BRIVA FASTPAY
+    57708 = BRIVA RAJABILLER
+    """
 
     if pd.isna(text):
-
-        return None, None
+        return None
 
     text = str(text)
 
-    for prefix, va_type in prefixes.items():
+    match = re.search(
+        r"(57888\d{5,15}|57708\d{5,15})",
+        text
+    )
 
-        # Prefix + 5 sampai 15 digit
-        pattern = (
-            rf"({re.escape(prefix)}\d{{5,15}})"
+    if match:
+        return match.group(1)
+
+    return None
+
+
+def classify_va(va):
+    """
+    Menentukan jenis VA.
+    """
+
+    if pd.isna(va) or va is None:
+        return "TIDAK TERIDENTIFIKASI"
+
+    va = str(va)
+
+    if va.startswith("57888"):
+        return "BRIVA FASTPAY"
+
+    if va.startswith("57708"):
+        return "BRIVA RAJABILLER"
+
+    return "TIDAK TERIDENTIFIKASI"
+
+
+def extract_va_by_prefix(text, prefix):
+    """
+    Ekstraksi VA untuk file bank tertentu.
+    """
+
+    if pd.isna(text):
+        return None
+
+    text = str(text)
+
+    match = re.search(
+        rf"({prefix}\d{{5,15}})",
+        text
+    )
+
+    if match:
+        return match.group(1)
+
+    return None
+
+
+def safe_prepare_excel_df(df):
+    """
+    Membersihkan dataframe sebelum dimasukkan ke Excel.
+
+    Ini penting untuk mencegah error ExcelWriter/openpyxl,
+    terutama jika terdapat datetime, NaN, Inf, atau timezone.
+    """
+
+    if df is None or df.empty:
+        return pd.DataFrame({"INFO": ["Tidak ada data"]})
+
+    result = df.copy()
+
+    for col in result.columns:
+
+        # Datetime
+        if pd.api.types.is_datetime64_any_dtype(result[col]):
+            try:
+                result[col] = result[col].dt.tz_localize(None)
+            except Exception:
+                pass
+
+            result[col] = result[col].astype(str)
+
+        # Object berisi timezone datetime
+        if result[col].dtype == "object":
+            try:
+                result[col] = result[col].apply(
+                    lambda x: (
+                        x.tz_localize(None)
+                        if hasattr(x, "tzinfo")
+                        and x.tzinfo is not None
+                        else x
+                    )
+                )
+            except Exception:
+                pass
+
+        # Inf
+        result[col] = result[col].replace(
+            [float("inf"), float("-inf")],
+            None
         )
 
-        match = re.search(
-            pattern,
-            text
-        )
+    return result
 
-        if match:
 
-            return (
-                match.group(1),
-                va_type
+def dataframe_to_excel(dataframes):
+    """
+    Membuat file Excel dengan openpyxl secara aman.
+
+    dataframes:
+    {
+        "MATCHED_OK": df,
+        "ISSUE_FMSS": df,
+        ...
+    }
+    """
+
+    output = io.BytesIO()
+
+    wb = Workbook()
+
+    # Hapus sheet default
+    default_sheet = wb.active
+    wb.remove(default_sheet)
+
+    for sheet_name, df in dataframes.items():
+
+        # Excel maksimal 31 karakter untuk nama sheet
+        sheet_name = sheet_name[:31]
+
+        ws = wb.create_sheet(title=sheet_name)
+
+        clean_df = safe_prepare_excel_df(df)
+
+        # Header
+        for col_idx, column in enumerate(
+            clean_df.columns,
+            start=1
+        ):
+            ws.cell(
+                row=1,
+                column=col_idx,
+                value=str(column)
             )
 
-    return (
-        None,
-        None
-    )
+        # Data
+        for row_idx, row in enumerate(
+            clean_df.itertuples(index=False, name=None),
+            start=2
+        ):
+            for col_idx, value in enumerate(
+                row,
+                start=1
+            ):
 
+                if pd.isna(value):
+                    value = None
 
-# ============================================================
-# HELPER - APPLY VA
-# ============================================================
+                # Hindari object aneh masuk Excel
+                if not isinstance(
+                    value,
+                    (
+                        str,
+                        int,
+                        float,
+                        bool,
+                        type(None)
+                    )
+                ):
+                    value = str(value)
 
-def apply_va(
-    df,
-    source_column,
-    prefixes
-):
+                ws.cell(
+                    row=row_idx,
+                    column=col_idx,
+                    value=value
+                )
 
-    df = df.copy()
+        # Auto width
+        for column_cells in ws.columns:
 
-    extracted = (
-        df[source_column]
-        .apply(
-            lambda x:
-            extract_va(
-                x,
-                prefixes
+            max_length = 0
+            column_letter = column_cells[0].column_letter
+
+            for cell in column_cells:
+
+                try:
+                    cell_length = len(str(cell.value))
+                    if cell_length > max_length:
+                        max_length = cell_length
+                except Exception:
+                    pass
+
+            ws.column_dimensions[
+                column_letter
+            ].width = min(
+                max(max_length + 2, 10),
+                50
             )
-        )
-    )
 
-    df["VA_CODE"] = extracted.apply(
-        lambda x: x[0]
-    )
+    wb.save(output)
 
-    df["VA_TYPE"] = extracted.apply(
-        lambda x: x[1]
-    )
+    output.seek(0)
 
-    return df
+    return output.getvalue()
 
 
-# ============================================================
-# HELPER - OCCURRENCE KEY
-# ============================================================
-#
-# Penting untuk transaksi duplicate.
-#
-# Contoh:
-#
-# VA 578881234
-# Rp 100.000
-#
-# muncul 3x.
-#
-# Maka transaksi ke-1, ke-2, ke-3
-# tetap dapat dicocokkan 1-to-1.
-#
+def make_issue_table(df, issue_type):
+    """
+    Membuat tabel ringkas untuk tampilan dashboard.
+    """
 
-def add_occurrence_key(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
 
-    df = df.copy()
+    result = pd.DataFrame()
 
-    df["_OCCURRENCE"] = (
-        df
-        .groupby(
-            [
-                "VA_CODE",
-                "NOMINAL_MATCH"
-            ],
-            dropna=False
-        )
-        .cumcount()
-    )
+    if "VA" in df.columns:
+        result["KODE VA"] = df["VA"]
 
-    return df
+    if "JENIS VA" in df.columns:
+        result["JENIS VA"] = df["JENIS VA"]
+
+    if "nominal" in df.columns:
+        result["NOMINAL"] = df["nominal"]
+
+    elif "MUTASI_KREDIT_NUM" in df.columns:
+        result["NOMINAL"] = df["MUTASI_KREDIT_NUM"]
+
+    if "ISSUE" in df.columns:
+        result["ISSUE"] = df["ISSUE"]
+
+    else:
+        result["ISSUE"] = issue_type
+
+    return result
 
 
 # ============================================================
-# RECONCILIATION ENGINE
+# 4. PENGATURAN BANK
 # ============================================================
 
-def reconcile_pair(
-    df_internal,
-    df_bank,
-    fee_adjustment,
-    recon_name,
-    recon_id
+st.subheader("1. Pengaturan Data")
+
+opsi_bank = [
+    "",
+    "BRIVA",
+    "BNIVA",
+    "BCAVA",
+    "MANDIRIVA",
+    "BSIVA",
+    "MuamalatVA"
+]
+
+pilihan_bank = st.selectbox(
+    "Pilih Bank Sumber Mutasi:",
+    opsi_bank
+)
+
+
+# Reset jika bank berubah
+if (
+    pilihan_bank
+    != st.session_state.pilihan_bank_terakhir
 ):
 
-    # --------------------------------------------------------
-    # INTERNAL
-    # --------------------------------------------------------
+    reset_result()
 
-    validate_columns(
-        df_internal,
-        [
-            "status",
-            "keterangan",
-            "nominal"
-        ],
-        f"FMSS {recon_name}"
+    st.session_state.pilihan_bank_terakhir = (
+        pilihan_bank
     )
 
-    # --------------------------------------------------------
-    # BANK
-    # --------------------------------------------------------
 
-    validate_columns(
-        df_bank,
-        [
-            "DESK_TRAN",
-            "MUTASI_KREDIT"
-        ],
-        f"Bank {recon_name}"
-    )
+# ============================================================
+# 5. UPLOAD FILE
+# ============================================================
 
-    # --------------------------------------------------------
-    # FMSS SUCCESS
-    # --------------------------------------------------------
+st.subheader("2. Unggah File")
 
-    df_int = (
-        df_internal[
-            df_internal[
-                "status"
-            ]
-            .astype(str)
-            .str.upper()
-            .eq("SUKSES")
-        ]
-        .copy()
-    )
 
-    total_fmss_success = len(df_int)
+if pilihan_bank == "BRIVA":
 
-    # --------------------------------------------------------
-    # EXTRACT VA FMSS
-    # --------------------------------------------------------
+    # ========================================================
+    # BRIVA → 3 FILE
+    # ========================================================
 
-    df_int = apply_va(
-        df_int,
-        "keterangan",
-        {
-            PREFIX_FASTPAY:
-                TYPE_FASTPAY,
+    col1, col2, col3 = st.columns(3)
 
-            PREFIX_RAJABILLER:
-                TYPE_RAJABILLER
-        }
-    )
+    with col1:
 
-    # --------------------------------------------------------
-    # NOMINAL FMSS
-    # --------------------------------------------------------
+        st.markdown("### 📄 FMSS")
 
-    df_int[
-        "NOMINAL_ORIGINAL"
-    ] = parse_nominal(
-        df_int[
-            "nominal"
-        ]
-    )
-
-    df_int[
-        "NOMINAL_MATCH"
-    ] = (
-        df_int[
-            "NOMINAL_ORIGINAL"
-        ]
-        + fee_adjustment
-    )
-
-    # --------------------------------------------------------
-    # INVALID FMSS
-    # --------------------------------------------------------
-
-    invalid_fmss = (
-        df_int[
-            df_int[
-                "VA_CODE"
-            ].isna()
-        ]
-        .copy()
-    )
-
-    # --------------------------------------------------------
-    # VALID FMSS
-    # --------------------------------------------------------
-
-    valid_fmss = (
-        df_int[
-            df_int[
-                "VA_CODE"
-            ].notna()
-        ]
-        .copy()
-        .reset_index(
-            drop=True
+        file_int = st.file_uploader(
+            "Upload data FMSS",
+            type=["csv", "xlsx"],
+            key="fmss_briva"
         )
-    )
 
-    # --------------------------------------------------------
-    # BANK CREDIT
-    # --------------------------------------------------------
+    with col2:
 
-    df_bank = df_bank.copy()
+        st.markdown("### 🏦 BRIVA Fastpay")
 
-    df_bank[
-        "MUTASI_KREDIT_NUM"
-    ] = parse_nominal(
-        df_bank[
-            "MUTASI_KREDIT"
-        ]
-    )
+        st.caption("Prefix VA: 57888")
 
-    df_bank = (
-        df_bank[
-            df_bank[
-                "MUTASI_KREDIT_NUM"
-            ] > 0
-        ]
-        .copy()
-    )
-
-    total_bank_credit = len(df_bank)
-
-    # --------------------------------------------------------
-    # EXTRACT BANK VA
-    # --------------------------------------------------------
-
-    bank_prefix = (
-        PREFIX_FASTPAY
-        if recon_name == "FASTPAY"
-        else PREFIX_RAJABILLER
-    )
-
-    bank_type = (
-        TYPE_FASTPAY
-        if recon_name == "FASTPAY"
-        else TYPE_RAJABILLER
-    )
-
-    df_bank = apply_va(
-        df_bank,
-        "DESK_TRAN",
-        {
-            bank_prefix:
-                bank_type
-        }
-    )
-
-    # --------------------------------------------------------
-    # INVALID BANK
-    # --------------------------------------------------------
-
-    invalid_bank = (
-        df_bank[
-            df_bank[
-                "VA_CODE"
-            ].isna()
-        ]
-        .copy()
-    )
-
-    # --------------------------------------------------------
-    # VALID BANK
-    # --------------------------------------------------------
-
-    valid_bank = (
-        df_bank[
-            df_bank[
-                "VA_CODE"
-            ].notna()
-        ]
-        .copy()
-        .reset_index(
-            drop=True
+        file_bnk_57888 = st.file_uploader(
+            "Upload mutasi BRIVA 57888",
+            type=["csv", "xlsx"],
+            key="briva_57888"
         )
-    )
 
-    valid_bank[
-        "NOMINAL_MATCH"
-    ] = (
-        valid_bank[
-            "MUTASI_KREDIT_NUM"
-        ]
-    )
+    with col3:
 
-    # --------------------------------------------------------
-    # ADD OCCURRENCE
-    # --------------------------------------------------------
+        st.markdown("### 🏦 BRIVA Rajabiller")
 
-    valid_fmss = add_occurrence_key(
-        valid_fmss
-    )
+        st.caption("Prefix VA: 57708")
 
-    valid_bank = add_occurrence_key(
-        valid_bank
-    )
-
-    # ========================================================
-    # MERGE 1-TO-1
-    # ========================================================
-
-    matched = pd.merge(
-        valid_fmss,
-        valid_bank,
-        on=[
-            "VA_CODE",
-            "NOMINAL_MATCH",
-            "_OCCURRENCE"
-        ],
-        how="outer",
-        indicator=True,
-        suffixes=(
-            "_FMSS",
-            "_BANK"
+        file_bnk_57708 = st.file_uploader(
+            "Upload mutasi BRIVA 57708",
+            type=["csv", "xlsx"],
+            key="briva_57708"
         )
-    )
-
-    # --------------------------------------------------------
-    # MATCHED
-    # --------------------------------------------------------
-
-    matched_ok = (
-        matched[
-            matched[
-                "_merge"
-            ].eq("both")
-        ]
-        .copy()
-    )
-
-    matched_ok[
-        "MATCH_STATUS"
-    ] = "MATCHED"
-
-    matched_ok[
-        "RECONCILIATION_ID"
-    ] = recon_id
-
-    matched_ok[
-        "RECON_TYPE"
-    ] = recon_name
-
-    # --------------------------------------------------------
-    # FMSS ONLY
-    # --------------------------------------------------------
-
-    fmss_only = (
-        matched[
-            matched[
-                "_merge"
-            ].eq("left_only")
-        ]
-        .copy()
-    )
-
-    fmss_only[
-        "ISSUE_TYPE"
-    ] = "FMSS_ONLY"
-
-    fmss_only[
-        "RECONCILIATION_ID"
-    ] = recon_id
-
-    fmss_only[
-        "RECON_TYPE"
-    ] = recon_name
-
-    # --------------------------------------------------------
-    # BANK ONLY
-    # --------------------------------------------------------
-
-    bank_only = (
-        matched[
-            matched[
-                "_merge"
-            ].eq("right_only")
-        ]
-        .copy()
-    )
-
-    bank_only[
-        "ISSUE_TYPE"
-    ] = "BANK_ONLY"
-
-    bank_only[
-        "RECONCILIATION_ID"
-    ] = recon_id
-
-    bank_only[
-        "RECON_TYPE"
-    ] = recon_name
 
     # ========================================================
-    # AMOUNT MISMATCH DETECTION
+    # FEE
     # ========================================================
-    #
-    # Jika VA sama tetapi nominal berbeda,
-    # jangan hanya dianggap FMSS_ONLY / BANK_ONLY.
-    #
-    # Kita tandai sebagai AMOUNT_MISMATCH.
-    #
 
-    fmss_only_va = set(
-        fmss_only[
-            "VA_CODE"
-        ]
-        .dropna()
+    st.subheader("3. Konfigurasi Fee")
+
+    fee_col1, fee_col2 = st.columns(2)
+
+    with fee_col1:
+
+        fee_57888 = st.number_input(
+            "Fee BRIVA Fastpay (57888)",
+            min_value=0,
+            value=1000,
+            step=100
+        )
+
+    with fee_col2:
+
+        fee_57708 = st.number_input(
+            "Fee BRIVA Rajabiller (57708)",
+            min_value=0,
+            value=1000,
+            step=100
+        )
+
+    st.caption(
+        "Rumus matching: Nominal FMSS + Fee = Nominal Mutasi Bank"
     )
 
-    bank_only_va = set(
-        bank_only[
-            "VA_CODE"
-        ]
-        .dropna()
+    semua_file_ada = (
+        file_int
+        and file_bnk_57888
+        and file_bnk_57708
     )
 
-    common_issue_va = (
-        fmss_only_va
-        &
-        bank_only_va
+
+else:
+
+    # ========================================================
+    # BANK LAIN → 2 FILE
+    # ========================================================
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+
+        file_int = st.file_uploader(
+            "Upload data FMSS",
+            type=["csv", "xlsx"],
+            key="fmss_other"
+        )
+
+    with col2:
+
+        label_bank = (
+            f"Upload Mutasi Bank ({pilihan_bank})"
+            if pilihan_bank
+            else
+            "Upload Mutasi Bank"
+        )
+
+        file_bnk = st.file_uploader(
+            label_bank,
+            type=["csv", "xlsx"],
+            key="bank_other"
+        )
+
+    semua_file_ada = (
+        pilihan_bank != ""
+        and file_int
+        and file_bnk
     )
 
-    if common_issue_va:
 
-        fmss_only.loc[
-            fmss_only[
-                "VA_CODE"
-            ].isin(
-                common_issue_va
-            ),
-            "ISSUE_TYPE"
-        ] = "AMOUNT_MISMATCH"
+# ============================================================
+# 6. PROSES REKONSILIASI BRIVA
+# ============================================================
 
-        bank_only.loc[
-            bank_only[
-                "VA_CODE"
-            ].isin(
-                common_issue_va
-            ),
-            "ISSUE_TYPE"
-        ] = "AMOUNT_MISMATCH"
+if pilihan_bank == "BRIVA" and semua_file_ada:
+
+    st.divider()
+
+    if st.button(
+        "🚀 Mulai Croscek Data BRIVA",
+        type="primary",
+        use_container_width=True
+    ):
+
+        reset_result()
+
+        with st.spinner(
+            "Sedang memproses rekonsiliasi BRIVA..."
+        ):
+
+            try:
+
+                # ====================================================
+                # READ FILE
+                # ====================================================
+
+                df_int = normalize_columns(
+                    read_uploaded_file(file_int)
+                )
+
+                df_bank_57888 = normalize_columns(
+                    read_uploaded_file(file_bnk_57888)
+                )
+
+                df_bank_57708 = normalize_columns(
+                    read_uploaded_file(file_bnk_57708)
+                )
+
+
+                # ====================================================
+                # VALIDASI KOLOM FMSS
+                # ====================================================
+
+                status_col = find_column(
+                    df_int,
+                    [
+                        "status"
+                    ]
+                )
+
+                keterangan_col = find_column(
+                    df_int,
+                    [
+                        "keterangan",
+                        "deskripsi",
+                        "description"
+                    ]
+                )
+
+                nominal_col = find_column(
+                    df_int,
+                    [
+                        "nominal",
+                        "amount"
+                    ]
+                )
+
+                if not status_col:
+                    raise ValueError(
+                        "Kolom 'status' tidak ditemukan di file FMSS."
+                    )
+
+                if not keterangan_col:
+                    raise ValueError(
+                        "Kolom 'keterangan' tidak ditemukan di file FMSS."
+                    )
+
+                if not nominal_col:
+                    raise ValueError(
+                        "Kolom 'nominal' tidak ditemukan di file FMSS."
+                    )
+
+
+                # ====================================================
+                # FMSS SUCCESS
+                # ====================================================
+
+                df_int_success = df_int[
+                    df_int[status_col]
+                    .astype(str)
+                    .str.upper()
+                    .str.strip()
+                    == "SUKSES"
+                ].copy()
+
+
+                # ====================================================
+                # EXTRACT VA FMSS
+                # ====================================================
+
+                df_int_success["VA"] = (
+                    df_int_success[keterangan_col]
+                    .apply(extract_va)
+                )
+
+                df_int_success["JENIS VA"] = (
+                    df_int_success["VA"]
+                    .apply(classify_va)
+                )
+
+                df_int_success["nominal"] = (
+                    numeric_value(
+                        df_int_success[nominal_col]
+                    )
+                )
+
+
+                # ====================================================
+                # FMSS INVALID VA
+                #
+                # Transaksi SUKSES tetapi tidak menemukan
+                # prefix 57888 / 57708
+                # ====================================================
+
+                df_invalid_fmss = (
+                    df_int_success[
+                        df_int_success["VA"].isna()
+                    ]
+                    .copy()
+                )
+
+                if not df_invalid_fmss.empty:
+
+                    df_invalid_fmss["ISSUE"] = (
+                        "VA_TIDAK_TERIDENTIFIKASI"
+                    )
+
+
+                # Hanya transaksi yang punya VA valid
+                df_int_valid = (
+                    df_int_success[
+                        df_int_success["VA"].notna()
+                    ]
+                    .copy()
+                )
+
+
+                # ====================================================
+                # PROCESS BANK 57888
+                # ====================================================
+
+                desk_57888 = find_column(
+                    df_bank_57888,
+                    [
+                        "DESK_TRAN",
+                        "desk_tran",
+                        "keterangan",
+                        "deskripsi"
+                    ]
+                )
+
+                credit_57888 = find_column(
+                    df_bank_57888,
+                    [
+                        "MUTASI_KREDIT",
+                        "mutasi_kredit",
+                        "kredit",
+                        "credit"
+                    ]
+                )
+
+                if not desk_57888:
+                    raise ValueError(
+                        "Kolom DESK_TRAN/keterangan tidak ditemukan "
+                        "pada file mutasi BRIVA 57888."
+                    )
+
+                if not credit_57888:
+                    raise ValueError(
+                        "Kolom MUTASI_KREDIT/kredit tidak ditemukan "
+                        "pada file mutasi BRIVA 57888."
+                    )
+
+                df_bank_57888["MUTASI_KREDIT_NUM"] = (
+                    numeric_value(
+                        df_bank_57888[credit_57888]
+                    )
+                )
+
+                df_bank_57888 = df_bank_57888[
+                    df_bank_57888["MUTASI_KREDIT_NUM"] > 0
+                ].copy()
+
+                df_bank_57888["VA"] = (
+                    df_bank_57888[desk_57888]
+                    .apply(
+                        lambda x:
+                        extract_va_by_prefix(
+                            x,
+                            "57888"
+                        )
+                    )
+                )
+
+                df_bank_57888["JENIS VA"] = (
+                    "BRIVA FASTPAY"
+                )
+
+
+                # ====================================================
+                # BANK INVALID 57888
+                # ====================================================
+
+                invalid_bank_57888 = (
+                    df_bank_57888[
+                        df_bank_57888["VA"].isna()
+                    ]
+                    .copy()
+                )
+
+                if not invalid_bank_57888.empty:
+
+                    invalid_bank_57888["ISSUE"] = (
+                        "VA_TIDAK_TERIDENTIFIKASI"
+                    )
+
+
+                df_bank_57888_valid = (
+                    df_bank_57888[
+                        df_bank_57888["VA"].notna()
+                    ]
+                    .copy()
+                )
+
+
+                # ====================================================
+                # PROCESS BANK 57708
+                # ====================================================
+
+                desk_57708 = find_column(
+                    df_bank_57708,
+                    [
+                        "DESK_TRAN",
+                        "desk_tran",
+                        "keterangan",
+                        "deskripsi"
+                    ]
+                )
+
+                credit_57708 = find_column(
+                    df_bank_57708,
+                    [
+                        "MUTASI_KREDIT",
+                        "mutasi_kredit",
+                        "kredit",
+                        "credit"
+                    ]
+                )
+
+                if not desk_57708:
+                    raise ValueError(
+                        "Kolom DESK_TRAN/keterangan tidak ditemukan "
+                        "pada file mutasi BRIVA 57708."
+                    )
+
+                if not credit_57708:
+                    raise ValueError(
+                        "Kolom MUTASI_KREDIT/kredit tidak ditemukan "
+                        "pada file mutasi BRIVA 57708."
+                    )
+
+                df_bank_57708["MUTASI_KREDIT_NUM"] = (
+                    numeric_value(
+                        df_bank_57708[credit_57708]
+                    )
+                )
+
+                df_bank_57708 = df_bank_57708[
+                    df_bank_57708["MUTASI_KREDIT_NUM"] > 0
+                ].copy()
+
+                df_bank_57708["VA"] = (
+                    df_bank_57708[desk_57708]
+                    .apply(
+                        lambda x:
+                        extract_va_by_prefix(
+                            x,
+                            "57708"
+                        )
+                    )
+                )
+
+                df_bank_57708["JENIS VA"] = (
+                    "BRIVA RAJABILLER"
+                )
+
+
+                # ====================================================
+                # BANK INVALID 57708
+                # ====================================================
+
+                invalid_bank_57708 = (
+                    df_bank_57708[
+                        df_bank_57708["VA"].isna()
+                    ]
+                    .copy()
+                )
+
+                if not invalid_bank_57708.empty:
+
+                    invalid_bank_57708["ISSUE"] = (
+                        "VA_TIDAK_TERIDENTIFIKASI"
+                    )
+
+
+                df_bank_57708_valid = (
+                    df_bank_57708[
+                        df_bank_57708["VA"].notna()
+                    ]
+                    .copy()
+                )
+
+
+                # ====================================================
+                # MATCHING FUNCTION
+                # ====================================================
+
+                def reconcile(
+                    df_fmss,
+                    df_bank,
+                    fee,
+                    jenis_va
+                ):
+
+                    fmss = df_fmss[
+                        df_fmss["JENIS VA"]
+                        == jenis_va
+                    ].copy()
+
+                    bank = df_bank.copy()
+
+                    if fmss.empty:
+
+                        return (
+                            pd.DataFrame(),
+                            pd.DataFrame(),
+                            bank
+                        )
+
+                    if bank.empty:
+
+                        fmss["ISSUE"] = "FMSS_ONLY"
+
+                        return (
+                            pd.DataFrame(),
+                            fmss,
+                            pd.DataFrame()
+                        )
+
+
+                    # -----------------------------------------------
+                    # NOMINAL ADJUSTMENT
+                    # -----------------------------------------------
+
+                    fmss["NOMINAL_INT_ADJ"] = (
+                        fmss["nominal"] + fee
+                    )
+
+
+                    # -----------------------------------------------
+                    # OCCURRENCE NUMBER
+                    #
+                    # Digunakan agar transaksi duplicate tetap
+                    # dicocokkan 1-to-1.
+                    # -----------------------------------------------
+
+                    fmss["_MATCH_NO"] = (
+                        fmss
+                        .groupby(
+                            [
+                                "VA",
+                                "NOMINAL_INT_ADJ"
+                            ],
+                            dropna=False
+                        )
+                        .cumcount()
+                    )
+
+                    bank["_MATCH_NO"] = (
+                        bank
+                        .groupby(
+                            [
+                                "VA",
+                                "MUTASI_KREDIT_NUM"
+                            ],
+                            dropna=False
+                        )
+                        .cumcount()
+                    )
+
+
+                    # -----------------------------------------------
+                    # MERGE 1-to-1
+                    # -----------------------------------------------
+
+                    matched = pd.merge(
+                        fmss,
+                        bank,
+                        left_on=[
+                            "VA",
+                            "NOMINAL_INT_ADJ",
+                            "_MATCH_NO"
+                        ],
+                        right_on=[
+                            "VA",
+                            "MUTASI_KREDIT_NUM",
+                            "_MATCH_NO"
+                        ],
+                        how="inner",
+                        suffixes=(
+                            "_FMSS",
+                            "_BANK"
+                        )
+                    )
+
+
+                    # -----------------------------------------------
+                    # FMSS UNMATCHED
+                    # -----------------------------------------------
+
+                    fmss_key = set(
+                        zip(
+                            fmss["VA"],
+                            fmss["NOMINAL_INT_ADJ"],
+                            fmss["_MATCH_NO"]
+                        )
+                    )
+
+                    matched_key = set(
+                        zip(
+                            matched["VA"],
+                            matched["NOMINAL_INT_ADJ"],
+                            matched["_MATCH_NO"]
+                        )
+                    )
+
+                    unmatched_fmss_key = (
+                        fmss_key - matched_key
+                    )
+
+                    unmatched_fmss = fmss[
+                        fmss.apply(
+                            lambda row:
+                            (
+                                row["VA"],
+                                row["NOMINAL_INT_ADJ"],
+                                row["_MATCH_NO"]
+                            )
+                            in unmatched_fmss_key,
+                            axis=1
+                        )
+                    ].copy()
+
+
+                    # -----------------------------------------------
+                    # BANK UNMATCHED
+                    # -----------------------------------------------
+
+                    bank_key = set(
+                        zip(
+                            bank["VA"],
+                            bank["MUTASI_KREDIT_NUM"],
+                            bank["_MATCH_NO"]
+                        )
+                    )
+
+                    matched_bank_key = set(
+                        zip(
+                            matched["VA"],
+                            matched["MUTASI_KREDIT_NUM"],
+                            matched["_MATCH_NO"]
+                        )
+                    )
+
+                    unmatched_bank_key = (
+                        bank_key - matched_bank_key
+                    )
+
+                    unmatched_bank = bank[
+                        bank.apply(
+                            lambda row:
+                            (
+                                row["VA"],
+                                row["MUTASI_KREDIT_NUM"],
+                                row["_MATCH_NO"]
+                            )
+                            in unmatched_bank_key,
+                            axis=1
+                        )
+                    ].copy()
+
+
+                    # -----------------------------------------------
+                    # ISSUE
+                    # -----------------------------------------------
+
+                    if not unmatched_fmss.empty:
+                        unmatched_fmss["ISSUE"] = (
+                            "FMSS_ONLY"
+                        )
+
+                    if not unmatched_bank.empty:
+                        unmatched_bank["ISSUE"] = (
+                            "BANK_ONLY"
+                        )
+
+
+                    # -----------------------------------------------
+                    # MATCHED
+                    # -----------------------------------------------
+
+                    if not matched.empty:
+
+                        matched["JENIS VA"] = (
+                            jenis_va
+                        )
+
+                        matched["MATCH_STATUS"] = (
+                            "MATCHED_OK"
+                        )
+
+                        matched["FEE"] = fee
+
+
+                    # Cleanup
+                    drop_cols = [
+                        "_MATCH_NO"
+                    ]
+
+                    matched = matched.drop(
+                        columns=drop_cols,
+                        errors="ignore"
+                    )
+
+                    unmatched_fmss = unmatched_fmss.drop(
+                        columns=drop_cols,
+                        errors="ignore"
+                    )
+
+                    unmatched_bank = unmatched_bank.drop(
+                        columns=drop_cols,
+                        errors="ignore"
+                    )
+
+                    return (
+                        matched,
+                        unmatched_fmss,
+                        unmatched_bank
+                    )
+
+
+                # ====================================================
+                # RECONCILE FASTPAY
+                # ====================================================
+
+                (
+                    matched_57888,
+                    issue_fmss_57888,
+                    issue_bank_57888
+                ) = reconcile(
+                    df_int_valid,
+                    df_bank_57888_valid,
+                    fee_57888,
+                    "BRIVA FASTPAY"
+                )
+
+
+                # ====================================================
+                # RECONCILE RAJABILLER
+                # ====================================================
+
+                (
+                    matched_57708,
+                    issue_fmss_57708,
+                    issue_bank_57708
+                ) = reconcile(
+                    df_int_valid,
+                    df_bank_57708_valid,
+                    fee_57708,
+                    "BRIVA RAJABILLER"
+                )
+
+
+                # ====================================================
+                # COMBINE RESULT
+                # ====================================================
+
+                matched_all = pd.concat(
+                    [
+                        matched_57888,
+                        matched_57708
+                    ],
+                    ignore_index=True
+                )
+
+                issue_fmss_all = pd.concat(
+                    [
+                        issue_fmss_57888,
+                        issue_fmss_57708
+                    ],
+                    ignore_index=True
+                )
+
+                issue_bank_all = pd.concat(
+                    [
+                        issue_bank_57888,
+                        issue_bank_57708
+                    ],
+                    ignore_index=True
+                )
+
+                invalid_fmss_all = (
+                    df_invalid_fmss
+                    .copy()
+                )
+
+                invalid_bank_all = pd.concat(
+                    [
+                        invalid_bank_57888,
+                        invalid_bank_57708
+                    ],
+                    ignore_index=True
+                )
+
+
+                # ====================================================
+                # SAVE SESSION STATE
+                # ====================================================
+
+                st.session_state.df_matched = (
+                    matched_all
+                )
+
+                st.session_state.df_issue_fmss = (
+                    issue_fmss_all
+                )
+
+                st.session_state.df_issue_bank = (
+                    issue_bank_all
+                )
+
+                st.session_state.df_invalid_fmss = (
+                    invalid_fmss_all
+                )
+
+                st.session_state.df_invalid_bank = (
+                    invalid_bank_all
+                )
+
+                st.session_state.sudah_diproses = True
+
+
+                st.success(
+                    "Rekonsiliasi BRIVA selesai."
+                )
+
+
+            except Exception as e:
+
+                st.session_state.sudah_diproses = False
+
+                st.error(
+                    "Terjadi kesalahan saat memproses data."
+                )
+
+                st.exception(e)
+
+
+# ============================================================
+# 7. BANK LAIN
+# ============================================================
+
+elif (
+    pilihan_bank != ""
+    and pilihan_bank != "BRIVA"
+    and semua_file_ada
+):
+
+    st.divider()
+
+    if st.button(
+        f"🚀 Mulai Croscek Data {pilihan_bank}",
+        type="primary",
+        use_container_width=True
+    ):
+
+        st.warning(
+            f"Modul rekonsiliasi {pilihan_bank} "
+            "belum diaktifkan. Struktur upload sudah "
+            "disiapkan agar bank ini dapat ditambahkan "
+            "tanpa mengubah dashboard utama."
+        )
+
+
+# ============================================================
+# 8. HASIL REKONSILIASI BRIVA
+# ============================================================
+
+if (
+    pilihan_bank == "BRIVA"
+    and st.session_state.sudah_diproses
+):
+
+    df_matched = (
+        st.session_state.df_matched
+    )
+
+    df_issue_fmss = (
+        st.session_state.df_issue_fmss
+    )
+
+    df_issue_bank = (
+        st.session_state.df_issue_bank
+    )
+
+    df_invalid_fmss = (
+        st.session_state.df_invalid_fmss
+    )
+
+    df_invalid_bank = (
+        st.session_state.df_invalid_bank
+    )
+
 
     # ========================================================
     # SUMMARY
     # ========================================================
 
-    expected_amount = (
-        valid_fmss[
-            "NOMINAL_MATCH"
-        ].sum()
-    )
-
-    bank_amount = (
-        valid_bank[
-            "NOMINAL_MATCH"
-        ].sum()
-    )
-
-    matched_amount = (
-        matched_ok[
-            "NOMINAL_MATCH"
-        ].sum()
-        if not matched_ok.empty
-        else 0
-    )
-
-    fmss_issue_amount = (
-        fmss_only[
-            "NOMINAL_MATCH"
-        ].sum()
-        if not fmss_only.empty
-        else 0
-    )
-
-    bank_issue_amount = (
-        bank_only[
-            "NOMINAL_MATCH"
-        ].sum()
-        if not bank_only.empty
-        else 0
-    )
-
-    valid_fmss_count = len(
-        valid_fmss
-    )
-
-    matched_count = len(
-        matched_ok
-    )
-
-    transaction_match_rate = (
-        matched_count
-        /
-        valid_fmss_count
-        *
-        100
-        if valid_fmss_count > 0
-        else 0
-    )
-
-    amount_match_rate = (
-        matched_amount
-        /
-        expected_amount
-        *
-        100
-        if expected_amount > 0
-        else 0
-    )
-
-    amount_difference = (
-        bank_amount
-        -
-        expected_amount
-    )
-
-    summary = {
-
-        "recon_type":
-            recon_name,
-
-        "reconciliation_id":
-            recon_id,
-
-        "fmss_success":
-            total_fmss_success,
-
-        "fmss_valid_va":
-            valid_fmss_count,
-
-        "fmss_invalid_va":
-            len(invalid_fmss),
-
-        "bank_credit":
-            total_bank_credit,
-
-        "bank_valid_va":
-            len(valid_bank),
-
-        "bank_invalid_va":
-            len(invalid_bank),
-
-        "matched":
-            matched_count,
-
-        "issue_fmss":
-            len(fmss_only),
-
-        "issue_bank":
-            len(bank_only),
-
-        "expected_amount":
-            expected_amount,
-
-        "bank_amount":
-            bank_amount,
-
-        "matched_amount":
-            matched_amount,
-
-        "fmss_issue_amount":
-            fmss_issue_amount,
-
-        "bank_issue_amount":
-            bank_issue_amount,
-
-        "amount_difference":
-            amount_difference,
-
-        "transaction_match_rate":
-            transaction_match_rate,
-
-        "amount_match_rate":
-            amount_match_rate,
-
-        "fee_adjustment":
-            fee_adjustment
-
-    }
-
-    return {
-
-        "matched":
-            matched_ok,
-
-        "issue_fmss":
-            fmss_only,
-
-        "issue_bank":
-            bank_only,
-
-        "invalid_fmss":
-            invalid_fmss,
-
-        "invalid_bank":
-            invalid_bank,
-
-        "summary":
-            summary
-
-    }
-
-
-# ============================================================
-# DISPLAY MONEY
-# ============================================================
-
-def rupiah(value):
-
-    try:
-
-        return (
-            f"Rp {float(value):,.0f}"
-        )
-
-    except:
-
-        return "Rp 0"
-
-
-# ============================================================
-# DISPLAY SUMMARY
-# ============================================================
-
-def render_recon_summary(
-    result,
-    title
-):
-
-    summary = result[
-        "summary"
-    ]
-
-    st.markdown(
-        f"### {title}"
-    )
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    c1.metric(
-        "Matched",
-        f"{summary['matched']:,}"
-    )
-
-    c2.metric(
-        "Issue FMSS",
-        f"{summary['issue_fmss']:,}"
-    )
-
-    c3.metric(
-        "Issue Bank",
-        f"{summary['issue_bank']:,}"
-    )
-
-    c4.metric(
-        "Match Rate",
-        f"{summary['transaction_match_rate']:.2f}%"
-    )
-
-    c5, c6, c7, c8 = st.columns(4)
-
-    c5.metric(
-        "Expected",
-        rupiah(
-            summary[
-                "expected_amount"
-            ]
-        )
-    )
-
-    c6.metric(
-        "Actual Bank",
-        rupiah(
-            summary[
-                "bank_amount"
-            ]
-        )
-    )
-
-    c7.metric(
-        "Matched Amount",
-        rupiah(
-            summary[
-                "matched_amount"
-            ]
-        )
-    )
-
-    c8.metric(
-        "Amount Difference",
-        rupiah(
-            summary[
-                "amount_difference"
-            ]
-        )
-    )
-
-    if (
-        summary[
-            "transaction_match_rate"
-        ] >= 99.5
-        and
-        summary[
-            "amount_match_rate"
-        ] >= 99.5
-    ):
-
-        st.success(
-            "🟢 Rekonsiliasi sehat"
-        )
-
-    elif (
-        summary[
-            "transaction_match_rate"
-        ] >= 98
-        and
-        summary[
-            "amount_match_rate"
-        ] >= 98
-    ):
-
-        st.warning(
-            "🟡 Rekonsiliasi perlu review"
-        )
-
-    else:
-
-        st.error(
-            "🔴 Rekonsiliasi memiliki issue signifikan"
-        )
-
-
-# ============================================================
-# UI - UPLOAD
-# ============================================================
-
-st.subheader(
-    "1. Upload Data"
-)
-
-col1, col2, col3 = st.columns(3)
-
-
-with col1:
-
-    st.markdown(
-        "**📄 FMSS**"
-    )
-
-    file_fmss = st.file_uploader(
-        "Upload data FMSS",
-        type=[
-            "csv",
-            "xlsx"
-        ],
-        key="file_fmss"
-    )
-
-
-with col2:
-
-    st.markdown(
-        "**🏦 BRIVA Fastpay — 57888**"
-    )
-
-    file_fastpay = st.file_uploader(
-        "Upload mutasi BRIVA 57888",
-        type=[
-            "csv",
-            "xlsx"
-        ],
-        key="file_fastpay"
-    )
-
-
-with col3:
-
-    st.markdown(
-        "**🏦 BRIVA Rajabiller — 57708**"
-    )
-
-    file_rajabiller = st.file_uploader(
-        "Upload mutasi BRIVA 57708",
-        type=[
-            "csv",
-            "xlsx"
-        ],
-        key="file_rajabiller"
-    )
-
-
-# ============================================================
-# FEE CONFIGURATION
-# ============================================================
-
-st.subheader(
-    "2. Konfigurasi Fee"
-)
-
-fee1, fee2 = st.columns(2)
-
-
-with fee1:
-
-    fee_fastpay = st.number_input(
-        "Fee Fastpay (57888)",
-        min_value=0,
-        value=DEFAULT_FEE_FASTPAY,
-        step=500
-    )
-
-
-with fee2:
-
-    fee_rajabiller = st.number_input(
-        "Fee Rajabiller (57708)",
-        min_value=0,
-        value=DEFAULT_FEE_RAJABILLER,
-        step=500
-    )
-
-
-st.caption(
-    "Rumus pencocokan: Nominal FMSS + Fee = Nominal mutasi bank."
-)
-
-
-# ============================================================
-# PROCESS BUTTON
-# ============================================================
-
-ready = (
-    file_fmss
-    and file_fastpay
-    and file_rajabiller
-)
-
-
-if ready:
-
-    st.divider()
-
-    if st.button(
-        "🚀 MULAI REKONSILIASI",
-        type="primary",
-        use_container_width=True
-    ):
-
-        try:
-
-            with st.spinner(
-                "Memproses rekonsiliasi Fastpay dan Rajabiller..."
-            ):
-
-                # ------------------------------------------------
-                # READ FILE
-                # ------------------------------------------------
-
-                df_fmss = read_file(
-                    file_fmss
-                )
-
-                df_fastpay = read_file(
-                    file_fastpay
-                )
-
-                df_rajabiller = read_file(
-                    file_rajabiller
-                )
-
-                # ------------------------------------------------
-                # PROCESS ID
-                # ------------------------------------------------
-
-                process_id = datetime.now().strftime(
-                    "REC-%Y%m%d-%H%M%S"
-                )
-
-                # ------------------------------------------------
-                # RECON FASTPAY
-                # ------------------------------------------------
-
-                result_fastpay = reconcile_pair(
-
-                    df_fmss,
-
-                    df_fastpay,
-
-                    fee_fastpay,
-
-                    "FASTPAY",
-
-                    process_id
-                )
-
-                # ------------------------------------------------
-                # RECON RAJABILLER
-                # ------------------------------------------------
-
-                result_rajabiller = reconcile_pair(
-
-                    df_fmss,
-
-                    df_rajabiller,
-
-                    fee_rajabiller,
-
-                    "RAJABILLER",
-
-                    process_id
-                )
-
-                # ------------------------------------------------
-                # INVALID FMSS
-                #
-                # Ambil dari seluruh FMSS.
-                #
-                # Yang valid:
-                # 57888 atau 57708
-                #
-                # Yang tidak punya prefix:
-                # INVALID
-                # ------------------------------------------------
-
-                validate_columns(
-                    df_fmss,
-                    [
-                        "status",
-                        "keterangan",
-                        "nominal"
-                    ],
-                    "FMSS"
-                )
-
-                df_fmss_success = (
-                    df_fmss[
-                        df_fmss[
-                            "status"
-                        ]
-                        .astype(str)
-                        .str.upper()
-                        .eq("SUKSES")
-                    ]
-                    .copy()
-                )
-
-                df_fmss_success = apply_va(
-                    df_fmss_success,
-                    "keterangan",
-                    {
-                        PREFIX_FASTPAY:
-                            TYPE_FASTPAY,
-
-                        PREFIX_RAJABILLER:
-                            TYPE_RAJABILLER
-                    }
-                )
-
-                df_invalid_fmss = (
-                    df_fmss_success[
-                        df_fmss_success[
-                            "VA_CODE"
-                        ].isna()
-                    ]
-                    .copy()
-                )
-
-                # ------------------------------------------------
-                # INVALID BANK
-                # ------------------------------------------------
-
-                df_invalid_bank_fastpay = (
-                    result_fastpay[
-                        "invalid_bank"
-                    ]
-                    .copy()
-                )
-
-                df_invalid_bank_rajabiller = (
-                    result_rajabiller[
-                        "invalid_bank"
-                    ]
-                    .copy()
-                )
-
-                # ------------------------------------------------
-                # SAVE STATE
-                # ------------------------------------------------
-
-                st.session_state[
-                    "result_fastpay"
-                ] = result_fastpay
-
-                st.session_state[
-                    "result_rajabiller"
-                ] = result_rajabiller
-
-                st.session_state[
-                    "invalid_fmss"
-                ] = df_invalid_fmss
-
-                st.session_state[
-                    "invalid_bank_fastpay"
-                ] = df_invalid_bank_fastpay
-
-                st.session_state[
-                    "invalid_bank_rajabiller"
-                ] = df_invalid_bank_rajabiller
-
-                st.session_state[
-                    "last_process_id"
-                ] = process_id
-
-                # ------------------------------------------------
-                # TOTAL SUMMARY
-                # ------------------------------------------------
-
-                s1 = result_fastpay[
-                    "summary"
-                ]
-
-                s2 = result_rajabiller[
-                    "summary"
-                ]
-
-                total_valid_fmss = (
-                    s1["fmss_valid_va"]
-                    +
-                    s2["fmss_valid_va"]
-                )
-
-                total_matched = (
-                    s1["matched"]
-                    +
-                    s2["matched"]
-                )
-
-                total_expected = (
-                    s1["expected_amount"]
-                    +
-                    s2["expected_amount"]
-                )
-
-                total_bank = (
-                    s1["bank_amount"]
-                    +
-                    s2["bank_amount"]
-                )
-
-                total_matched_amount = (
-                    s1["matched_amount"]
-                    +
-                    s2["matched_amount"]
-                )
-
-                total_issue_fmss = (
-                    s1["issue_fmss"]
-                    +
-                    s2["issue_fmss"]
-                )
-
-                total_issue_bank = (
-                    s1["issue_bank"]
-                    +
-                    s2["issue_bank"]
-                )
-
-                total_difference = (
-                    total_bank
-                    -
-                    total_expected
-                )
-
-                total_match_rate = (
-                    total_matched
-                    /
-                    total_valid_fmss
-                    *
-                    100
-                    if total_valid_fmss
-                    else 0
-                )
-
-                total_amount_rate = (
-                    total_matched_amount
-                    /
-                    total_expected
-                    *
-                    100
-                    if total_expected
-                    else 0
-                )
-
-                st.session_state[
-                    "summary"
-                ] = {
-
-                    "process_id":
-                        process_id,
-
-                    "total_valid_fmss":
-                        total_valid_fmss,
-
-                    "total_matched":
-                        total_matched,
-
-                    "total_issue_fmss":
-                        total_issue_fmss,
-
-                    "total_issue_bank":
-                        total_issue_bank,
-
-                    "total_expected":
-                        total_expected,
-
-                    "total_bank":
-                        total_bank,
-
-                    "total_matched_amount":
-                        total_matched_amount,
-
-                    "total_difference":
-                        total_difference,
-
-                    "total_match_rate":
-                        total_match_rate,
-
-                    "total_amount_rate":
-                        total_amount_rate
-
-                }
-
-                st.session_state[
-                    "processed"
-                ] = True
-
-            st.success(
-                "✅ Rekonsiliasi selesai."
-            )
-
-        except Exception as e:
-
-            st.session_state[
-                "processed"
-            ] = False
-
-            st.error(
-                "❌ Rekonsiliasi gagal diproses."
-            )
-
-            with st.expander(
-                "Technical Error"
-            ):
-
-                st.code(
-                    traceback.format_exc()
-                )
-
-
-else:
-
-    missing = []
-
-    if not file_fmss:
-        missing.append(
-            "FMSS"
-        )
-
-    if not file_fastpay:
-        missing.append(
-            "Mutasi BRIVA 57888"
-        )
-
-    if not file_rajabiller:
-        missing.append(
-            "Mutasi BRIVA 57708"
-        )
-
-    st.info(
-        "Upload terlebih dahulu: "
-        + ", ".join(missing)
-    )
-
-
-# ============================================================
-# DISPLAY RESULT
-# ============================================================
-
-if st.session_state[
-    "processed"
-]:
-
-    result_fastpay = (
-        st.session_state[
-            "result_fastpay"
-        ]
-    )
-
-    result_rajabiller = (
-        st.session_state[
-            "result_rajabiller"
-        ]
-    )
-
-    invalid_fmss = (
-        st.session_state[
-            "invalid_fmss"
-        ]
-    )
-
-    invalid_bank_fastpay = (
-        st.session_state[
-            "invalid_bank_fastpay"
-        ]
-    )
-
-    invalid_bank_rajabiller = (
-        st.session_state[
-            "invalid_bank_rajabiller"
-        ]
-    )
-
-    summary = (
-        st.session_state[
-            "summary"
-        ]
-    )
-
-    st.divider()
-
-    # ========================================================
-    # TOTAL SUMMARY
-    # ========================================================
-
-    st.subheader(
-        "🎯 Overall Reconciliation"
-    )
-
-    a1, a2, a3, a4 = st.columns(4)
-
-    a1.metric(
-        "Matched",
-        f"{summary['total_matched']:,}"
-    )
-
-    a2.metric(
-        "Issue FMSS",
-        f"{summary['total_issue_fmss']:,}"
-    )
-
-    a3.metric(
-        "Issue Bank",
-        f"{summary['total_issue_bank']:,}"
-    )
-
-    a4.metric(
-        "Overall Match Rate",
-        f"{summary['total_match_rate']:.2f}%"
-    )
-
-    a5, a6, a7, a8 = st.columns(4)
-
-    a5.metric(
-        "Expected",
-        rupiah(
-            summary[
-                "total_expected"
-            ]
-        )
-    )
-
-    a6.metric(
-        "Actual Bank",
-        rupiah(
-            summary[
-                "total_bank"
-            ]
-        )
-    )
-
-    a7.metric(
-        "Matched Amount",
-        rupiah(
-            summary[
-                "total_matched_amount"
-            ]
-        )
-    )
-
-    a8.metric(
-        "Amount Difference",
-        rupiah(
-            summary[
-                "total_difference"
-            ]
-        )
-    )
-
-    if (
-        summary[
-            "total_match_rate"
-        ] >= 99.5
-        and
-        summary[
-            "total_amount_rate"
-        ] >= 99.5
-    ):
-
-        st.success(
-            "🟢 Overall reconciliation HEALTHY"
-        )
-
-    elif (
-        summary[
-            "total_match_rate"
-        ] >= 98
-        and
-        summary[
-            "total_amount_rate"
-        ] >= 98
-    ):
-
-        st.warning(
-            "🟡 Overall reconciliation WARNING"
-        )
-
-    else:
-
-        st.error(
-            "🔴 Overall reconciliation CRITICAL"
-        )
-
-
-    # ========================================================
-    # FASTPAY
-    # ========================================================
-
-    st.divider()
-
-    render_recon_summary(
-        result_fastpay,
-        "🏦 BRIVA FASTPAY — 57888"
-    )
-
-
-    # ========================================================
-    # RAJABILLER
-    # ========================================================
-
-    st.divider()
-
-    render_recon_summary(
-        result_rajabiller,
-        "🏦 BRIVA RAJABILLER — 57708"
-    )
-
-
-    # ========================================================
-    # ISSUE DETAIL
-    # ========================================================
-
     st.divider()
 
     st.subheader(
-        "🚨 Detail Issue"
+        "🎯 Ringkasan Rekonsiliasi BRIVA"
     )
 
-    issue_tab1, issue_tab2 = st.tabs(
-        [
-            "FMSS Issue",
-            "Bank Issue"
-        ]
+    m1, m2, m3, m4 = st.columns(4)
+
+    m1.metric(
+        "✅ Matched Sempurna",
+        f"{len(df_matched):,} Trx"
+    )
+
+    m2.metric(
+        "⚠️ Issue FMSS",
+        f"{len(df_issue_fmss):,} Trx"
+    )
+
+    m3.metric(
+        "⚠️ Issue Bank",
+        f"{len(df_issue_bank):,} Trx"
+    )
+
+    m4.metric(
+        "🚨 Invalid VA",
+        f"{len(df_invalid_fmss) + len(df_invalid_bank):,} Trx"
     )
 
 
     # ========================================================
-    # FMSS ISSUE
+    # AMOUNT SUMMARY
     # ========================================================
 
-    with issue_tab1:
+    st.subheader(
+        "💰 Ringkasan Nominal"
+    )
 
-        fastpay_issue = (
-            result_fastpay[
-                "issue_fmss"
-            ]
-            .copy()
-        )
+    amount_col1, amount_col2, amount_col3 = (
+        st.columns(3)
+    )
 
-        rajabiller_issue = (
-            result_rajabiller[
-                "issue_fmss"
-            ]
-            .copy()
-        )
 
-        if not fastpay_issue.empty:
+    matched_amount = 0
 
-            st.markdown(
-                "### 🚨 FMSS Issue — Fastpay 57888"
+    if (
+        not df_matched.empty
+        and "nominal_FMSS" in df_matched.columns
+    ):
+        matched_amount = (
+            pd.to_numeric(
+                df_matched["nominal_FMSS"],
+                errors="coerce"
             )
+            .fillna(0)
+            .sum()
+        )
 
-            display = prepare_issue_fmss(
-                fastpay_issue
+    issue_fmss_amount = 0
+
+    if (
+        not df_issue_fmss.empty
+        and "nominal" in df_issue_fmss.columns
+    ):
+        issue_fmss_amount = (
+            pd.to_numeric(
+                df_issue_fmss["nominal"],
+                errors="coerce"
+            )
+            .fillna(0)
+            .sum()
+        )
+
+    issue_bank_amount = 0
+
+    if (
+        not df_issue_bank.empty
+        and "MUTASI_KREDIT_NUM" in df_issue_bank.columns
+    ):
+        issue_bank_amount = (
+            pd.to_numeric(
+                df_issue_bank["MUTASI_KREDIT_NUM"],
+                errors="coerce"
+            )
+            .fillna(0)
+            .sum()
+        )
+
+
+    amount_col1.metric(
+        "Matched",
+        f"Rp {matched_amount:,.0f}"
+    )
+
+    amount_col2.metric(
+        "Issue FMSS",
+        f"Rp {issue_fmss_amount:,.0f}"
+    )
+
+    amount_col3.metric(
+        "Issue Bank",
+        f"Rp {issue_bank_amount:,.0f}"
+    )
+
+
+    # ========================================================
+    # ISSUE TABLE
+    # ========================================================
+
+    st.divider()
+
+    col_left, col_right = st.columns(2)
+
+
+    # ========================================================
+    # ISSUE FMSS
+    # ========================================================
+
+    with col_left:
+
+        st.subheader(
+            "🚨 Issue FMSS"
+        )
+
+        if not df_issue_fmss.empty:
+
+            tampil_fmss = make_issue_table(
+                df_issue_fmss,
+                "FMSS_ONLY"
             )
 
             st.dataframe(
-                display,
+                tampil_fmss,
                 use_container_width=True,
                 hide_index=True
             )
@@ -1646,65 +1435,30 @@ if st.session_state[
         else:
 
             st.success(
-                "Tidak ada issue FMSS Fastpay."
-            )
-
-
-        if not rajabiller_issue.empty:
-
-            st.markdown(
-                "### 🚨 FMSS Issue — Rajabiller 57708"
-            )
-
-            display = prepare_issue_fmss(
-                rajabiller_issue
-            )
-
-            st.dataframe(
-                display,
-                use_container_width=True,
-                hide_index=True
-            )
-
-        else:
-
-            st.success(
-                "Tidak ada issue FMSS Rajabiller."
+                "Tidak ada issue FMSS. "
+                "Semua transaksi FMSS memiliki pasangan."
             )
 
 
     # ========================================================
-    # BANK ISSUE
+    # ISSUE BANK
     # ========================================================
 
-    with issue_tab2:
+    with col_right:
 
-        fastpay_bank_issue = (
-            result_fastpay[
-                "issue_bank"
-            ]
-            .copy()
+        st.subheader(
+            "🚨 Issue Bank"
         )
 
-        rajabiller_bank_issue = (
-            result_rajabiller[
-                "issue_bank"
-            ]
-            .copy()
-        )
+        if not df_issue_bank.empty:
 
-        if not fastpay_bank_issue.empty:
-
-            st.markdown(
-                "### 🚨 Bank Issue — Fastpay 57888"
-            )
-
-            display = prepare_issue_bank(
-                fastpay_bank_issue
+            tampil_bank = make_issue_table(
+                df_issue_bank,
+                "BANK_ONLY"
             )
 
             st.dataframe(
-                display,
+                tampil_bank,
                 use_container_width=True,
                 hide_index=True
             )
@@ -1712,30 +1466,8 @@ if st.session_state[
         else:
 
             st.success(
-                "Tidak ada issue Bank Fastpay."
-            )
-
-
-        if not rajabiller_bank_issue.empty:
-
-            st.markdown(
-                "### 🚨 Bank Issue — Rajabiller 57708"
-            )
-
-            display = prepare_issue_bank(
-                rajabiller_bank_issue
-            )
-
-            st.dataframe(
-                display,
-                use_container_width=True,
-                hide_index=True
-            )
-
-        else:
-
-            st.success(
-                "Tidak ada issue Bank Rajabiller."
+                "Tidak ada issue Bank. "
+                "Semua transaksi bank memiliki pasangan."
             )
 
 
@@ -1746,25 +1478,60 @@ if st.session_state[
     st.divider()
 
     with st.expander(
-        "⚠️ Transaksi dengan VA Tidak Teridentifikasi"
+        "⚠️ Transaksi dengan VA Tidak Teridentifikasi",
+        expanded=False
     ):
 
-        inv1, inv2 = st.columns(2)
+        invalid_col1, invalid_col2 = (
+            st.columns(2)
+        )
 
 
-        with inv1:
+        # ----------------------------------------------------
+        # INVALID FMSS
+        # ----------------------------------------------------
 
-            st.markdown(
-                "### FMSS Invalid VA"
+        with invalid_col1:
+
+            st.subheader(
+                "FMSS Invalid VA"
             )
 
-            if not invalid_fmss.empty:
+            if not df_invalid_fmss.empty:
 
-                st.dataframe(
-                    invalid_fmss,
-                    use_container_width=True,
-                    hide_index=True
+                invalid_fmss_display = (
+                    df_invalid_fmss.copy()
                 )
+
+                columns_to_show = []
+
+                for col in [
+                    "tanggal_transfer",
+                    "keterangan",
+                    "nominal",
+                    "ISSUE"
+                ]:
+
+                    if col in invalid_fmss_display.columns:
+                        columns_to_show.append(col)
+
+                if columns_to_show:
+
+                    st.dataframe(
+                        invalid_fmss_display[
+                            columns_to_show
+                        ],
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                else:
+
+                    st.dataframe(
+                        invalid_fmss_display,
+                        use_container_width=True,
+                        hide_index=True
+                    )
 
             else:
 
@@ -1773,31 +1540,51 @@ if st.session_state[
                 )
 
 
-        with inv2:
+        # ----------------------------------------------------
+        # INVALID BANK
+        # ----------------------------------------------------
 
-            st.markdown(
-                "### Bank Invalid VA"
+        with invalid_col2:
+
+            st.subheader(
+                "Bank Invalid VA"
             )
 
-            all_invalid_bank = pd.concat(
-                [
-                    invalid_bank_fastpay.assign(
-                        SUMBER="BRIVA FASTPAY"
-                    ),
-                    invalid_bank_rajabiller.assign(
-                        SUMBER="BRIVA RAJABILLER"
-                    )
-                ],
-                ignore_index=True
-            )
+            if not df_invalid_bank.empty:
 
-            if not all_invalid_bank.empty:
-
-                st.dataframe(
-                    all_invalid_bank,
-                    use_container_width=True,
-                    hide_index=True
+                invalid_bank_display = (
+                    df_invalid_bank.copy()
                 )
+
+                columns_to_show = []
+
+                for col in [
+                    "DESK_TRAN",
+                    "keterangan",
+                    "MUTASI_KREDIT_NUM",
+                    "ISSUE"
+                ]:
+
+                    if col in invalid_bank_display.columns:
+                        columns_to_show.append(col)
+
+                if columns_to_show:
+
+                    st.dataframe(
+                        invalid_bank_display[
+                            columns_to_show
+                        ],
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                else:
+
+                    st.dataframe(
+                        invalid_bank_display,
+                        use_container_width=True,
+                        hide_index=True
+                    )
 
             else:
 
@@ -1807,7 +1594,120 @@ if st.session_state[
 
 
     # ========================================================
-    # EXPORT
+    # BREAKDOWN JENIS VA
+    # ========================================================
+
+    st.divider()
+
+    st.subheader(
+        "📊 Breakdown Rekonsiliasi"
+    )
+
+    breakdown_rows = []
+
+    for jenis in [
+        "BRIVA FASTPAY",
+        "BRIVA RAJABILLER"
+    ]:
+
+        matched_count = 0
+        fmss_count = 0
+        bank_count = 0
+
+        matched_nominal = 0
+        fmss_nominal = 0
+        bank_nominal = 0
+
+
+        if not df_matched.empty:
+
+            temp = df_matched[
+                df_matched["JENIS VA"]
+                == jenis
+            ]
+
+            matched_count = len(temp)
+
+            if "nominal_FMSS" in temp.columns:
+
+                matched_nominal = (
+                    pd.to_numeric(
+                        temp["nominal_FMSS"],
+                        errors="coerce"
+                    )
+                    .fillna(0)
+                    .sum()
+                )
+
+
+        if not df_issue_fmss.empty:
+
+            temp = df_issue_fmss[
+                df_issue_fmss["JENIS VA"]
+                == jenis
+            ]
+
+            fmss_count = len(temp)
+
+            if "nominal" in temp.columns:
+
+                fmss_nominal = (
+                    pd.to_numeric(
+                        temp["nominal"],
+                        errors="coerce"
+                    )
+                    .fillna(0)
+                    .sum()
+                )
+
+
+        if not df_issue_bank.empty:
+
+            temp = df_issue_bank[
+                df_issue_bank["JENIS VA"]
+                == jenis
+            ]
+
+            bank_count = len(temp)
+
+            if "MUTASI_KREDIT_NUM" in temp.columns:
+
+                bank_nominal = (
+                    pd.to_numeric(
+                        temp["MUTASI_KREDIT_NUM"],
+                        errors="coerce"
+                    )
+                    .fillna(0)
+                    .sum()
+                )
+
+
+        breakdown_rows.append(
+            {
+                "JENIS VA": jenis,
+                "MATCHED": matched_count,
+                "ISSUE FMSS": fmss_count,
+                "ISSUE BANK": bank_count,
+                "NOMINAL MATCHED": matched_nominal,
+                "NOMINAL ISSUE FMSS": fmss_nominal,
+                "NOMINAL ISSUE BANK": bank_nominal,
+            }
+        )
+
+
+    df_breakdown = pd.DataFrame(
+        breakdown_rows
+    )
+
+    st.dataframe(
+        df_breakdown,
+        use_container_width=True,
+        hide_index=True
+    )
+
+
+    # ========================================================
+    # DOWNLOAD EXCEL
     # ========================================================
 
     st.divider()
@@ -1816,565 +1716,45 @@ if st.session_state[
         "📥 Download Laporan"
     )
 
-    try:
-
-        output = io.BytesIO()
-
-        # ====================================================
-        # XlsxWriter
-        # ====================================================
-
-        with pd.ExcelWriter(
-            output,
-            engine="xlsxwriter"
-        ) as writer:
-
-            workbook = writer.book
-
-            header_format = workbook.add_format({
-                "bold": True,
-                "border": 1,
-                "align": "center",
-                "valign": "vcenter"
-            })
-
-            money_format = workbook.add_format({
-                "num_format": '#,##0'
-            })
-
-            percent_format = workbook.add_format({
-                "num_format": '0.00%'
-            })
-
-            # ------------------------------------------------
-            # SUMMARY
-            # ------------------------------------------------
-
-            overall_df = pd.DataFrame([
-                {
-
-                    "PROCESS_ID":
-                        summary[
-                            "process_id"
-                        ],
-
-                    "TOTAL_MATCHED":
-                        summary[
-                            "total_matched"
-                        ],
-
-                    "TOTAL_ISSUE_FMSS":
-                        summary[
-                            "total_issue_fmss"
-                        ],
-
-                    "TOTAL_ISSUE_BANK":
-                        summary[
-                            "total_issue_bank"
-                        ],
-
-                    "TOTAL_EXPECTED":
-                        summary[
-                            "total_expected"
-                        ],
-
-                    "TOTAL_BANK":
-                        summary[
-                            "total_bank"
-                        ],
-
-                    "TOTAL_MATCHED_AMOUNT":
-                        summary[
-                            "total_matched_amount"
-                        ],
-
-                    "TOTAL_AMOUNT_DIFFERENCE":
-                        summary[
-                            "total_difference"
-                        ],
-
-                    "OVERALL_MATCH_RATE":
-                        summary[
-                            "total_match_rate"
-                        ] / 100,
-
-                    "OVERALL_AMOUNT_RATE":
-                        summary[
-                            "total_amount_rate"
-                        ] / 100
-
-                }
-            ])
-
-            overall_df.to_excel(
-                writer,
-                sheet_name="SUMMARY",
-                index=False
-            )
-
-
-            # ------------------------------------------------
-            # SUMMARY FASTPAY
-            # ------------------------------------------------
-
-            summary_fastpay_df = pd.DataFrame([
-                result_fastpay[
-                    "summary"
-                ]
-            ])
-
-            summary_fastpay_df.to_excel(
-                writer,
-                sheet_name="SUMMARY_FASTPAY",
-                index=False
-            )
-
-
-            # ------------------------------------------------
-            # SUMMARY RAJABILLER
-            # ------------------------------------------------
-
-            summary_rajabiller_df = pd.DataFrame([
-                result_rajabiller[
-                    "summary"
-                ]
-            ])
-
-            summary_rajabiller_df.to_excel(
-                writer,
-                sheet_name="SUMMARY_RAJABILLER",
-                index=False
-            )
-
-
-            # ------------------------------------------------
-            # MATCHED FASTPAY
-            # ------------------------------------------------
-
-            matched_fastpay = (
-                result_fastpay[
-                    "matched"
-                ]
-                .copy()
-            )
-
-            if matched_fastpay.empty:
-
-                pd.DataFrame({
-                    "INFO": [
-                        "Tidak ada matched Fastpay."
-                    ]
-                }).to_excel(
-                    writer,
-                    sheet_name="MATCHED_FASTPAY",
-                    index=False
-                )
-
-            else:
-
-                matched_fastpay.to_excel(
-                    writer,
-                    sheet_name="MATCHED_FASTPAY",
-                    index=False
-                )
-
-
-            # ------------------------------------------------
-            # MATCHED RAJABILLER
-            # ------------------------------------------------
-
-            matched_rajabiller = (
-                result_rajabiller[
-                    "matched"
-                ]
-                .copy()
-            )
-
-            if matched_rajabiller.empty:
-
-                pd.DataFrame({
-                    "INFO": [
-                        "Tidak ada matched Rajabiller."
-                    ]
-                }).to_excel(
-                    writer,
-                    sheet_name="MATCHED_RAJABILLER",
-                    index=False
-                )
-
-            else:
-
-                matched_rajabiller.to_excel(
-                    writer,
-                    sheet_name="MATCHED_RAJABILLER",
-                    index=False
-                )
-
-
-            # ------------------------------------------------
-            # ISSUE FMSS
-            # ------------------------------------------------
-
-            issue_fmss_export = pd.concat(
-                [
-                    result_fastpay[
-                        "issue_fmss"
-                    ].assign(
-                        SUMBER="BRIVA FASTPAY"
-                    ),
-
-                    result_rajabiller[
-                        "issue_fmss"
-                    ].assign(
-                        SUMBER="BRIVA RAJABILLER"
-                    )
-                ],
-                ignore_index=True
-            )
-
-            if issue_fmss_export.empty:
-
-                pd.DataFrame({
-                    "INFO": [
-                        "Tidak ada issue FMSS."
-                    ]
-                }).to_excel(
-                    writer,
-                    sheet_name="ISSUE_FMSS",
-                    index=False
-                )
-
-            else:
-
-                issue_fmss_export.to_excel(
-                    writer,
-                    sheet_name="ISSUE_FMSS",
-                    index=False
-                )
-
-
-            # ------------------------------------------------
-            # ISSUE BANK
-            # ------------------------------------------------
-
-            issue_bank_export = pd.concat(
-                [
-                    result_fastpay[
-                        "issue_bank"
-                    ].assign(
-                        SUMBER="BRIVA FASTPAY"
-                    ),
-
-                    result_rajabiller[
-                        "issue_bank"
-                    ].assign(
-                        SUMBER="BRIVA RAJABILLER"
-                    )
-                ],
-                ignore_index=True
-            )
-
-            if issue_bank_export.empty:
-
-                pd.DataFrame({
-                    "INFO": [
-                        "Tidak ada issue Bank."
-                    ]
-                }).to_excel(
-                    writer,
-                    sheet_name="ISSUE_BANK",
-                    index=False
-                )
-
-            else:
-
-                issue_bank_export.to_excel(
-                    writer,
-                    sheet_name="ISSUE_BANK",
-                    index=False
-                )
-
-
-            # ------------------------------------------------
-            # INVALID FMSS
-            # ------------------------------------------------
-
-            if invalid_fmss.empty:
-
-                pd.DataFrame({
-                    "INFO": [
-                        "Tidak ada FMSS invalid VA."
-                    ]
-                }).to_excel(
-                    writer,
-                    sheet_name="INVALID_VA_FMSS",
-                    index=False
-                )
-
-            else:
-
-                invalid_fmss.to_excel(
-                    writer,
-                    sheet_name="INVALID_VA_FMSS",
-                    index=False
-                )
-
-
-            # ------------------------------------------------
-            # INVALID BANK
-            # ------------------------------------------------
-
-            all_invalid_bank_export = pd.concat(
-                [
-                    invalid_bank_fastpay.assign(
-                        SUMBER="BRIVA FASTPAY"
-                    ),
-
-                    invalid_bank_rajabiller.assign(
-                        SUMBER="BRIVA RAJABILLER"
-                    )
-                ],
-                ignore_index=True
-            )
-
-            if all_invalid_bank_export.empty:
-
-                pd.DataFrame({
-                    "INFO": [
-                        "Tidak ada Bank invalid VA."
-                    ]
-                }).to_excel(
-                    writer,
-                    sheet_name="INVALID_VA_BANK",
-                    index=False
-                )
-
-            else:
-
-                all_invalid_bank_export.to_excel(
-                    writer,
-                    sheet_name="INVALID_VA_BANK",
-                    index=False
-                )
-
-
-            # ------------------------------------------------
-            # FORMAT ALL SHEETS
-            # ------------------------------------------------
-
-            for sheet_name in writer.sheets:
-
-                worksheet = writer.sheets[
-                    sheet_name
-                ]
-
-                worksheet.freeze_panes(
-                    1,
-                    0
-                )
-
-                worksheet.autofilter(
-                    0,
-                    0,
-                    0,
-                    20
-                )
-
-                worksheet.set_column(
-                    0,
-                    30,
-                    18
-                )
-
-                # Header
-                worksheet.set_row(
-                    0,
-                    22
-                )
-
-
-            # ------------------------------------------------
-            # SPECIAL SUMMARY FORMAT
-            # ------------------------------------------------
-
-            ws = writer.sheets[
-                "SUMMARY"
-            ]
-
-            for col_num, col_name in enumerate(
-                overall_df.columns
-            ):
-
-                ws.write(
-                    0,
-                    col_num,
-                    col_name,
-                    header_format
-                )
-
-            # Money
-            for col_name in [
-                "TOTAL_EXPECTED",
-                "TOTAL_BANK",
-                "TOTAL_MATCHED_AMOUNT",
-                "TOTAL_AMOUNT_DIFFERENCE"
-            ]:
-
-                idx = (
-                    overall_df.columns
-                    .get_loc(
-                        col_name
-                    )
-                )
-
-                ws.set_column(
-                    idx,
-                    idx,
-                    22,
-                    money_format
-                )
-
-            # Percentage
-            for col_name in [
-                "OVERALL_MATCH_RATE",
-                "OVERALL_AMOUNT_RATE"
-            ]:
-
-                idx = (
-                    overall_df.columns
-                    .get_loc(
-                        col_name
-                    )
-                )
-
-                ws.set_column(
-                    idx,
-                    idx,
-                    22,
-                    percent_format
-                )
-
-
-        excel_data = output.getvalue()
-
-        st.download_button(
-
-            label=(
-                "📥 Download Laporan Rekonsiliasi Lengkap (.xlsx)"
-            ),
-
-            data=excel_data,
-
-            file_name=(
-                f"Laporan_Rekonsiliasi_"
-                f"{summary['process_id']}.xlsx"
-            ),
-
-            mime=(
-                "application/vnd.openxmlformats-officedocument."
-                "spreadsheetml.sheet"
-            ),
-
-            type="primary",
-
-            use_container_width=True
-        )
-
-        st.caption(
-            f"Process ID: {summary['process_id']}"
-        )
-
-    except Exception as e:
-
-        st.error(
-            "❌ Rekonsiliasi berhasil, tetapi "
-            "file Excel gagal dibuat."
-        )
-
-        st.code(
-            traceback.format_exc()
-        )
+    excel_data = dataframe_to_excel(
+        {
+            "MATCHED_OK": df_matched,
+            "ISSUE_FMSS": df_issue_fmss,
+            "ISSUE_BANK": df_issue_bank,
+            "FMSS_INVALID_VA": df_invalid_fmss,
+            "BANK_INVALID_VA": df_invalid_bank,
+            "BREAKDOWN": df_breakdown,
+        }
+    )
+
+    st.download_button(
+        label="📥 Download Laporan Lengkap (.xlsx)",
+        data=excel_data,
+        file_name="Laporan_Rekonsiliasi_BRIVA.xlsx",
+        mime=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+        type="primary",
+        use_container_width=True
+    )
 
 
 # ============================================================
-# HELPER DISPLAY ISSUE FMSS
+# 9. INFO JIKA BELUM PILIH BANK
 # ============================================================
 
-def prepare_issue_fmss(df):
+elif (
+    pilihan_bank == ""
+    and (
+        st.session_state.get(
+            "pilihan_bank_terakhir",
+            ""
+        ) == ""
+    )
+):
 
-    if df.empty:
-
-        return df
-
-    result = pd.DataFrame()
-
-    if "VA_CODE" in df.columns:
-
-        result["KODE VA"] = (
-            df["VA_CODE"]
-        )
-
-    if "VA_TYPE" in df.columns:
-
-        result["JENIS VA"] = (
-            df["VA_TYPE"]
-        )
-
-    if "NOMINAL_ORIGINAL" in df.columns:
-
-        result["NOMINAL FMSS"] = (
-            df["NOMINAL_ORIGINAL"]
-        )
-
-    if "NOMINAL_MATCH" in df.columns:
-
-        result["NOMINAL BANK EXPECTED"] = (
-            df["NOMINAL_MATCH"]
-        )
-
-    if "ISSUE_TYPE" in df.columns:
-
-        result["ISSUE"] = (
-            df["ISSUE_TYPE"]
-        )
-
-    return result
-
-
-# ============================================================
-# HELPER DISPLAY ISSUE BANK
-# ============================================================
-
-def prepare_issue_bank(df):
-
-    if df.empty:
-
-        return df
-
-    result = pd.DataFrame()
-
-    if "VA_CODE" in df.columns:
-
-        result["KODE VA"] = (
-            df["VA_CODE"]
-        )
-
-    if "VA_TYPE" in df.columns:
-
-        result["JENIS VA"] = (
-            df["VA_TYPE"]
-        )
-
-    if "MUTASI_KREDIT_NUM" in df.columns:
-
-        result["NOMINAL BANK"] = (
-            df["MUTASI_KREDIT_NUM"]
-        )
-
-    if "ISSUE_TYPE" in df.columns:
-
-        result["ISSUE"] = (
-            df["ISSUE_TYPE"]
-        )
-
-    return result
+    st.info(
+        "💡 Silakan pilih **Bank Sumber Mutasi** "
+        "terlebih dahulu pada dropdown di atas."
+    )
