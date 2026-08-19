@@ -1,5 +1,4 @@
-# VERSION: v4 FINAL - BNIVA robust VA parser + pre-match diagnostics
-import streamlit as st
+# VERSION: v6 - BNIVA regex fixed (single escaping) + VA normalization\nimport streamlit as st
 import pandas as pd
 import re
 import io
@@ -192,39 +191,34 @@ def extract_va(text):
 
 def extract_bniva_va(text):
     """
-    BNIVA VA parser yang toleran terhadap format Description bank.
+    BNIVA VA parser.
 
-    Baseline BNIVA:
-        prefix 988765 + 10 digit = 16 digit VA.
+    Format utama BNIVA:
+        988765 + 10 digit
 
-    Kenapa tidak memakai (?!\\d)?
-    Karena Description bank kadang menempelkan angka lain setelah VA.
-    Negative lookahead membuat VA valid ikut dianggap INVALID.
-
-    Urutan:
-    1. Cari 988765 + 10 digit dengan kemungkinan separator.
-    2. Jika format tidak persis seperti itu, fallback ke 988765 + 5-15 digit.
+    Parser dibuat toleran terhadap separator/spasi di Description,
+    tetapi hasil KODE_VA selalu dinormalisasi menjadi digit saja.
     """
     if pd.isna(text):
         return None
 
     text = str(text)
 
-    # Format utama: 988765 + 10 digit.
-    # Separator umum di Description: spasi, -, atau titik.
+    # 1) Format utama: 988765 + 10 digit.
+    #    Separator opsional: spasi, -, atau titik.
     match = re.search(
-        r"(?<!\d)(988765[\\s\\-\\.]?\\d{10})",
+        r"(?<!\d)(988765[\s\-\.]?\d{10})",
         text
     )
 
     if match:
-        va = re.sub(r"\\D", "", match.group(1))
+        va = re.sub(r"\D", "", match.group(1))
         if len(va) == 16 and va.startswith("988765"):
             return va
 
-    # Fallback untuk format Description yang tidak standar.
+    # 2) Fallback untuk format Description yang menempel.
     match = re.search(
-        r"(988765\\d{5,15})",
+        r"(988765\d{5,15})",
         text
     )
 
@@ -638,6 +632,17 @@ if can_process:
                         .apply(extract_va)
                     )
 
+                # Final normalization: VA selalu string digit tanpa separator.
+                df_int_sukses["KODE_VA"] = (
+                    df_int_sukses["KODE_VA"]
+                    .astype("string")
+                    .str.replace(r"\D", "", regex=True)
+                )
+                df_int_sukses.loc[
+                    df_int_sukses["KODE_VA"].eq(""),
+                    "KODE_VA"
+                ] = None
+
                 df_int_sukses["JENIS_VA"] = (
                     df_int_sukses["KODE_VA"]
                     .apply(classify_va)
@@ -809,6 +814,17 @@ if can_process:
                         .apply(va_parser)
                     )
 
+                    # Final normalization: VA selalu string digit.
+                    df["KODE_VA"] = (
+                        df["KODE_VA"]
+                        .astype("string")
+                        .str.replace(r"\D", "", regex=True)
+                    )
+                    df.loc[
+                        df["KODE_VA"].eq(""),
+                        "KODE_VA"
+                    ] = None
+
                     df["JENIS_VA"] = (
                         df["KODE_VA"]
                         .apply(classify_va)
@@ -935,6 +951,10 @@ if can_process:
                         st.error(
                             "❌ BNIVA: tidak ada VA yang overlap antara FMSS dan Bank. "
                             "Masalah ada di ekstraksi VA/format Description, bukan matching nominal."
+                        )
+                        st.caption(
+                            f"VA valid FMSS: {df_int_valid['KODE_VA'].notna().sum():,} | "
+                            f"VA valid Bank: {df_bank_valid['KODE_VA'].notna().sum():,}"
                         )
                     elif common_key == 0:
                         st.warning(
