@@ -974,6 +974,92 @@ def parse_bniva_datetime(series):
     return parsed
 
 
+def parse_bniva_fmss_datetime(series):
+    """
+    Parser khusus tanggal FMSS untuk BNIVA.
+
+    Alasan fungsi ini terpisah dari parser bank dan parser umum:
+    export FMSS dapat berisi timestamp campuran dalam satu file, misalnya:
+        2026-08-19 23:53:00.774091
+        2026-08-19 19:46:05
+
+    Pandas dapat menginfer satu format dari baris mayoritas sehingga baris
+    tanpa microsecond berubah menjadi NaT. BNIVA pernah mengalami kondisi
+    ini pada transaksi retry yang valid.
+
+    Fungsi ini mencoba format dengan microsecond dan tanpa microsecond
+    secara eksplisit, lalu memakai fallback hanya untuk nilai yang belum
+    berhasil diparse.
+    """
+
+    if pd.api.types.is_datetime64_any_dtype(series):
+
+        return pd.to_datetime(
+            series,
+            errors="coerce"
+        )
+
+    text = (
+        series.astype("string")
+        .str.strip()
+    )
+
+    parsed = pd.Series(
+        pd.NaT,
+        index=series.index,
+        dtype="datetime64[ns]"
+    )
+
+    # Format standar FMSS dengan microsecond.
+    parsed_micro = pd.to_datetime(
+        text,
+        format="%Y-%m-%d %H:%M:%S.%f",
+        errors="coerce"
+    )
+
+    parsed = parsed.fillna(
+        parsed_micro
+    )
+
+    # Format transaksi retry FMSS yang tidak memiliki microsecond.
+    parsed_seconds = pd.to_datetime(
+        text,
+        format="%Y-%m-%d %H:%M:%S",
+        errors="coerce"
+    )
+
+    parsed = parsed.fillna(
+        parsed_seconds
+    )
+
+    # Fallback untuk antisipasi export FMSS di kemudian hari berubah.
+    mask_fallback = (
+        parsed.isna()
+        & text.notna()
+    )
+
+    if mask_fallback.any():
+
+        try:
+            parsed_fallback = pd.to_datetime(
+                text[mask_fallback],
+                format="mixed",
+                errors="coerce"
+            )
+
+        except (TypeError, ValueError):
+            parsed_fallback = pd.to_datetime(
+                text[mask_fallback],
+                errors="coerce"
+            )
+
+        parsed.loc[mask_fallback] = (
+            parsed_fallback
+        )
+
+    return parsed
+
+
 def build_bniva_search_dates(recon_dates):
     """
     Membentuk search window D-1 / D / D+1
@@ -3616,6 +3702,16 @@ if can_process:
 
                     df_int_sukses["_TANGGAL_DT"] = (
                         parse_briva_datetime(
+                            df_int_sukses[
+                                col_tanggal_int
+                            ]
+                        )
+                    )
+
+                elif pilihan_bank == "BNIVA":
+
+                    df_int_sukses["_TANGGAL_DT"] = (
+                        parse_bniva_fmss_datetime(
                             df_int_sukses[
                                 col_tanggal_int
                             ]
