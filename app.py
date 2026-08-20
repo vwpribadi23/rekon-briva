@@ -338,6 +338,7 @@ def classify_va_series(series):
 #   2) mutasi D+1 boleh menjadi search pool untuk cutoff,
 #   3) unmatched D+1 tidak dihitung sebagai Issue Bank D,
 #   4) matching tetap VA + EXPECTED_BANK, 1-to-1.
+#   5) credit leg reversal/net-zero BRI dikeluarkan sebelum matching.
 # - BNIVA, MANDIRIVA, dan engine tampilan dashboard tidak berubah.
 
 
@@ -414,6 +415,220 @@ def build_briva_search_dates(recon_dates):
     return sorted(result)
 
 
+BRIVA_REVERSAL_WINDOW_SECONDS = 120
+
+
+def _briva_amount_key(value):
+    """
+    Key nominal BRIVA untuk kebutuhan deteksi reversal.
+    Pembulatan ke rupiah penuh konsisten dengan data mutasi BRI.
+    """
+
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def detect_briva_reversal_credit_mask(df):
+    """
+    Mendeteksi credit leg BRIVA yang sudah direversal / dibalik bank.
+
+    Prinsip konservatif:
+    1) VA harus sama.
+    2) Description harus sama persis.
+    3) Jika SEQ tersedia, SEQ harus sama.
+    4) Total credit dan debit dalam satu event harus sama (net zero).
+    5) Seluruh event terjadi dalam <= 120 detik.
+
+    Pada file BRI 20 Agustus yang diuji, pola reversal contohnya:
+        Credit nominal utama
+        Debit fee / adjustment
+        Credit fee / adjustment
+        Debit nominal utama
+
+    Total credit == total debit, sehingga uang bersih yang bertahan di
+    rekening adalah nol. Semua baris CREDIT dari event tersebut tidak boleh
+    dipakai untuk matching FMSS maupun dihitung sebagai Issue Bank.
+
+    Jika kolom debit tidak tersedia, fungsi tidak mengubah perilaku lama.
+    """
+
+    result = pd.Series(
+        False,
+        index=df.index,
+        dtype=bool
+    )
+
+    required_cols = {
+        "_TANGGAL_DT",
+        "_CREDIT_NUM",
+        "_DEBIT_NUM",
+        "KODE_VA",
+        "_DESC_VALUE"
+    }
+
+    if not required_cols.issubset(df.columns):
+        return result
+
+    work = df[
+        df["KODE_VA"].notna()
+        & (
+            (df["_CREDIT_NUM"] > 0)
+            | (df["_DEBIT_NUM"] > 0)
+        )
+        & df["_TANGGAL_DT"].notna()
+    ].copy()
+
+    if work.empty:
+        return result
+
+    # Normalisasi key agar grouping tidak terganggu tipe data campuran.
+    work["_REVERSAL_VA_KEY"] = (
+        work["KODE_VA"]
+        .astype(str)
+        .str.strip()
+    )
+
+    work["_REVERSAL_DESC_KEY"] = (
+        work["_DESC_VALUE"]
+        .astype(str)
+        .str.strip()
+    )
+
+    work["_REVERSAL_DATE_KEY"] = (
+        work["_TANGGAL_DT"]
+        .dt.date
+    )
+
+    # SEQ bersifat optional. Jika file BRI menyediakan SEQ, kita pakai
+    # sebagai penguat event ID agar deteksi reversal makin konservatif.
+    has_seq = (
+        "_BRIVA_SEQ_KEY" in work.columns
+        and work["_BRIVA_SEQ_KEY"].notna().any()
+    )
+
+    if has_seq:
+        group_cols = [
+            "_REVERSAL_VA_KEY",
+            "_REVERSAL_DESC_KEY",
+            "_BRIVA_SEQ_KEY",
+            "_REVERSAL_DATE_KEY"
+        ]
+
+        for _, group in work.groupby(
+            group_cols,
+            dropna=False,
+            sort=False
+        ):
+            total_credit = float(
+                group["_CREDIT_NUM"].sum()
+            )
+
+            total_debit = float(
+                group["_DEBIT_NUM"].sum()
+            )
+
+            if total_credit <= 0 or total_debit <= 0:
+                continue
+
+            # Net zero sampai toleransi < Rp1.
+            if abs(total_credit - total_debit) >= 0.5:
+                continue
+
+            time_span = (
+                group["_TANGGAL_DT"].max()
+                - group["_TANGGAL_DT"].min()
+            ).total_seconds()
+
+            if time_span > BRIVA_REVERSAL_WINDOW_SECONDS:
+                continue
+
+            credit_indexes = group.index[
+                group["_CREDIT_NUM"] > 0
+            ]
+
+            result.loc[credit_indexes] = True
+
+        return result
+
+    # --------------------------------------------------------
+    # FALLBACK JIKA SEQ TIDAK TERSEDIA
+    # --------------------------------------------------------
+    # Pair credit-debit one-to-one berdasarkan VA + description + nominal,
+    # dalam window waktu yang sama. Ini sengaja lebih ketat daripada hanya
+    # VA + nominal agar transaksi reguler tidak salah dianggap reversal.
+
+    debit_pool = defaultdict(list)
+
+    for idx, row in work[
+        work["_DEBIT_NUM"] > 0
+    ].iterrows():
+        key = (
+            row["_REVERSAL_VA_KEY"],
+            row["_REVERSAL_DESC_KEY"],
+            row["_REVERSAL_DATE_KEY"],
+            _briva_amount_key(
+                row["_DEBIT_NUM"]
+            )
+        )
+
+        debit_pool[key].append(
+            (idx, row["_TANGGAL_DT"])
+        )
+
+    used_debits = set()
+
+    for credit_idx, row in work[
+        work["_CREDIT_NUM"] > 0
+    ].sort_values(
+        "_TANGGAL_DT",
+        kind="stable"
+    ).iterrows():
+        key = (
+            row["_REVERSAL_VA_KEY"],
+            row["_REVERSAL_DESC_KEY"],
+            row["_REVERSAL_DATE_KEY"],
+            _briva_amount_key(
+                row["_CREDIT_NUM"]
+            )
+        )
+
+        candidates = [
+            item
+            for item in debit_pool.get(key, [])
+            if item[0] not in used_debits
+        ]
+
+        if not candidates:
+            continue
+
+        nearest_idx, nearest_dt = min(
+            candidates,
+            key=lambda item: abs(
+                (
+                    item[1]
+                    - row["_TANGGAL_DT"]
+                ).total_seconds()
+            )
+        )
+
+        delta_seconds = abs(
+            (
+                nearest_dt
+                - row["_TANGGAL_DT"]
+            ).total_seconds()
+        )
+
+        if delta_seconds <= BRIVA_REVERSAL_WINDOW_SECONDS:
+            result.loc[credit_idx] = True
+            used_debits.add(
+                nearest_idx
+            )
+
+    return result
+
+
 def prepare_briva_bank_dataframe(
     uploaded_file,
     recon_dates,
@@ -423,9 +638,13 @@ def prepare_briva_bank_dataframe(
     Load dan normalisasi file bank khusus BRIVA.
 
     Logic field/VA/nominal tetap mengikuti prepare_bank_dataframe() legacy.
-    Perbedaannya hanya:
+    Enhancement terbatas:
         - parser tanggal BRIVA lebih robust,
-        - bank D+1 ikut dibaca sebagai search pool cutoff.
+        - bank D+1 ikut dibaca sebagai search pool cutoff,
+        - credit leg reversal / net-zero dikeluarkan sebelum matching.
+
+    Reversal hanya dideteksi jika file menyediakan kolom MUTASI_DEBET/DEBET.
+    Jika kolom debit tidak tersedia, perilaku tetap sama seperti versi lama.
     """
 
     df = read_uploaded_file(
@@ -440,6 +659,21 @@ def prepare_briva_bank_dataframe(
             "KREDIT",
             "kredit"
         ]
+    )
+
+    # Debit bersifat optional agar kompatibel dengan file BRIVA ringkas
+    # yang sebelumnya hanya diwajibkan TGL_TRAN, DESK_TRAN, MUTASI_KREDIT.
+    col_debit = find_column(
+        df,
+        [
+            "MUTASI_DEBET",
+            "mutasi_debet",
+            "DEBET",
+            "debet",
+            "DEBIT",
+            "debit"
+        ],
+        required=False
     )
 
     col_desc = find_column(
@@ -466,6 +700,17 @@ def prepare_briva_bank_dataframe(
         ]
     )
 
+    col_seq = find_column(
+        df,
+        [
+            "SEQ",
+            "seq",
+            "SEQUENCE",
+            "sequence"
+        ],
+        required=False
+    )
+
     df = df.copy()
 
     # --------------------------------------------------------
@@ -477,12 +722,19 @@ def prepare_briva_bank_dataframe(
     )
 
     # --------------------------------------------------------
-    # CREDIT
+    # CREDIT / DEBIT
     # --------------------------------------------------------
 
     df["_CREDIT_NUM"] = clean_numeric(
         df[col_credit]
     )
+
+    if col_debit is not None:
+        df["_DEBIT_NUM"] = clean_numeric(
+            df[col_debit]
+        )
+    else:
+        df["_DEBIT_NUM"] = 0.0
 
     # --------------------------------------------------------
     # FILTER TANGGAL D + D+1
@@ -508,14 +760,6 @@ def prepare_briva_bank_dataframe(
     ].copy()
 
     # --------------------------------------------------------
-    # HANYA UANG MASUK
-    # --------------------------------------------------------
-
-    df = df[
-        df["_CREDIT_NUM"] > 0
-    ].copy()
-
-    # --------------------------------------------------------
     # BANK TYPE - logic legacy
     # --------------------------------------------------------
 
@@ -537,7 +781,7 @@ def prepare_briva_bank_dataframe(
     )
 
     # --------------------------------------------------------
-    # SOURCE
+    # SOURCE / AUDIT FIELDS
     # --------------------------------------------------------
 
     df["SOURCE_BANK"] = source_bank
@@ -546,6 +790,42 @@ def prepare_briva_bank_dataframe(
         df[col_desc]
         .astype(str)
     )
+
+    if col_seq is not None:
+        df["_BRIVA_SEQ_KEY"] = (
+            df[col_seq]
+            .astype("string")
+            .str.strip()
+        )
+    else:
+        df["_BRIVA_SEQ_KEY"] = pd.NA
+
+    # --------------------------------------------------------
+    # REVERSAL / NET-ZERO DETECTION
+    # --------------------------------------------------------
+    # Dilakukan sebelum filter CREDIT > 0 agar sisi debit dari event reversal
+    # masih tersedia untuk membuktikan bahwa credit tersebut sudah dibalik.
+
+    df["_IS_REVERSAL_CREDIT"] = (
+        detect_briva_reversal_credit_mask(
+            df
+        )
+    )
+
+    df["_REVERSAL_STATUS"] = ""
+    df.loc[
+        df["_IS_REVERSAL_CREDIT"],
+        "_REVERSAL_STATUS"
+    ] = "REVERSAL_NET_ZERO_EXCLUDED"
+
+    # --------------------------------------------------------
+    # HANYA UANG MASUK YANG MASIH VALID
+    # --------------------------------------------------------
+
+    df = df[
+        (df["_CREDIT_NUM"] > 0)
+        & (~df["_IS_REVERSAL_CREDIT"])
+    ].copy()
 
     return df
 
