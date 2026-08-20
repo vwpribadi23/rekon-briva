@@ -1335,6 +1335,1137 @@ def fast_match_bniva(
     )
 
 
+
+# ============================================================
+# MANDIRIVA ENGINE - OPTION C / TIERED CONFIDENCE
+# ============================================================
+#
+# PENTING:
+# - Engine BRIVA dan BNIVA tidak diubah.
+# - MANDIRIVA menggunakan engine terpisah.
+# - Prefix yang direkonsiliasi: 888984
+# - Fee MANDIRIVA: Rp1.000
+# - Search window bank: D-1 / D / D+1
+# - Matching Option C:
+#       Tahap 1 : VA + nominal UNIQUE -> HIGH CONFIDENCE
+#       Tahap 2 : duplicate -> chronological / time resolution 1-to-1
+#       Jika waktu benar-benar tidak bisa membedakan -> AMBIGUOUS
+# - Unmatched bank D-1 / D+1 tidak dihitung sebagai Issue Bank D.
+# - Unmatched bank D hanya boleh menjadi BANK_ONLY jika FMSS D-1/D/D+1
+#   tersedia sehingga benar-benar dapat diverifikasi.
+# ============================================================
+
+MANDIRIVA_PREFIX = "888984"
+MANDIRIVA_FEE = 1000
+MANDIRIVA_VA_REGEX = r"(888984\d+)"
+
+
+def extract_mandiriva_va_series(series):
+    """
+    Ekstrak VA MANDIRIVA berdasarkan prefix 888984.
+
+    Panjang VA tidak di-hardcode karena pada sampel valid
+    ditemukan panjang yang bervariasi.
+    """
+
+    result = (
+        series.astype("string")
+        .str.extract(
+            MANDIRIVA_VA_REGEX,
+            expand=False
+        )
+    )
+
+    return result.where(
+        result.notna(),
+        None
+    )
+
+
+def classify_mandiriva_va_series(series):
+
+    result = pd.Series(
+        "INVALID VA",
+        index=series.index,
+        dtype="object"
+    )
+
+    mask_mandiriva = (
+        series.astype("string")
+        .str.startswith(
+            MANDIRIVA_PREFIX,
+            na=False
+        )
+    )
+
+    result.loc[mask_mandiriva] = "MANDIRIVA"
+
+    return result
+
+
+def parse_mandiriva_datetime(series):
+    """
+    Parser tanggal mutasi Mandiri.
+
+    Format sampel:
+        18 August 2026 01:29:26
+    """
+
+    if pd.api.types.is_datetime64_any_dtype(series):
+
+        return pd.to_datetime(
+            series,
+            errors="coerce"
+        )
+
+    text = (
+        series.astype("string")
+        .str.strip()
+    )
+
+    parsed = pd.to_datetime(
+        text,
+        format="%d %B %Y %H:%M:%S",
+        errors="coerce"
+    )
+
+    # Fallback apabila format export berubah.
+    mask_fallback = parsed.isna()
+
+    if mask_fallback.any():
+
+        parsed_fallback = pd.to_datetime(
+            text[mask_fallback],
+            errors="coerce",
+            dayfirst=True
+        )
+
+        parsed.loc[mask_fallback] = (
+            parsed_fallback
+        )
+
+    return parsed
+
+
+def build_mandiriva_search_dates(recon_dates):
+    """
+    Window pencarian MANDIRIVA: D-1 / D / D+1.
+    Weekend/libur tidak mengubah window.
+    """
+
+    search_dates = set()
+
+    for recon_date in recon_dates:
+
+        date_value = pd.to_datetime(
+            recon_date
+        ).date()
+
+        search_dates.add(
+            date_value - timedelta(days=1)
+        )
+
+        search_dates.add(
+            date_value
+        )
+
+        search_dates.add(
+            date_value + timedelta(days=1)
+        )
+
+    return search_dates
+
+
+def prepare_mandiriva_bank_dataframe(
+    uploaded_file,
+    recon_dates,
+    source_bank="MANDIRIVA"
+):
+    """
+    Load dan normalisasi mutasi MANDIRIVA.
+
+    Hanya transaksi yang:
+        - berada pada window D-1 / D / D+1
+        - Credit Amount > 0
+        - berada dalam scope prefix 888984
+
+    Mutasi produk Mandiri lain di rekening yang sama tidak dianggap
+    Invalid VA karena memang bukan scope MANDIRIVA 888984.
+    """
+
+    df = read_uploaded_file(
+        uploaded_file
+    )
+
+    col_credit = find_column(
+        df,
+        [
+            "Credit Amount",
+            "CREDIT AMOUNT",
+            "credit amount",
+            "CreditAmount",
+            "CREDIT_AMOUNT",
+            "credit_amount",
+            "CREDIT",
+            "Credit",
+            "credit",
+            "KREDIT",
+            "kredit"
+        ]
+    )
+
+    col_desc = find_column(
+        df,
+        [
+            "Remarks",
+            "REMARKS",
+            "remarks",
+            "AdditionalDesc",
+            "ADDITIONALDESC",
+            "additionaldesc",
+            "DESCRIPTION",
+            "Description",
+            "description",
+            "KETERANGAN",
+            "keterangan"
+        ]
+    )
+
+    col_date = find_column(
+        df,
+        [
+            "PostDate",
+            "POSTDATE",
+            "postdate",
+            "Post Date",
+            "POST DATE",
+            "post date",
+            "POST_DATE",
+            "post_date",
+            "TANGGAL",
+            "tanggal"
+        ]
+    )
+
+    df = df.copy()
+
+    # --------------------------------------------------------
+    # DATE
+    # --------------------------------------------------------
+
+    df["_TANGGAL_DT"] = (
+        parse_mandiriva_datetime(
+            df[col_date]
+        )
+    )
+
+    df["_TANGGAL_ONLY_DATE"] = (
+        df["_TANGGAL_DT"]
+        .dt.date
+    )
+
+    # --------------------------------------------------------
+    # CREDIT
+    # --------------------------------------------------------
+
+    df["_CREDIT_NUM"] = (
+        clean_numeric(
+            df[col_credit]
+        )
+    )
+
+    # --------------------------------------------------------
+    # SEARCH WINDOW
+    # --------------------------------------------------------
+
+    search_dates = (
+        build_mandiriva_search_dates(
+            recon_dates
+        )
+    )
+
+    df = df[
+        df["_TANGGAL_ONLY_DATE"]
+        .isin(search_dates)
+    ].copy()
+
+    # --------------------------------------------------------
+    # HANYA UANG MASUK
+    # --------------------------------------------------------
+
+    df = df[
+        df["_CREDIT_NUM"] > 0
+    ].copy()
+
+    # --------------------------------------------------------
+    # HANYA SCOPE PREFIX 888984
+    # --------------------------------------------------------
+
+    desc_text = (
+        df[col_desc]
+        .astype("string")
+        .fillna("")
+    )
+
+    scope_mask = (
+        desc_text.str.contains(
+            MANDIRIVA_PREFIX,
+            regex=False,
+            na=False
+        )
+    )
+
+    df = df[
+        scope_mask
+    ].copy()
+
+    # --------------------------------------------------------
+    # VA
+    # --------------------------------------------------------
+
+    df["KODE_VA"] = (
+        extract_mandiriva_va_series(
+            df[col_desc]
+        )
+    )
+
+    df["JENIS_VA"] = (
+        classify_mandiriva_va_series(
+            df["KODE_VA"]
+        )
+    )
+
+    # --------------------------------------------------------
+    # BANK TYPE / SOURCE / DESCRIPTION
+    # --------------------------------------------------------
+
+    df["_BANK_TYPE"] = "MANDIRIVA"
+    df["SOURCE_BANK"] = source_bank
+
+    df["_DESC_VALUE"] = (
+        df[col_desc]
+        .astype(str)
+    )
+
+    return df
+
+
+def get_mandiriva_date_relation(
+    int_row,
+    bank_row
+):
+    """
+    Label relasi tanggal pasangan MANDIRIVA.
+    """
+
+    try:
+
+        fmss_date = pd.to_datetime(
+            int_row.get("_TANGGAL_DT")
+        ).date()
+
+        bank_date = pd.to_datetime(
+            bank_row.get("_TANGGAL_DT")
+        ).date()
+
+        delta_days = (
+            bank_date - fmss_date
+        ).days
+
+    except Exception:
+
+        return "UNKNOWN"
+
+    if delta_days == -1:
+        return "H-1 RETRY"
+
+    if delta_days == 0:
+        return "SAME DAY"
+
+    if delta_days == 1:
+        return "H+1 CUTOFF"
+
+    return "OUTSIDE WINDOW"
+
+
+def mandiriva_time_difference_seconds(
+    int_row,
+    bank_row
+):
+
+    fmss_dt = pd.to_datetime(
+        int_row.get("_TANGGAL_DT"),
+        errors="coerce"
+    )
+
+    bank_dt = pd.to_datetime(
+        bank_row.get("_TANGGAL_DT"),
+        errors="coerce"
+    )
+
+    if pd.isna(fmss_dt) or pd.isna(bank_dt):
+        return None
+
+    return (
+        bank_dt - fmss_dt
+    ).total_seconds()
+
+
+def _mandiriva_alignment(
+    fmss_items,
+    bank_items
+):
+    """
+    Chronological sequence alignment untuk duplicate key.
+
+    Objective:
+        1. Maksimalkan jumlah pasangan.
+        2. Dari jumlah pasangan maksimum, minimalkan total selisih waktu absolut.
+        3. Urutan waktu dipertahankan agar transaksi tidak saling silang.
+
+    Tidak membutuhkan scipy / dependency tambahan.
+    """
+
+    m = len(fmss_items)
+    n = len(bank_items)
+
+    if m == 0 or n == 0:
+        return []
+
+    # dp[i][j] = (jumlah_match, total_cost_seconds, path)
+    # path berisi tuple posisi (fmss_pos, bank_pos).
+    dp = [
+        [None for _ in range(n + 1)]
+        for _ in range(m + 1)
+    ]
+
+    dp[0][0] = (0, 0.0, [])
+
+    for i in range(m + 1):
+
+        for j in range(n + 1):
+
+            current = dp[i][j]
+
+            if current is None:
+                continue
+
+            current_matches, current_cost, current_path = current
+
+            # ------------------------------------------------
+            # SKIP FMSS
+            # ------------------------------------------------
+
+            if i < m:
+
+                candidate = (
+                    current_matches,
+                    current_cost,
+                    current_path
+                )
+
+                existing = dp[i + 1][j]
+
+                if (
+                    existing is None
+                    or candidate[0] > existing[0]
+                    or (
+                        candidate[0] == existing[0]
+                        and candidate[1] < existing[1]
+                    )
+                ):
+
+                    dp[i + 1][j] = candidate
+
+            # ------------------------------------------------
+            # SKIP BANK
+            # ------------------------------------------------
+
+            if j < n:
+
+                candidate = (
+                    current_matches,
+                    current_cost,
+                    current_path
+                )
+
+                existing = dp[i][j + 1]
+
+                if (
+                    existing is None
+                    or candidate[0] > existing[0]
+                    or (
+                        candidate[0] == existing[0]
+                        and candidate[1] < existing[1]
+                    )
+                ):
+
+                    dp[i][j + 1] = candidate
+
+            # ------------------------------------------------
+            # MATCH
+            # ------------------------------------------------
+
+            if i < m and j < n:
+
+                fmss_dt = fmss_items[i][1]
+                bank_dt = bank_items[j][1]
+
+                if (
+                    pd.isna(fmss_dt)
+                    or pd.isna(bank_dt)
+                ):
+
+                    pair_cost = 10 ** 12
+
+                else:
+
+                    pair_cost = abs(
+                        (
+                            bank_dt
+                            - fmss_dt
+                        ).total_seconds()
+                    )
+
+                candidate = (
+                    current_matches + 1,
+                    current_cost + pair_cost,
+                    current_path + [
+                        (i, j)
+                    ]
+                )
+
+                existing = dp[i + 1][j + 1]
+
+                if (
+                    existing is None
+                    or candidate[0] > existing[0]
+                    or (
+                        candidate[0] == existing[0]
+                        and candidate[1] < existing[1]
+                    )
+                ):
+
+                    dp[i + 1][j + 1] = candidate
+
+    result = dp[m][n]
+
+    if result is None:
+        return []
+
+    return result[2]
+
+
+def _mandiriva_group_is_ambiguous(
+    fmss_items,
+    bank_items,
+    alignment
+):
+    """
+    Ambiguous hanya jika timestamp benar-benar tidak memberi pembeda.
+
+    Guardrail dibuat konservatif tanpa threshold waktu bisnis yang di-hardcode:
+        - timestamp duplicate identik pada key yang sama; atau
+        - satu FMSS mempunyai dua kandidat bank dengan jarak waktu identik.
+
+    Jika tidak terjadi kondisi tersebut, chronological alignment digunakan.
+    """
+
+    if not alignment:
+        return False
+
+    fmss_times = [
+        item[1]
+        for item in fmss_items
+    ]
+
+    bank_times = [
+        item[1]
+        for item in bank_items
+    ]
+
+    valid_fmss_times = [
+        value
+        for value in fmss_times
+        if not pd.isna(value)
+    ]
+
+    valid_bank_times = [
+        value
+        for value in bank_times
+        if not pd.isna(value)
+    ]
+
+    if len(valid_fmss_times) != len(set(valid_fmss_times)):
+        return True
+
+    if len(valid_bank_times) != len(set(valid_bank_times)):
+        return True
+
+    for fmss_pos, bank_pos in alignment:
+
+        fmss_dt = fmss_items[fmss_pos][1]
+        selected_bank_dt = bank_items[bank_pos][1]
+
+        if pd.isna(fmss_dt) or pd.isna(selected_bank_dt):
+            continue
+
+        selected_distance = abs(
+            (
+                selected_bank_dt
+                - fmss_dt
+            ).total_seconds()
+        )
+
+        equal_distance_count = 0
+
+        for _, candidate_bank_dt, _ in bank_items:
+
+            if pd.isna(candidate_bank_dt):
+                continue
+
+            candidate_distance = abs(
+                (
+                    candidate_bank_dt
+                    - fmss_dt
+                ).total_seconds()
+            )
+
+            if abs(
+                candidate_distance
+                - selected_distance
+            ) < 0.000001:
+
+                equal_distance_count += 1
+
+        if equal_distance_count > 1:
+            return True
+
+    return False
+
+
+def fast_match_mandiriva(
+    df_int_valid,
+    df_bank_valid,
+    recon_dates
+):
+    """
+    MANDIRIVA Option C - Tiered Confidence Matching.
+
+    Tahap 1:
+        VA + EXPECTED_BANK yang hanya muncul 1x di FMSS dan 1x di Bank
+        -> MATCHED HIGH CONFIDENCE.
+
+    Tahap 2:
+        Duplicate VA + nominal
+        -> chronological sequence alignment berdasarkan timestamp.
+
+    Matching selalu 1-to-1.
+
+    EXPECTED_BANK untuk MANDIRIVA sudah dihitung sebagai:
+        NOMINAL_ASLI + Rp1.000
+    sebelum fungsi ini dipanggil.
+    """
+
+    bank_records = (
+        df_bank_valid
+        .to_dict("records")
+    )
+
+    int_records = (
+        df_int_valid
+        .to_dict("records")
+    )
+
+    matched_bank_indexes = set()
+    matched_int_indexes = set()
+
+    blocked_bank_indexes = set()
+    blocked_int_indexes = set()
+
+    matched = []
+    unmatched_internal = []
+
+    # ========================================================
+    # BUILD KEY INDEX
+    # ========================================================
+
+    fmss_index = defaultdict(list)
+    bank_index = defaultdict(list)
+
+    for int_idx, int_row in enumerate(
+        int_records
+    ):
+
+        key = (
+            str(int_row.get("KODE_VA")),
+            float(int_row.get("EXPECTED_BANK", 0))
+        )
+
+        fmss_index[key].append(
+            int_idx
+        )
+
+    for bank_idx, bank_row in enumerate(
+        bank_records
+    ):
+
+        key = (
+            str(bank_row.get("KODE_VA")),
+            float(bank_row.get("_CREDIT_NUM", 0))
+        )
+
+        bank_index[key].append(
+            bank_idx
+        )
+
+    # ========================================================
+    # HELPER: SAVE MATCH
+    # ========================================================
+
+    def save_match(
+        int_idx,
+        bank_idx,
+        match_method,
+        match_confidence
+    ):
+
+        int_row = int_records[
+            int_idx
+        ]
+
+        bank_row = bank_records[
+            bank_idx
+        ]
+
+        record = int_row.copy()
+
+        record["MATCH_MUTASI_KREDIT"] = (
+            bank_row.get(
+                "_CREDIT_NUM",
+                0
+            )
+        )
+
+        record["MATCH_DESK_TRAN"] = (
+            bank_row.get(
+                "_DESC_VALUE",
+                ""
+            )
+        )
+
+        record["SOURCE_BANK"] = (
+            bank_row.get(
+                "SOURCE_BANK",
+                "MANDIRIVA"
+            )
+        )
+
+        record["BANK_TYPE"] = (
+            bank_row.get(
+                "_BANK_TYPE",
+                "MANDIRIVA"
+            )
+        )
+
+        record["MATCH_METHOD"] = (
+            match_method
+        )
+
+        record["MATCH_CONFIDENCE"] = (
+            match_confidence
+        )
+
+        record["DATE_RELATION"] = (
+            get_mandiriva_date_relation(
+                int_row,
+                bank_row
+            )
+        )
+
+        time_difference_seconds = (
+            mandiriva_time_difference_seconds(
+                int_row,
+                bank_row
+            )
+        )
+
+        record["TIME_DIFFERENCE_SECONDS"] = (
+            time_difference_seconds
+        )
+
+        if time_difference_seconds is None:
+
+            record["TIME_DIFFERENCE_MINUTES"] = None
+
+        else:
+
+            record["TIME_DIFFERENCE_MINUTES"] = (
+                time_difference_seconds / 60
+            )
+
+        record["BANK_MATCH_DATETIME"] = (
+            bank_row.get(
+                "_TANGGAL_DT"
+            )
+        )
+
+        record["STATUS_MATCH"] = "MATCHED"
+
+        matched.append(
+            record
+        )
+
+        matched_int_indexes.add(
+            int_idx
+        )
+
+        matched_bank_indexes.add(
+            bank_idx
+        )
+
+    # ========================================================
+    # TAHAP 1 - UNIQUE EXACT
+    # ========================================================
+
+    all_keys = set(
+        fmss_index.keys()
+    )
+
+    for key in all_keys:
+
+        fmss_candidates = (
+            fmss_index.get(
+                key,
+                []
+            )
+        )
+
+        bank_candidates = (
+            bank_index.get(
+                key,
+                []
+            )
+        )
+
+        if (
+            len(fmss_candidates) == 1
+            and len(bank_candidates) == 1
+        ):
+
+            save_match(
+                fmss_candidates[0],
+                bank_candidates[0],
+                "VA_NOMINAL_UNIQUE",
+                "HIGH"
+            )
+
+    # ========================================================
+    # TAHAP 2 - DUPLICATE / TIME RESOLUTION
+    # ========================================================
+
+    remaining_keys = set()
+
+    for int_idx, int_row in enumerate(
+        int_records
+    ):
+
+        if int_idx in matched_int_indexes:
+            continue
+
+        key = (
+            str(int_row.get("KODE_VA")),
+            float(int_row.get("EXPECTED_BANK", 0))
+        )
+
+        remaining_keys.add(
+            key
+        )
+
+    for key in remaining_keys:
+
+        fmss_candidates = [
+            idx
+            for idx in fmss_index.get(
+                key,
+                []
+            )
+            if idx not in matched_int_indexes
+        ]
+
+        bank_candidates = [
+            idx
+            for idx in bank_index.get(
+                key,
+                []
+            )
+            if idx not in matched_bank_indexes
+        ]
+
+        if not fmss_candidates:
+            continue
+
+        if not bank_candidates:
+            continue
+
+        fmss_items = []
+
+        for int_idx in fmss_candidates:
+
+            int_dt = pd.to_datetime(
+                int_records[int_idx].get(
+                    "_TANGGAL_DT"
+                ),
+                errors="coerce"
+            )
+
+            fmss_items.append(
+                (
+                    int_idx,
+                    int_dt,
+                    int_records[int_idx]
+                )
+            )
+
+        bank_items = []
+
+        for bank_idx in bank_candidates:
+
+            bank_dt = pd.to_datetime(
+                bank_records[bank_idx].get(
+                    "_TANGGAL_DT"
+                ),
+                errors="coerce"
+            )
+
+            bank_items.append(
+                (
+                    bank_idx,
+                    bank_dt,
+                    bank_records[bank_idx]
+                )
+            )
+
+        fmss_items.sort(
+            key=lambda item: (
+                pd.Timestamp.max
+                if pd.isna(item[1])
+                else item[1],
+                item[0]
+            )
+        )
+
+        bank_items.sort(
+            key=lambda item: (
+                pd.Timestamp.max
+                if pd.isna(item[1])
+                else item[1],
+                item[0]
+            )
+        )
+
+        alignment = (
+            _mandiriva_alignment(
+                fmss_items,
+                bank_items
+            )
+        )
+
+        if not alignment:
+            continue
+
+        is_ambiguous = (
+            _mandiriva_group_is_ambiguous(
+                fmss_items,
+                bank_items,
+                alignment
+            )
+        )
+
+        if is_ambiguous:
+
+            for fmss_pos, bank_pos in alignment:
+
+                int_idx = fmss_items[
+                    fmss_pos
+                ][0]
+
+                bank_idx = bank_items[
+                    bank_pos
+                ][0]
+
+                blocked_int_indexes.add(
+                    int_idx
+                )
+
+                blocked_bank_indexes.add(
+                    bank_idx
+                )
+
+            continue
+
+        for fmss_pos, bank_pos in alignment:
+
+            int_idx = fmss_items[
+                fmss_pos
+            ][0]
+
+            bank_idx = bank_items[
+                bank_pos
+            ][0]
+
+            save_match(
+                int_idx,
+                bank_idx,
+                "TIME_RESOLVED",
+                "HIGH"
+            )
+
+    # ========================================================
+    # FMSS YANG BELUM MATCH
+    # ========================================================
+
+    for int_idx, int_row in enumerate(
+        int_records
+    ):
+
+        if int_idx in matched_int_indexes:
+            continue
+
+        record = int_row.copy()
+
+        if int_idx in blocked_int_indexes:
+
+            record["STATUS_MATCH"] = (
+                "AMBIGUOUS_MATCH - MANDIRIVA"
+            )
+
+            record["MATCH_METHOD"] = (
+                "TIME_AMBIGUOUS"
+            )
+
+            record["MATCH_CONFIDENCE"] = (
+                "LOW"
+            )
+
+        else:
+
+            record["STATUS_MATCH"] = (
+                "FMSS_ONLY"
+            )
+
+            record["MATCH_METHOD"] = (
+                "NO_MATCH"
+            )
+
+            record["MATCH_CONFIDENCE"] = (
+                "NONE"
+            )
+
+        unmatched_internal.append(
+            record
+        )
+
+    # ========================================================
+    # ISSUE BANK
+    # ========================================================
+    #
+    # Prinsip:
+    # - Unmatched D-1 / D+1 = search pool saja, bukan Issue Bank D.
+    # - Unmatched Bank D tidak boleh langsung disebut BANK_ONLY jika
+    #   FMSS D-1 dan D+1 belum tersedia.
+    # - Agar dashboard tidak menghasilkan false Issue Bank, record yang
+    #   belum dapat diverifikasi tidak dimasukkan ke df_selisih_bnk.
+    # ========================================================
+
+    unmatched_bank = []
+
+    target_dates = {
+        pd.to_datetime(d).date()
+        for d in recon_dates
+    }
+
+    fmss_available_dates = set(
+        pd.to_datetime(
+            df_int_valid["_TANGGAL_DT"],
+            errors="coerce"
+        )
+        .dropna()
+        .dt.date
+    )
+
+    for bank_idx, bank_row in enumerate(
+        bank_records
+    ):
+
+        if bank_idx in matched_bank_indexes:
+            continue
+
+        if bank_idx in blocked_bank_indexes:
+            continue
+
+        bank_datetime = pd.to_datetime(
+            bank_row.get(
+                "_TANGGAL_DT"
+            ),
+            errors="coerce"
+        )
+
+        if pd.isna(bank_datetime):
+            continue
+
+        bank_date = (
+            bank_datetime.date()
+        )
+
+        # Neighbor date tidak dihitung sebagai Issue Bank target.
+        if bank_date not in target_dates:
+            continue
+
+        required_fmss_dates = {
+            bank_date - timedelta(days=1),
+            bank_date,
+            bank_date + timedelta(days=1)
+        }
+
+        # Hanya laporkan BANK_ONLY apabila crosscheck neighbor lengkap.
+        if not required_fmss_dates.issubset(
+            fmss_available_dates
+        ):
+            continue
+
+        record = bank_row.copy()
+
+        record["STATUS_MATCH"] = (
+            "BANK_ONLY - MANDIRIVA"
+        )
+
+        unmatched_bank.append(
+            record
+        )
+
+    # ========================================================
+    # DATAFRAME
+    # ========================================================
+
+    df_matched = pd.DataFrame(
+        matched
+    )
+
+    df_selisih_int = pd.DataFrame(
+        unmatched_internal
+    )
+
+    df_selisih_bnk = pd.DataFrame(
+        unmatched_bank
+    )
+
+    return (
+        df_matched,
+        df_selisih_int,
+        df_selisih_bnk
+    )
+
 # ============================================================
 # FAST BANK FILE PROCESSOR
 # ============================================================
@@ -2046,6 +3177,24 @@ if can_process:
                         )
                     )
 
+                elif pilihan_bank == "MANDIRIVA":
+
+                    df_int_sukses["KODE_VA"] = (
+                        extract_mandiriva_va_series(
+                            df_int_sukses[
+                                col_keterangan_int
+                            ]
+                        )
+                    )
+
+                    df_int_sukses["JENIS_VA"] = (
+                        classify_mandiriva_va_series(
+                            df_int_sukses[
+                                "KODE_VA"
+                            ]
+                        )
+                    )
+
                 else:
 
                     df_int_sukses["KODE_VA"] = (
@@ -2148,6 +3297,17 @@ if can_process:
                     + fee_57708
                 )
 
+                if pilihan_bank == "MANDIRIVA":
+
+                    df_int_valid[
+                        "EXPECTED_BANK"
+                    ] = (
+                        df_int_valid[
+                            "NOMINAL_ASLI"
+                        ]
+                        + MANDIRIVA_FEE
+                    )
+
                 # =================================================
                 # BANK PROCESSING
                 # =================================================
@@ -2199,6 +3359,26 @@ if can_process:
 
                     bank_sources.append(
                         df_bniva
+                    )
+
+                elif pilihan_bank == "MANDIRIVA":
+
+                    # ---------------------------------------------
+                    # MANDIRIVA
+                    # Engine khusus Option C, terpisah dari
+                    # BRIVA dan BNIVA.
+                    # ---------------------------------------------
+
+                    df_mandiriva = (
+                        prepare_mandiriva_bank_dataframe(
+                            file_bnk_general,
+                            recon_dates,
+                            "MANDIRIVA"
+                        )
+                    )
+
+                    bank_sources.append(
+                        df_mandiriva
                     )
 
                 else:
@@ -2267,6 +3447,18 @@ if can_process:
                         df_selisih_int,
                         df_selisih_bnk
                     ) = fast_match_bniva(
+                        df_int_valid,
+                        df_bank_valid,
+                        recon_dates
+                    )
+
+                elif pilihan_bank == "MANDIRIVA":
+
+                    (
+                        df_matched,
+                        df_selisih_int,
+                        df_selisih_bnk
+                    ) = fast_match_mandiriva(
                         df_int_valid,
                         df_bank_valid,
                         recon_dates
