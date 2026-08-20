@@ -329,6 +329,462 @@ def classify_va_series(series):
 
 
 # ============================================================
+# BRIVA ENGINE - COMPREHENSIVE DATE / CUTOFF HANDLING
+# ============================================================
+# Catatan:
+# - fast_match() BRIVA legacy di bawah TIDAK diubah.
+# - Jalur BRIVA baru ini hanya memperbaiki temuan rekonsiliasi:
+#   1) timestamp FMSS campuran (dengan / tanpa microsecond),
+#   2) mutasi D+1 boleh menjadi search pool untuk cutoff,
+#   3) unmatched D+1 tidak dihitung sebagai Issue Bank D,
+#   4) matching tetap VA + EXPECTED_BANK, 1-to-1.
+# - BNIVA, MANDIRIVA, dan engine tampilan dashboard tidak berubah.
+
+
+def parse_briva_datetime(series):
+    """
+    Parser khusus BRIVA yang tahan timestamp campuran.
+
+    Contoh yang harus sama-sama valid:
+        2026-08-19 23:58:49.339228
+        2026-08-19 23:00:04
+
+    pd.to_datetime(series) pada beberapa versi pandas dapat mengunci
+    satu format dari baris awal sehingga baris tanpa microsecond menjadi NaT.
+    Karena itu parsing gagal akan dicoba ulang per nilai.
+    """
+
+    # Pandas modern: format='mixed' adalah pilihan paling tepat.
+    try:
+        parsed = pd.to_datetime(
+            series,
+            errors="coerce",
+            format="mixed"
+        )
+    except (TypeError, ValueError):
+        parsed = pd.to_datetime(
+            series,
+            errors="coerce"
+        )
+
+    # Fallback untuk versi pandas yang belum mendukung format='mixed'
+    # atau apabila masih ada nilai valid yang gagal diparse secara vectorized.
+    source = pd.Series(
+        series,
+        index=getattr(series, "index", None)
+    )
+
+    missing_mask = (
+        parsed.isna()
+        & source.notna()
+        & source.astype(str).str.strip().ne("")
+    )
+
+    if missing_mask.any():
+        reparsed = source.loc[missing_mask].apply(
+            lambda value: pd.to_datetime(
+                value,
+                errors="coerce"
+            )
+        )
+
+        parsed.loc[missing_mask] = reparsed
+
+    return parsed
+
+
+def build_briva_search_dates(recon_dates):
+    """
+    Search pool BRIVA untuk FMSS tanggal D:
+        D   = transaksi normal / retry yang sukses pada hari D
+        D+1 = antisipasi cutoff bank
+
+    D+1 hanya search pool. Sisa mutasi D+1 tidak boleh menjadi Issue Bank D.
+    """
+
+    result = set()
+
+    for value in recon_dates:
+        base_date = pd.Timestamp(value).date()
+        result.add(base_date)
+        result.add(
+            base_date + timedelta(days=1)
+        )
+
+    return sorted(result)
+
+
+def prepare_briva_bank_dataframe(
+    uploaded_file,
+    recon_dates,
+    source_bank
+):
+    """
+    Load dan normalisasi file bank khusus BRIVA.
+
+    Logic field/VA/nominal tetap mengikuti prepare_bank_dataframe() legacy.
+    Perbedaannya hanya:
+        - parser tanggal BRIVA lebih robust,
+        - bank D+1 ikut dibaca sebagai search pool cutoff.
+    """
+
+    df = read_uploaded_file(
+        uploaded_file
+    )
+
+    col_credit = find_column(
+        df,
+        [
+            "MUTASI_KREDIT",
+            "mutasi_kredit",
+            "KREDIT",
+            "kredit"
+        ]
+    )
+
+    col_desc = find_column(
+        df,
+        [
+            "DESK_TRAN",
+            "desk_tran",
+            "KETERANGAN",
+            "keterangan",
+            "DESCRIPTION",
+            "description"
+        ]
+    )
+
+    col_date = find_column(
+        df,
+        [
+            "TGL_TRAN",
+            "tgl_tran",
+            "TANGGAL_TRAN",
+            "tanggal_tran",
+            "TANGGAL",
+            "tanggal"
+        ]
+    )
+
+    df = df.copy()
+
+    # --------------------------------------------------------
+    # DATE - parser khusus BRIVA
+    # --------------------------------------------------------
+
+    df["_TANGGAL_DT"] = parse_briva_datetime(
+        df[col_date]
+    )
+
+    # --------------------------------------------------------
+    # CREDIT
+    # --------------------------------------------------------
+
+    df["_CREDIT_NUM"] = clean_numeric(
+        df[col_credit]
+    )
+
+    # --------------------------------------------------------
+    # FILTER TANGGAL D + D+1
+    # --------------------------------------------------------
+
+    search_dates = build_briva_search_dates(
+        recon_dates
+    )
+
+    search_datetime = pd.to_datetime(
+        search_dates
+    )
+
+    df["_TANGGAL_ONLY"] = (
+        df["_TANGGAL_DT"]
+        .dt.normalize()
+    )
+
+    df = df[
+        df["_TANGGAL_ONLY"].isin(
+            search_datetime
+        )
+    ].copy()
+
+    # --------------------------------------------------------
+    # HANYA UANG MASUK
+    # --------------------------------------------------------
+
+    df = df[
+        df["_CREDIT_NUM"] > 0
+    ].copy()
+
+    # --------------------------------------------------------
+    # BANK TYPE - logic legacy
+    # --------------------------------------------------------
+
+    df["_BANK_TYPE"] = (
+        df[col_desc]
+        .apply(classify_bank_transaction)
+    )
+
+    # --------------------------------------------------------
+    # VA - logic legacy
+    # --------------------------------------------------------
+
+    df["KODE_VA"] = extract_va_series(
+        df[col_desc]
+    )
+
+    df["JENIS_VA"] = classify_va_series(
+        df["KODE_VA"]
+    )
+
+    # --------------------------------------------------------
+    # SOURCE
+    # --------------------------------------------------------
+
+    df["SOURCE_BANK"] = source_bank
+
+    df["_DESC_VALUE"] = (
+        df[col_desc]
+        .astype(str)
+    )
+
+    return df
+
+
+def fast_match_briva(
+    df_int_valid,
+    df_bank_valid,
+    recon_dates
+):
+    """
+    Matching BRIVA komprehensif dengan rule bisnis lama:
+        KODE_VA exact
+        EXPECTED_BANK exact
+        1-to-1
+
+    Enhancement terbatas:
+        - Bank tanggal D diprioritaskan sebelum D+1.
+        - D+1 dapat menyelesaikan FMSS cutoff.
+        - Sisa Bank D+1 tidak dihitung sebagai Issue Bank tanggal D.
+
+    Tidak ada perubahan pada rumus fee maupun klasifikasi BRIVA.
+    """
+
+    target_dates = {
+        pd.Timestamp(value).date()
+        for value in recon_dates
+    }
+
+    # Copy agar dataframe asli tidak berubah.
+    bank_work = df_bank_valid.copy()
+
+    if not bank_work.empty:
+        bank_work["_BRIVA_ORIGINAL_ORDER"] = range(
+            len(bank_work)
+        )
+
+        bank_date = (
+            bank_work["_TANGGAL_DT"]
+            .dt.date
+        )
+
+        # Tanggal target D selalu dicoba lebih dulu daripada D+1.
+        bank_work["_BRIVA_DATE_PRIORITY"] = (
+            ~bank_date.isin(target_dates)
+        ).astype(int)
+
+        bank_work = bank_work.sort_values(
+            by=[
+                "_BRIVA_DATE_PRIORITY",
+                "_TANGGAL_DT",
+                "_BRIVA_ORIGINAL_ORDER"
+            ],
+            kind="stable",
+            na_position="last"
+        ).reset_index(drop=True)
+
+    bank_records = (
+        bank_work
+        .to_dict("records")
+    )
+
+    bank_index = defaultdict(
+        deque
+    )
+
+    for idx, bank_row in enumerate(
+        bank_records
+    ):
+        key = (
+            str(bank_row["KODE_VA"]),
+            float(bank_row["_CREDIT_NUM"])
+        )
+
+        bank_index[key].append(
+            idx
+        )
+
+    matched_bank_indexes = set()
+    matched = []
+    unmatched_internal = []
+
+    int_records = (
+        df_int_valid
+        .to_dict("records")
+    )
+
+    for int_row in int_records:
+        key = (
+            str(int_row["KODE_VA"]),
+            float(int_row["EXPECTED_BANK"])
+        )
+
+        queue = bank_index.get(
+            key
+        )
+
+        if queue:
+            bank_idx = queue.popleft()
+            bank_row = bank_records[bank_idx]
+
+            matched_bank_indexes.add(
+                bank_idx
+            )
+
+            record = int_row.copy()
+
+            record["MATCH_MUTASI_KREDIT"] = (
+                bank_row["_CREDIT_NUM"]
+            )
+
+            record["MATCH_DESK_TRAN"] = (
+                bank_row.get(
+                    "_DESC_VALUE",
+                    ""
+                )
+            )
+
+            record["SOURCE_BANK"] = (
+                bank_row.get(
+                    "SOURCE_BANK",
+                    ""
+                )
+            )
+
+            record["BANK_TYPE"] = (
+                bank_row.get(
+                    "_BANK_TYPE",
+                    ""
+                )
+            )
+
+            record["STATUS_MATCH"] = (
+                "MATCHED"
+            )
+
+            # Metadata audit tambahan; tidak mengubah dashboard.
+            bank_dt = bank_row.get(
+                "_TANGGAL_DT"
+            )
+
+            fmss_dt = int_row.get(
+                "_TANGGAL_DT"
+            )
+
+            record["MATCH_BANK_DATETIME"] = bank_dt
+
+            if (
+                pd.notna(bank_dt)
+                and pd.notna(fmss_dt)
+            ):
+                bank_date_value = pd.Timestamp(
+                    bank_dt
+                ).date()
+                fmss_date_value = pd.Timestamp(
+                    fmss_dt
+                ).date()
+
+                if bank_date_value == fmss_date_value:
+                    record["DATE_RELATION"] = "SAME_DAY"
+                elif bank_date_value == (
+                    fmss_date_value + timedelta(days=1)
+                ):
+                    record["DATE_RELATION"] = "H+1_CUTOFF"
+                else:
+                    record["DATE_RELATION"] = "OTHER"
+
+            matched.append(
+                record
+            )
+
+        else:
+            record = int_row.copy()
+            record["STATUS_MATCH"] = (
+                "FMSS_ONLY"
+            )
+
+            unmatched_internal.append(
+                record
+            )
+
+    # --------------------------------------------------------
+    # ISSUE BANK
+    # --------------------------------------------------------
+    # Hanya sisa mutasi bank tanggal TARGET D yang masuk Issue Bank.
+    # D+1 adalah search pool cutoff dan tidak boleh memperbesar issue D.
+
+    unmatched_bank = []
+
+    for idx, bank_row in enumerate(
+        bank_records
+    ):
+        if idx in matched_bank_indexes:
+            continue
+
+        bank_dt = bank_row.get(
+            "_TANGGAL_DT"
+        )
+
+        if pd.isna(bank_dt):
+            continue
+
+        bank_date_value = pd.Timestamp(
+            bank_dt
+        ).date()
+
+        if bank_date_value not in target_dates:
+            continue
+
+        record = bank_row.copy()
+
+        record["STATUS_MATCH"] = (
+            classify_issue_bank(
+                bank_row.get(
+                    "_BANK_TYPE",
+                    ""
+                )
+            )
+        )
+
+        record["MATCH_METHOD"] = (
+            "NO_FMSS_MATCH_TARGET_DATE"
+        )
+
+        record["MATCH_CONFIDENCE"] = (
+            "BANK_ONLY_CANDIDATE"
+        )
+
+        unmatched_bank.append(
+            record
+        )
+
+    return (
+        pd.DataFrame(matched),
+        pd.DataFrame(unmatched_internal),
+        pd.DataFrame(unmatched_bank)
+    )
+
+
+# ============================================================
 # BNIVA ENGINE
 # ============================================================
 #
@@ -3156,13 +3612,25 @@ if can_process:
                 # TANGGAL REKONSILIASI
                 # =================================================
 
-                df_int_sukses["_TANGGAL_DT"] = (
-                    parse_datetime(
-                        df_int_sukses[
-                            col_tanggal_int
-                        ]
+                if pilihan_bank == "BRIVA":
+
+                    df_int_sukses["_TANGGAL_DT"] = (
+                        parse_briva_datetime(
+                            df_int_sukses[
+                                col_tanggal_int
+                            ]
+                        )
                     )
-                )
+
+                else:
+
+                    df_int_sukses["_TANGGAL_DT"] = (
+                        parse_datetime(
+                            df_int_sukses[
+                                col_tanggal_int
+                            ]
+                        )
+                    )
 
                 df_int_sukses = (
                     df_int_sukses[
@@ -3365,7 +3833,7 @@ if can_process:
                     # BRIVA 57888
                     # ---------------------------------------------
 
-                    df_57888 = prepare_bank_dataframe(
+                    df_57888 = prepare_briva_bank_dataframe(
                         file_bnk_57888,
                         recon_dates,
                         "BRIVA FASTPAY 57888"
@@ -3379,7 +3847,7 @@ if can_process:
                     # BRIVA 57708
                     # ---------------------------------------------
 
-                    df_57708 = prepare_bank_dataframe(
+                    df_57708 = prepare_briva_bank_dataframe(
                         file_bnk_57708,
                         recon_dates,
                         "BRIVA RAJABILLER 57708"
@@ -3504,6 +3972,18 @@ if can_process:
                         df_selisih_int,
                         df_selisih_bnk
                     ) = fast_match_mandiriva(
+                        df_int_valid,
+                        df_bank_valid,
+                        recon_dates
+                    )
+
+                elif pilihan_bank == "BRIVA":
+
+                    (
+                        df_matched,
+                        df_selisih_int,
+                        df_selisih_bnk
+                    ) = fast_match_briva(
                         df_int_valid,
                         df_bank_valid,
                         recon_dates
