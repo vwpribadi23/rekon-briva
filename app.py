@@ -2367,15 +2367,28 @@ def fast_match_mandiriva(
         )
 
     # ========================================================
-    # ISSUE BANK
+    # ISSUE BANK - MANDIRIVA
     # ========================================================
     #
-    # Prinsip:
-    # - Unmatched D-1 / D+1 = search pool saja, bukan Issue Bank D.
-    # - Unmatched Bank D tidak boleh langsung disebut BANK_ONLY jika
-    #   FMSS D-1 dan D+1 belum tersedia.
-    # - Agar dashboard tidak menghasilkan false Issue Bank, record yang
-    #   belum dapat diverifikasi tidak dimasukkan ke df_selisih_bnk.
+    # Tujuan rule ini:
+    # 1. Tetap TIDAK menghitung unmatched Bank D-1 / D+1 sebagai
+    #    Issue Bank untuk periode FMSS D karena keduanya hanya search pool.
+    # 2. Unmatched Bank pada tanggal target D harus dapat muncul di
+    #    dashboard sebagai kandidat BANK_ONLY agar kasus uang masuk bank
+    #    tetapi belum tercatat di FMSS tidak tersembunyi.
+    # 3. Tetap melindungi batch carry-over/cutoff H-1 Mandiri yang secara
+    #    historis masuk ke Bank D pada dini hari. Tanpa FMSS D-1, transaksi
+    #    dini hari tersebut belum aman disebut BANK_ONLY.
+    #
+    # Guard operasional:
+    # - Bank D pukul 00:00:00 s.d. sebelum 03:00:00 yang belum match
+    #   dianggap BANK_UNVERIFIED_NEIGHBOR dan TIDAK masuk Issue Bank.
+    # - Bank D mulai 03:00:00 yang belum match dimasukkan sebagai
+    #   BANK_ONLY_CANDIDATE - MANDIRIVA.
+    #
+    # Guard 03:00 dipakai untuk menahan false positive batch cutoff H-1
+    # (contoh historis batch sekitar 01:32-02:xx), tanpa mengubah engine
+    # matching FMSS maupun tampilan dashboard.
     # ========================================================
 
     unmatched_bank = []
@@ -2385,14 +2398,7 @@ def fast_match_mandiriva(
         for d in recon_dates
     }
 
-    fmss_available_dates = set(
-        pd.to_datetime(
-            df_int_valid["_TANGGAL_DT"],
-            errors="coerce"
-        )
-        .dropna()
-        .dt.date
-    )
+    mandiriva_neighbor_guard_hour = 3
 
     for bank_idx, bank_row in enumerate(
         bank_records
@@ -2418,27 +2424,66 @@ def fast_match_mandiriva(
             bank_datetime.date()
         )
 
-        # Neighbor date tidak dihitung sebagai Issue Bank target.
+        # D-1 / D+1 hanya search pool untuk FMSS tanggal target.
         if bank_date not in target_dates:
             continue
 
-        required_fmss_dates = {
-            bank_date - timedelta(days=1),
-            bank_date,
-            bank_date + timedelta(days=1)
-        }
+        # ----------------------------------------------------
+        # PROTEKSI CARRY-OVER H-1 DINI HARI
+        # ----------------------------------------------------
+        # Tanpa file FMSS D-1, unmatched Bank D sebelum pukul 03:00
+        # berpotensi besar merupakan settlement/cutoff transaksi D-1.
+        # Jangan naikkan menjadi Issue Bank dashboard.
+        # ----------------------------------------------------
 
-        # Hanya laporkan BANK_ONLY apabila crosscheck neighbor lengkap.
-        if not required_fmss_dates.issubset(
-            fmss_available_dates
-        ):
+        if bank_datetime.hour < mandiriva_neighbor_guard_hour:
             continue
+
+        # ----------------------------------------------------
+        # BANK ONLY CANDIDATE
+        # ----------------------------------------------------
+        # Uang sudah benar-benar masuk di Bank tanggal D, tetapi sesudah
+        # seluruh proses matching 1-to-1 tidak ada FMSS D yang memakai
+        # record ini. Masukkan ke Issue Bank agar gangguan internal dapat
+        # terdeteksi oleh dashboard.
+        # ----------------------------------------------------
 
         record = bank_row.copy()
 
         record["STATUS_MATCH"] = (
-            "BANK_ONLY - MANDIRIVA"
+            "BANK_ONLY_CANDIDATE - MANDIRIVA"
         )
+
+        record["MATCH_METHOD"] = (
+            "NO_FMSS_MATCH_TARGET_DATE"
+        )
+
+        record["MATCH_CONFIDENCE"] = (
+            "MEDIUM"
+        )
+
+        bank_credit = float(
+            record.get(
+                "_CREDIT_NUM",
+                0
+            )
+            or 0
+        )
+
+        # Estimasi nominal FMSS hanya untuk kebutuhan audit/export.
+        # Dashboard tetap memakai nominal uang yang benar-benar masuk bank.
+        if bank_credit > MANDIRIVA_FEE:
+            record["EXPECTED_FMSS_NOMINAL"] = (
+                bank_credit - MANDIRIVA_FEE
+            )
+            record["BANK_ONLY_NOTE"] = (
+                "CREDIT_GT_FEE"
+            )
+        else:
+            record["EXPECTED_FMSS_NOMINAL"] = None
+            record["BANK_ONLY_NOTE"] = (
+                "CREDIT_LE_FEE_REVIEW"
+            )
 
         unmatched_bank.append(
             record
