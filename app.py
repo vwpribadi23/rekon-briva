@@ -3334,6 +3334,1606 @@ def fast_match_mandiriva(
     )
 
 # ============================================================
+# BCAVA ENGINE - MULTI FORMAT / MULTI REPORT CUTOFF
+# ============================================================
+#
+# PENTING:
+# - Engine BRIVA, BNIVA, dan MANDIRIVA tidak diubah.
+# - BCAVA menggunakan parser dan matching engine terpisah.
+# - Prefix BCAVA: 15501
+# - Fee BCAVA: Rp3.000
+# - Report BCA boleh berbeda format antar hari.
+# - Uploader bank BCAVA dapat menerima lebih dari satu file.
+# - Scope transaksi ditentukan dari TANGGAL TRANSAKSI di setiap row,
+#   bukan dari nama file.
+# - Report D dan D+1 digabung untuk menangkap cutoff.
+# - Jika report D+1 belum tersedia (H0), FMSS setelah coverage bank terakhir
+#   tidak dinaikkan menjadi Issue FMSS.
+# ============================================================
+
+BCAVA_PREFIX = "15501"
+BCAVA_FEE = 3000
+BCAVA_VA_REGEX = r"(?<!\d)(15501[-\s]?\d{11})(?!\d)"
+
+
+def parse_bcava_fmss_datetime(series):
+    """
+    Parser tanggal FMSS BCAVA yang tahan timestamp campuran.
+    """
+
+    return parse_briva_datetime(series)
+
+
+def normalize_bcava_va_value(value):
+    """
+    Normalisasi VA BCA menjadi 16 digit:
+        15501 + 11 digit customer number.
+
+    Mendukung:
+        1550100295727045
+        15501-00295727045
+        00295727045
+    """
+
+    if pd.isna(value):
+        return None
+
+    digits = re.sub(
+        r"\D",
+        "",
+        str(value)
+    )
+
+    if (
+        len(digits) == 16
+        and digits.startswith(BCAVA_PREFIX)
+    ):
+        return digits
+
+    if len(digits) == 11:
+        return BCAVA_PREFIX + digits
+
+    return None
+
+
+def extract_bcava_va_series(series):
+    """
+    Ekstrak VA BCAVA dari keterangan FMSS.
+    """
+
+    extracted = (
+        series.astype("string")
+        .str.extract(
+            BCAVA_VA_REGEX,
+            expand=False
+        )
+    )
+
+    return extracted.apply(
+        normalize_bcava_va_value
+    )
+
+
+def classify_bcava_va_series(series):
+
+    result = pd.Series(
+        "INVALID VA",
+        index=series.index,
+        dtype="object"
+    )
+
+    mask = (
+        series.astype("string")
+        .str.fullmatch(
+            r"15501\d{11}",
+            na=False
+        )
+    )
+
+    result.loc[mask] = "BCAVA"
+
+    return result
+
+
+def extract_bcava_outlet_value(value):
+    """
+    Ekstrak kode outlet dari nama/keterangan BCA.
+    Contoh: TOPUP FA1431511 -> FA1431511.
+    """
+
+    if pd.isna(value):
+        return None
+
+    text = str(value).upper()
+
+    match = re.search(
+        r"\b(?:FA|FT|TK)\d+\b",
+        text
+    )
+
+    if match:
+        return match.group(0)
+
+    return None
+
+
+def _bcava_decode_bytes(raw_bytes):
+    """
+    Decode file text BCA dengan beberapa encoding umum.
+    """
+
+    for encoding in [
+        "utf-8-sig",
+        "utf-8",
+        "cp1252",
+        "latin1"
+    ]:
+        try:
+            return raw_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+
+    return raw_bytes.decode(
+        "latin1",
+        errors="replace"
+    )
+
+
+def _bcava_read_bytes(uploaded_file):
+
+    uploaded_file.seek(0)
+    raw = uploaded_file.read()
+    uploaded_file.seek(0)
+
+    if isinstance(raw, str):
+        raw = raw.encode(
+            "utf-8",
+            errors="replace"
+        )
+
+    return raw
+
+
+def _bcava_parse_amount_text(value):
+
+    if value is None:
+        return 0.0
+
+    text = (
+        str(value)
+        .replace("Rp", "")
+        .replace("IDR", "")
+        .replace(" ", "")
+        .replace(",", "")
+    )
+
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _parse_bcava_r5401_text(
+    text,
+    source_name,
+    source_id
+):
+    """
+    Parser format:
+        LAPORAN TRANSAKSI VIA E-BANKING & COUNTER
+        NO.PELANGGAN/NO.TXN ... NILAI TRANSAKSI ... TGL. TXN WAKTU
+    """
+
+    report_date = None
+
+    report_match = re.search(
+        r"\bTANGGAL\s*:\s*(\d{2}/\d{2}/\d{2})",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    if report_match:
+        report_date = pd.to_datetime(
+            report_match.group(1),
+            format="%d/%m/%y",
+            errors="coerce"
+        )
+
+        if pd.notna(report_date):
+            report_date = report_date.date()
+        else:
+            report_date = None
+
+    pattern = re.compile(
+        r"^\s*(\d+)\s+"
+        r"(\d{1,20})\s+"
+        r"(.+?)\s+IDR\s+"
+        r"([\d,]+\.\d{2})\s+"
+        r"(\d{2}/\d{2}/\d{2})\s+"
+        r"(\d{2}:\d{2}:\d{2})\s+"
+        r"(\S+)\s+"
+        r"(\S+)\s+"
+        r"(.*?)\s*$",
+        flags=re.MULTILINE
+    )
+
+    records = []
+
+    for match in pattern.finditer(text):
+
+        (
+            row_no,
+            customer_no,
+            customer_name,
+            amount_text,
+            date_text,
+            time_text,
+            location,
+            reference,
+            description_2
+        ) = match.groups()
+
+        bank_dt = pd.to_datetime(
+            f"{date_text} {time_text}",
+            format="%d/%m/%y %H:%M:%S",
+            errors="coerce"
+        )
+
+        records.append({
+            "_TANGGAL_DT": bank_dt,
+            "_CREDIT_NUM": _bcava_parse_amount_text(
+                amount_text
+            ),
+            "KODE_VA": normalize_bcava_va_value(
+                customer_no
+            ),
+            "JENIS_VA": "BCAVA",
+            "BANK_OUTLET": extract_bcava_outlet_value(
+                customer_name
+            ),
+            "BANK_REFERENCE": str(reference).strip(),
+            "_BANK_TYPE": "BCAVA",
+            "SOURCE_BANK": "BCAVA",
+            "SOURCE_FORMAT": "BCA_R5401",
+            "SOURCE_FILE": source_name,
+            "SOURCE_ROW": int(row_no),
+            "_BCAVA_SOURCE_ID": source_id,
+            "_BCAVA_REPORT_DATE": report_date,
+            "_DESC_VALUE": str(customer_name).strip(),
+            "BCA_LOCATION": str(location).strip(),
+            "BCA_DESCRIPTION_2": str(description_2).strip(),
+            "BCA_CUSTOMER_NO_RAW": str(customer_no).strip()
+        })
+
+    return pd.DataFrame(records)
+
+
+def _parse_bcava_va_report_text(
+    text,
+    source_name,
+    source_id
+):
+    """
+    Parser format:
+        Laporan BCA Virtual Account
+        No. Virtual Account ... Total Transfer ... Tanggal Transaksi
+    """
+
+    pattern = re.compile(
+        r"^\s*(\d+)\s+"
+        r"(\S+)\s+"
+        r"(\S+)\s+"
+        r"(.+?)\s+IDR\s+"
+        r"([\d,]+\.\d{2})\s+"
+        r"([\d,]+\.\d{2})\s+"
+        r"(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2})\s+"
+        r"(.*?)\s*$",
+        flags=re.MULTILINE
+    )
+
+    records = []
+
+    for match in pattern.finditer(text):
+
+        (
+            row_no,
+            va_raw,
+            sub_company,
+            customer_name,
+            total_bill,
+            total_transfer,
+            datetime_text,
+            news
+        ) = match.groups()
+
+        bank_dt = pd.to_datetime(
+            datetime_text,
+            format="%d/%m/%Y %H:%M:%S",
+            errors="coerce"
+        )
+
+        records.append({
+            "_TANGGAL_DT": bank_dt,
+            "_CREDIT_NUM": _bcava_parse_amount_text(
+                total_transfer
+            ),
+            "KODE_VA": normalize_bcava_va_value(
+                va_raw
+            ),
+            "JENIS_VA": "BCAVA",
+            "BANK_OUTLET": extract_bcava_outlet_value(
+                customer_name
+            ),
+            "BANK_REFERENCE": str(news).strip(),
+            "_BANK_TYPE": "BCAVA",
+            "SOURCE_BANK": "BCAVA",
+            "SOURCE_FORMAT": "BCA_VA_REPORT",
+            "SOURCE_FILE": source_name,
+            "SOURCE_ROW": int(row_no),
+            "_BCAVA_SOURCE_ID": source_id,
+            "_BCAVA_REPORT_DATE": None,
+            "_DESC_VALUE": str(customer_name).strip(),
+            "BCA_SUB_COMPANY": str(sub_company).strip(),
+            "BCA_TOTAL_BILL": _bcava_parse_amount_text(
+                total_bill
+            ),
+            "BCA_VA_RAW": str(va_raw).strip()
+        })
+
+    df = pd.DataFrame(records)
+
+    if not df.empty:
+        valid_dates = (
+            pd.to_datetime(
+                df["_TANGGAL_DT"],
+                errors="coerce"
+            )
+            .dropna()
+            .dt.date
+        )
+
+        if not valid_dates.empty:
+            # Pada format ini tidak ada report date eksplisit.
+            # Tanggal report diinfer dari tanggal transaksi maksimum.
+            df["_BCAVA_REPORT_DATE"] = max(
+                valid_dates
+            )
+
+    return df
+
+
+def _parse_bcava_structured_dataframe(
+    df,
+    source_name,
+    source_id
+):
+    """
+    Generic/flexible parser untuk antisipasi export BCA baru berbentuk
+    CSV/XLSX dengan nama kolom yang masih dapat dikenali.
+
+    Jika field penting tidak dapat dipetakan secara aman, fungsi akan gagal
+    daripada menebak dan menghasilkan rekonsiliasi yang salah.
+    """
+
+    if df is None or df.empty:
+        raise ValueError(
+            f"File BCAVA kosong: {source_name}"
+        )
+
+    va_col = find_column(
+        df,
+        [
+            "No. Virtual Account",
+            "No Virtual Account",
+            "Virtual Account",
+            "VIRTUAL ACCOUNT",
+            "VA",
+            "No. VA",
+            "NO.PELANGGAN/NO.TXN",
+            "NO PELANGGAN",
+            "Customer No",
+            "CUSTOMER NO"
+        ],
+        required=False
+    )
+
+    amount_col = find_column(
+        df,
+        [
+            "Total Transfer",
+            "TOTAL TRANSFER",
+            "NILAI TRANSAKSI",
+            "Nilai Transaksi",
+            "Transaction Amount",
+            "TRANSACTION AMOUNT",
+            "Amount",
+            "AMOUNT",
+            "Nilai Transfer",
+            "NILAI TRANSFER",
+            "Credit",
+            "CREDIT"
+        ],
+        required=False
+    )
+
+    datetime_col = find_column(
+        df,
+        [
+            "Tanggal Transaksi",
+            "TANGGAL TRANSAKSI",
+            "Transaction Date",
+            "TRANSACTION DATE",
+            "Datetime",
+            "DATETIME",
+            "TGL_TRAN",
+            "tgl_tran"
+        ],
+        required=False
+    )
+
+    date_col = find_column(
+        df,
+        [
+            "TGL. TXN",
+            "TGL TXN",
+            "Tanggal",
+            "TANGGAL",
+            "Date",
+            "DATE"
+        ],
+        required=False
+    )
+
+    time_col = find_column(
+        df,
+        [
+            "WAKTU",
+            "Waktu",
+            "Time",
+            "TIME"
+        ],
+        required=False
+    )
+
+    name_col = find_column(
+        df,
+        [
+            "Nama",
+            "NAMA",
+            "NAMA PELANGGAN",
+            "Nama Pelanggan",
+            "Description",
+            "DESCRIPTION",
+            "Keterangan",
+            "KETERANGAN"
+        ],
+        required=False
+    )
+
+    reference_col = find_column(
+        df,
+        [
+            "Berita",
+            "BERITA",
+            "KETERANGAN1",
+            "Keterangan1",
+            "Reference",
+            "REFERENCE",
+            "Reference No",
+            "REFERENCE NO"
+        ],
+        required=False
+    )
+
+    if va_col is None or amount_col is None:
+        raise ValueError(
+            "Format report BCAVA belum dikenali secara aman. "
+            f"File: {source_name}. Kolom tersedia: {list(df.columns)}"
+        )
+
+    if datetime_col is None and date_col is None:
+        raise ValueError(
+            "Kolom tanggal transaksi BCAVA tidak ditemukan secara aman. "
+            f"File: {source_name}."
+        )
+
+    work = df.copy()
+
+    if datetime_col is not None:
+        bank_dt = parse_briva_datetime(
+            work[datetime_col]
+        )
+    else:
+        combined = work[date_col].astype("string")
+
+        if time_col is not None:
+            combined = (
+                combined.str.strip()
+                + " "
+                + work[time_col].astype("string").str.strip()
+            )
+
+        bank_dt = parse_briva_datetime(
+            combined
+        )
+
+    result = pd.DataFrame(
+        index=work.index
+    )
+
+    result["_TANGGAL_DT"] = bank_dt
+    result["_CREDIT_NUM"] = clean_numeric(
+        work[amount_col]
+    )
+    result["KODE_VA"] = work[va_col].apply(
+        normalize_bcava_va_value
+    )
+    result["JENIS_VA"] = classify_bcava_va_series(
+        result["KODE_VA"]
+    )
+
+    if name_col is not None:
+        result["BANK_OUTLET"] = work[name_col].apply(
+            extract_bcava_outlet_value
+        )
+        result["_DESC_VALUE"] = work[name_col].astype(str)
+    else:
+        result["BANK_OUTLET"] = None
+        result["_DESC_VALUE"] = "BCAVA"
+
+    if reference_col is not None:
+        result["BANK_REFERENCE"] = work[reference_col].astype(str)
+    else:
+        result["BANK_REFERENCE"] = ""
+
+    result["_BANK_TYPE"] = "BCAVA"
+    result["SOURCE_BANK"] = "BCAVA"
+    result["SOURCE_FORMAT"] = "BCA_GENERIC_STRUCTURED"
+    result["SOURCE_FILE"] = source_name
+    result["SOURCE_ROW"] = range(1, len(result) + 1)
+    result["_BCAVA_SOURCE_ID"] = source_id
+
+    valid_dates = (
+        pd.to_datetime(
+            result["_TANGGAL_DT"],
+            errors="coerce"
+        )
+        .dropna()
+        .dt.date
+    )
+
+    inferred_report_date = (
+        max(valid_dates)
+        if not valid_dates.empty
+        else None
+    )
+
+    result["_BCAVA_REPORT_DATE"] = inferred_report_date
+
+    # Validation gate: generic parser harus punya kualitas parse tinggi.
+    total_rows = len(result)
+
+    valid_date_ratio = (
+        result["_TANGGAL_DT"].notna().sum()
+        / total_rows
+        if total_rows > 0
+        else 0
+    )
+
+    valid_amount_ratio = (
+        (result["_CREDIT_NUM"] > 0).sum()
+        / total_rows
+        if total_rows > 0
+        else 0
+    )
+
+    valid_va_ratio = (
+        result["KODE_VA"].notna().sum()
+        / total_rows
+        if total_rows > 0
+        else 0
+    )
+
+    if (
+        valid_date_ratio < 0.90
+        or valid_amount_ratio < 0.90
+        or valid_va_ratio < 0.90
+    ):
+        raise ValueError(
+            "Format BCAVA terdeteksi sebagian tetapi kualitas parsing "
+            "tidak cukup aman untuk rekonsiliasi. "
+            f"File: {source_name}."
+        )
+
+    return result.reset_index(drop=True)
+
+
+def _parse_single_bcava_file(
+    uploaded_file,
+    source_id
+):
+    """
+    Auto-detect format berdasarkan isi file, bukan nama file.
+    """
+
+    source_name = getattr(
+        uploaded_file,
+        "name",
+        f"BCAVA_FILE_{source_id}"
+    )
+
+    filename_lower = str(source_name).lower()
+
+    if filename_lower.endswith((".csv", ".xlsx")):
+        structured = read_uploaded_file(
+            uploaded_file
+        )
+
+        return _parse_bcava_structured_dataframe(
+            structured,
+            source_name,
+            source_id
+        )
+
+    raw_bytes = _bcava_read_bytes(
+        uploaded_file
+    )
+
+    text = _bcava_decode_bytes(
+        raw_bytes
+    )
+
+    upper_text = text.upper()
+
+    if (
+        "LAPORAN TRANSAKSI VIA E-BANKING & COUNTER"
+        in upper_text
+        and "NO.PELANGGAN/NO.TXN" in upper_text
+    ):
+        result = _parse_bcava_r5401_text(
+            text,
+            source_name,
+            source_id
+        )
+
+    elif (
+        "LAPORAN BCA VIRTUAL ACCOUNT" in upper_text
+        and "NO. VIRTUAL ACCOUNT" in upper_text
+        and "TOTAL TRANSFER" in upper_text
+    ):
+        result = _parse_bcava_va_report_text(
+            text,
+            source_name,
+            source_id
+        )
+
+    else:
+        raise ValueError(
+            "Format report BCAVA belum dikenali. "
+            f"File: {source_name}. "
+            "Rekonsiliasi dihentikan agar tidak menghasilkan angka yang salah."
+        )
+
+    if result.empty:
+        raise ValueError(
+            "Format BCAVA dikenali tetapi tidak ada baris transaksi "
+            f"yang berhasil dibaca dari file: {source_name}."
+        )
+
+    return result
+
+
+def build_bcava_search_dates(recon_dates):
+    """
+    Hanya untuk mempertahankan row neighbor yang dibutuhkan untuk
+    validasi coverage report. Matching tetap menggunakan transaction date D.
+    """
+
+    search_dates = set()
+
+    for recon_date in recon_dates:
+        value = pd.Timestamp(recon_date).date()
+
+        search_dates.add(
+            value - timedelta(days=1)
+        )
+        search_dates.add(value)
+        search_dates.add(
+            value + timedelta(days=1)
+        )
+
+    return search_dates
+
+
+def prepare_bcava_bank_dataframe(
+    uploaded_files,
+    recon_dates,
+    source_bank="BCAVA"
+):
+    """
+    Membaca satu atau beberapa report BCAVA.
+
+    Setiap file dideteksi formatnya secara independen lalu dinormalisasi
+    ke canonical dataframe yang sama.
+    """
+
+    if uploaded_files is None:
+        raise ValueError(
+            "Report BCAVA belum di-upload."
+        )
+
+    if not isinstance(
+        uploaded_files,
+        (list, tuple)
+    ):
+        uploaded_files = [uploaded_files]
+
+    uploaded_files = [
+        item
+        for item in uploaded_files
+        if item is not None
+    ]
+
+    if not uploaded_files:
+        raise ValueError(
+            "Report BCAVA belum di-upload."
+        )
+
+    frames = []
+    seen_file_signatures = set()
+
+    for position, uploaded_file in enumerate(
+        uploaded_files,
+        start=1
+    ):
+        # Signature ringan untuk menghindari file yang sama diproses dua kali.
+        raw_bytes = _bcava_read_bytes(
+            uploaded_file
+        )
+
+        signature = (
+            len(raw_bytes),
+            raw_bytes[:512],
+            raw_bytes[-512:]
+            if len(raw_bytes) >= 512
+            else raw_bytes
+        )
+
+        if signature in seen_file_signatures:
+            continue
+
+        seen_file_signatures.add(
+            signature
+        )
+
+        frame = _parse_single_bcava_file(
+            uploaded_file,
+            source_id=position
+        )
+
+        frames.append(frame)
+
+    if not frames:
+        raise ValueError(
+            "Tidak ada report BCAVA unik yang dapat diproses."
+        )
+
+    df = pd.concat(
+        frames,
+        ignore_index=True,
+        sort=False
+    )
+
+    df["_TANGGAL_DT"] = pd.to_datetime(
+        df["_TANGGAL_DT"],
+        errors="coerce"
+    )
+
+    df["_TANGGAL_ONLY_DATE"] = (
+        df["_TANGGAL_DT"]
+        .dt.date
+    )
+
+    df["_CREDIT_NUM"] = pd.to_numeric(
+        df["_CREDIT_NUM"],
+        errors="coerce"
+    ).fillna(0)
+
+    df["JENIS_VA"] = classify_bcava_va_series(
+        df["KODE_VA"]
+    )
+
+    df["SOURCE_BANK"] = source_bank
+    df["_BANK_TYPE"] = "BCAVA"
+
+    search_dates = build_bcava_search_dates(
+        recon_dates
+    )
+
+    df = df[
+        df["_TANGGAL_ONLY_DATE"].isin(
+            search_dates
+        )
+        & (df["_CREDIT_NUM"] > 0)
+        & df["_TANGGAL_DT"].notna()
+    ].copy()
+
+    if df.empty:
+        raise ValueError(
+            "Tidak ada transaksi BCAVA pada window tanggal rekonsiliasi."
+        )
+
+    return df.reset_index(drop=True)
+
+
+def _bcava_get_coverage(
+    df_bank,
+    target_date
+):
+    """
+    Coverage report berdasarkan report date/source:
+        report D     -> left/start coverage tanggal D
+        report D+1   -> right/end coverage tanggal D
+    """
+
+    target_date = pd.Timestamp(
+        target_date
+    ).date()
+
+    left_complete = False
+    right_complete = False
+
+    target_rows = df_bank[
+        df_bank["_TANGGAL_ONLY_DATE"]
+        == target_date
+    ].copy()
+
+    for _, source_group in df_bank.groupby(
+        "_BCAVA_SOURCE_ID",
+        sort=False
+    ):
+        report_dates = [
+            value
+            for value in source_group[
+                "_BCAVA_REPORT_DATE"
+            ].dropna().tolist()
+        ]
+
+        if report_dates:
+            report_date = pd.Timestamp(
+                report_dates[0]
+            ).date()
+        else:
+            source_dates = (
+                source_group[
+                    "_TANGGAL_DT"
+                ]
+                .dropna()
+                .dt.date
+            )
+
+            report_date = (
+                max(source_dates)
+                if not source_dates.empty
+                else None
+            )
+
+        contains_target = (
+            source_group[
+                "_TANGGAL_ONLY_DATE"
+            ]
+            .eq(target_date)
+            .any()
+        )
+
+        if not contains_target or report_date is None:
+            continue
+
+        if report_date == target_date:
+            left_complete = True
+
+        if report_date > target_date:
+            right_complete = True
+
+    first_bank_dt = (
+        target_rows["_TANGGAL_DT"].min()
+        if not target_rows.empty
+        else pd.NaT
+    )
+
+    last_bank_dt = (
+        target_rows["_TANGGAL_DT"].max()
+        if not target_rows.empty
+        else pd.NaT
+    )
+
+    return {
+        "left_complete": left_complete,
+        "right_complete": right_complete,
+        "first_bank_dt": first_bank_dt,
+        "last_bank_dt": last_bank_dt
+    }
+
+
+def _bcava_alignment(
+    fmss_items,
+    bank_items
+):
+    """
+    Chronological one-to-one alignment untuk duplicate VA+nominal.
+    Timestamp dipakai sebagai resolver, bukan hard threshold.
+    """
+
+    m = len(fmss_items)
+    n = len(bank_items)
+
+    if m == 0 or n == 0:
+        return []
+
+    dp = [
+        [None for _ in range(n + 1)]
+        for _ in range(m + 1)
+    ]
+
+    dp[0][0] = (0, 0.0, [])
+
+    for i in range(m + 1):
+        for j in range(n + 1):
+            current = dp[i][j]
+
+            if current is None:
+                continue
+
+            current_matches, current_cost, current_path = current
+
+            if i < m:
+                candidate = (
+                    current_matches,
+                    current_cost,
+                    current_path
+                )
+
+                existing = dp[i + 1][j]
+
+                if (
+                    existing is None
+                    or candidate[0] > existing[0]
+                    or (
+                        candidate[0] == existing[0]
+                        and candidate[1] < existing[1]
+                    )
+                ):
+                    dp[i + 1][j] = candidate
+
+            if j < n:
+                candidate = (
+                    current_matches,
+                    current_cost,
+                    current_path
+                )
+
+                existing = dp[i][j + 1]
+
+                if (
+                    existing is None
+                    or candidate[0] > existing[0]
+                    or (
+                        candidate[0] == existing[0]
+                        and candidate[1] < existing[1]
+                    )
+                ):
+                    dp[i][j + 1] = candidate
+
+            if i < m and j < n:
+                fmss_dt = fmss_items[i][1]
+                bank_dt = bank_items[j][1]
+
+                if pd.isna(fmss_dt) or pd.isna(bank_dt):
+                    pair_cost = 10 ** 12
+                else:
+                    pair_cost = abs(
+                        (
+                            bank_dt
+                            - fmss_dt
+                        ).total_seconds()
+                    )
+
+                # Outlet mismatch diberi penalti besar, tetapi tidak menjadi
+                # hard threshold bila salah satu sisi tidak mempunyai outlet.
+                fmss_outlet = fmss_items[i][2]
+                bank_outlet = bank_items[j][2]
+
+                if (
+                    fmss_outlet
+                    and bank_outlet
+                    and str(fmss_outlet).upper()
+                    != str(bank_outlet).upper()
+                ):
+                    pair_cost += 10 ** 9
+
+                candidate = (
+                    current_matches + 1,
+                    current_cost + pair_cost,
+                    current_path + [(i, j)]
+                )
+
+                existing = dp[i + 1][j + 1]
+
+                if (
+                    existing is None
+                    or candidate[0] > existing[0]
+                    or (
+                        candidate[0] == existing[0]
+                        and candidate[1] < existing[1]
+                    )
+                ):
+                    dp[i + 1][j + 1] = candidate
+
+    result = dp[m][n]
+
+    if result is None:
+        return []
+
+    return result[2]
+
+
+def _bcava_group_is_ambiguous(
+    fmss_items,
+    bank_items,
+    alignment
+):
+    """
+    Guardrail duplicate BCAVA. Jika timestamp benar-benar tidak memberi
+    pembeda, jangan memaksa pairing.
+    """
+
+    if not alignment:
+        return False
+
+    valid_fmss_times = [
+        item[1]
+        for item in fmss_items
+        if not pd.isna(item[1])
+    ]
+
+    valid_bank_times = [
+        item[1]
+        for item in bank_items
+        if not pd.isna(item[1])
+    ]
+
+    if len(valid_fmss_times) != len(set(valid_fmss_times)):
+        return True
+
+    if len(valid_bank_times) != len(set(valid_bank_times)):
+        return True
+
+    for fmss_pos, bank_pos in alignment:
+        fmss_dt = fmss_items[fmss_pos][1]
+        selected_bank_dt = bank_items[bank_pos][1]
+
+        if pd.isna(fmss_dt) or pd.isna(selected_bank_dt):
+            continue
+
+        selected_distance = abs(
+            (
+                selected_bank_dt
+                - fmss_dt
+            ).total_seconds()
+        )
+
+        equal_distance_count = 0
+
+        for _, candidate_bank_dt, _ in bank_items:
+            if pd.isna(candidate_bank_dt):
+                continue
+
+            candidate_distance = abs(
+                (
+                    candidate_bank_dt
+                    - fmss_dt
+                ).total_seconds()
+            )
+
+            if abs(
+                candidate_distance
+                - selected_distance
+            ) < 0.000001:
+                equal_distance_count += 1
+
+        if equal_distance_count > 1:
+            return True
+
+    return False
+
+
+def fast_match_bcava(
+    df_int_valid,
+    df_bank_all,
+    recon_dates
+):
+    """
+    Matching BCAVA:
+        - transaction date bank harus sama dengan tanggal FMSS,
+        - VA exact,
+        - EXPECTED_BANK exact (NOMINAL FMSS + Rp3.000),
+        - one-to-one,
+        - duplicate diselesaikan secara chronological.
+
+    H0:
+        jika report D+1 belum tersedia, FMSS setelah last bank coverage
+        dianggap pending cutoff dan tidak dihitung sebagai Issue FMSS.
+    """
+
+    target_dates = {
+        pd.Timestamp(value).date()
+        for value in recon_dates
+    }
+
+    coverage_by_date = {
+        target_date: _bcava_get_coverage(
+            df_bank_all,
+            target_date
+        )
+        for target_date in target_dates
+    }
+
+    missing_left = [
+        target_date
+        for target_date, coverage
+        in coverage_by_date.items()
+        if not coverage["left_complete"]
+    ]
+
+    if missing_left:
+        formatted = ", ".join(
+            pd.Timestamp(value).strftime("%d/%m/%Y")
+            for value in sorted(missing_left)
+        )
+
+        raise ValueError(
+            "Report BCAVA awal untuk tanggal target belum lengkap. "
+            "Upload report BCA pada tanggal target (report D). "
+            f"Tanggal yang belum memiliki left coverage: {formatted}."
+        )
+
+    bank_target = df_bank_all[
+        df_bank_all[
+            "_TANGGAL_ONLY_DATE"
+        ].isin(target_dates)
+    ].copy()
+
+    bank_records = bank_target.to_dict(
+        "records"
+    )
+
+    int_records = df_int_valid.to_dict(
+        "records"
+    )
+
+    matched = []
+    matched_int_indexes = set()
+    matched_bank_indexes = set()
+    blocked_int_indexes = set()
+    blocked_bank_indexes = set()
+
+    fmss_index = defaultdict(list)
+    bank_index = defaultdict(list)
+
+    for int_idx, row in enumerate(int_records):
+        fmss_dt = pd.to_datetime(
+            row.get("_TANGGAL_DT"),
+            errors="coerce"
+        )
+
+        if pd.isna(fmss_dt):
+            continue
+
+        key = (
+            fmss_dt.date(),
+            str(row.get("KODE_VA")),
+            float(row.get("EXPECTED_BANK", 0))
+        )
+
+        fmss_index[key].append(int_idx)
+
+    for bank_idx, row in enumerate(bank_records):
+        bank_dt = pd.to_datetime(
+            row.get("_TANGGAL_DT"),
+            errors="coerce"
+        )
+
+        if pd.isna(bank_dt):
+            continue
+
+        key = (
+            bank_dt.date(),
+            str(row.get("KODE_VA")),
+            float(row.get("_CREDIT_NUM", 0))
+        )
+
+        bank_index[key].append(bank_idx)
+
+    def outlet_compatible(int_row, bank_row):
+        fmss_outlet = int_row.get("FMSS_OUTLET")
+        bank_outlet = bank_row.get("BANK_OUTLET")
+
+        if (
+            fmss_outlet is None
+            or pd.isna(fmss_outlet)
+            or str(fmss_outlet).strip() == ""
+            or bank_outlet is None
+            or pd.isna(bank_outlet)
+            or str(bank_outlet).strip() == ""
+        ):
+            return True
+
+        return (
+            str(fmss_outlet).strip().upper()
+            == str(bank_outlet).strip().upper()
+        )
+
+    def save_match(
+        int_idx,
+        bank_idx,
+        method,
+        confidence
+    ):
+        int_row = int_records[int_idx]
+        bank_row = bank_records[bank_idx]
+
+        record = int_row.copy()
+
+        record["MATCH_MUTASI_KREDIT"] = bank_row.get(
+            "_CREDIT_NUM",
+            0
+        )
+        record["MATCH_DESK_TRAN"] = bank_row.get(
+            "_DESC_VALUE",
+            ""
+        )
+        record["SOURCE_BANK"] = bank_row.get(
+            "SOURCE_BANK",
+            "BCAVA"
+        )
+        record["BANK_TYPE"] = "BCAVA"
+        record["MATCH_METHOD"] = method
+        record["MATCH_CONFIDENCE"] = confidence
+        record["STATUS_MATCH"] = "MATCHED"
+        record["DATE_RELATION"] = "SAME_DAY"
+        record["BANK_MATCH_DATETIME"] = bank_row.get(
+            "_TANGGAL_DT"
+        )
+        record["BANK_OUTLET"] = bank_row.get(
+            "BANK_OUTLET"
+        )
+        record["BANK_REFERENCE"] = bank_row.get(
+            "BANK_REFERENCE"
+        )
+        record["SOURCE_FORMAT"] = bank_row.get(
+            "SOURCE_FORMAT"
+        )
+        record["SOURCE_FILE"] = bank_row.get(
+            "SOURCE_FILE"
+        )
+        record["SOURCE_ROW"] = bank_row.get(
+            "SOURCE_ROW"
+        )
+
+        fmss_dt = pd.to_datetime(
+            int_row.get("_TANGGAL_DT"),
+            errors="coerce"
+        )
+        bank_dt = pd.to_datetime(
+            bank_row.get("_TANGGAL_DT"),
+            errors="coerce"
+        )
+
+        if pd.notna(fmss_dt) and pd.notna(bank_dt):
+            record["TIME_DIFFERENCE_SECONDS"] = (
+                bank_dt - fmss_dt
+            ).total_seconds()
+        else:
+            record["TIME_DIFFERENCE_SECONDS"] = None
+
+        matched.append(record)
+        matched_int_indexes.add(int_idx)
+        matched_bank_indexes.add(bank_idx)
+
+    # --------------------------------------------------------
+    # TAHAP 1 - UNIQUE EXACT
+    # --------------------------------------------------------
+
+    for key, int_candidates in fmss_index.items():
+        bank_candidates = bank_index.get(
+            key,
+            []
+        )
+
+        if (
+            len(int_candidates) == 1
+            and len(bank_candidates) == 1
+        ):
+            int_idx = int_candidates[0]
+            bank_idx = bank_candidates[0]
+
+            if outlet_compatible(
+                int_records[int_idx],
+                bank_records[bank_idx]
+            ):
+                save_match(
+                    int_idx,
+                    bank_idx,
+                    "VA_NOMINAL_UNIQUE",
+                    "HIGH"
+                )
+
+    # --------------------------------------------------------
+    # TAHAP 2 - DUPLICATE / CHRONOLOGICAL RESOLUTION
+    # --------------------------------------------------------
+
+    for key, int_candidates_all in fmss_index.items():
+        int_candidates = [
+            idx
+            for idx in int_candidates_all
+            if idx not in matched_int_indexes
+        ]
+
+        bank_candidates = [
+            idx
+            for idx in bank_index.get(key, [])
+            if idx not in matched_bank_indexes
+        ]
+
+        if not int_candidates or not bank_candidates:
+            continue
+
+        fmss_items = []
+
+        for int_idx in int_candidates:
+            row = int_records[int_idx]
+            fmss_items.append((
+                int_idx,
+                pd.to_datetime(
+                    row.get("_TANGGAL_DT"),
+                    errors="coerce"
+                ),
+                row.get("FMSS_OUTLET")
+            ))
+
+        bank_items = []
+
+        for bank_idx in bank_candidates:
+            row = bank_records[bank_idx]
+            bank_items.append((
+                bank_idx,
+                pd.to_datetime(
+                    row.get("_TANGGAL_DT"),
+                    errors="coerce"
+                ),
+                row.get("BANK_OUTLET")
+            ))
+
+        fmss_items.sort(
+            key=lambda item: (
+                pd.Timestamp.max
+                if pd.isna(item[1])
+                else item[1],
+                item[0]
+            )
+        )
+
+        bank_items.sort(
+            key=lambda item: (
+                pd.Timestamp.max
+                if pd.isna(item[1])
+                else item[1],
+                item[0]
+            )
+        )
+
+        alignment = _bcava_alignment(
+            fmss_items,
+            bank_items
+        )
+
+        if not alignment:
+            continue
+
+        if _bcava_group_is_ambiguous(
+            fmss_items,
+            bank_items,
+            alignment
+        ):
+            for fmss_pos, bank_pos in alignment:
+                blocked_int_indexes.add(
+                    fmss_items[fmss_pos][0]
+                )
+                blocked_bank_indexes.add(
+                    bank_items[bank_pos][0]
+                )
+            continue
+
+        for fmss_pos, bank_pos in alignment:
+            int_idx = fmss_items[fmss_pos][0]
+            bank_idx = bank_items[bank_pos][0]
+
+            if not outlet_compatible(
+                int_records[int_idx],
+                bank_records[bank_idx]
+            ):
+                blocked_int_indexes.add(int_idx)
+                blocked_bank_indexes.add(bank_idx)
+                continue
+
+            save_match(
+                int_idx,
+                bank_idx,
+                "TIME_RESOLVED",
+                "HIGH"
+            )
+
+    # --------------------------------------------------------
+    # FMSS ONLY / H0 PENDING CUTOFF
+    # --------------------------------------------------------
+
+    unmatched_internal = []
+    pending_cutoff_count = 0
+    pending_cutoff_nominal = 0.0
+
+    for int_idx, int_row in enumerate(int_records):
+        if int_idx in matched_int_indexes:
+            continue
+
+        fmss_dt = pd.to_datetime(
+            int_row.get("_TANGGAL_DT"),
+            errors="coerce"
+        )
+
+        if pd.isna(fmss_dt):
+            continue
+
+        target_date = fmss_dt.date()
+        coverage = coverage_by_date[target_date]
+
+        # Saat H0, row FMSS setelah transaksi bank terakhir belum layak
+        # disebut Issue FMSS karena report berikutnya belum tersedia.
+        if (
+            not coverage["right_complete"]
+            and pd.notna(coverage["last_bank_dt"])
+            and fmss_dt > coverage["last_bank_dt"]
+        ):
+            pending_cutoff_count += 1
+            pending_cutoff_nominal += float(
+                int_row.get("NOMINAL_ASLI", 0)
+                or 0
+            )
+            continue
+
+        record = int_row.copy()
+
+        if int_idx in blocked_int_indexes:
+            record["STATUS_MATCH"] = (
+                "AMBIGUOUS_MATCH - BCAVA"
+            )
+            record["MATCH_METHOD"] = "TIME_AMBIGUOUS"
+            record["MATCH_CONFIDENCE"] = "LOW"
+        else:
+            record["STATUS_MATCH"] = "FMSS_ONLY"
+            record["MATCH_METHOD"] = "NO_MATCH"
+            record["MATCH_CONFIDENCE"] = "NONE"
+
+        unmatched_internal.append(record)
+
+    # --------------------------------------------------------
+    # BANK ONLY
+    # --------------------------------------------------------
+
+    unmatched_bank = []
+
+    fmss_max_by_date = {}
+
+    for target_date in target_dates:
+        values = [
+            pd.to_datetime(
+                row.get("_TANGGAL_DT"),
+                errors="coerce"
+            )
+            for row in int_records
+        ]
+
+        values = [
+            value
+            for value in values
+            if pd.notna(value)
+            and value.date() == target_date
+        ]
+
+        fmss_max_by_date[target_date] = (
+            max(values)
+            if values
+            else pd.NaT
+        )
+
+    for bank_idx, bank_row in enumerate(bank_records):
+        if bank_idx in matched_bank_indexes:
+            continue
+
+        bank_dt = pd.to_datetime(
+            bank_row.get("_TANGGAL_DT"),
+            errors="coerce"
+        )
+
+        if pd.isna(bank_dt):
+            continue
+
+        target_date = bank_dt.date()
+        coverage = coverage_by_date[target_date]
+
+        # Jika snapshot FMSS lebih tua dari transaksi bank paling akhir,
+        # tahan row yang lebih baru agar H0 tidak menghasilkan false issue.
+        fmss_max_dt = fmss_max_by_date.get(
+            target_date,
+            pd.NaT
+        )
+
+        if (
+            not coverage["right_complete"]
+            and pd.notna(fmss_max_dt)
+            and bank_dt > fmss_max_dt
+        ):
+            continue
+
+        record = bank_row.copy()
+
+        if bank_idx in blocked_bank_indexes:
+            record["STATUS_MATCH"] = (
+                "AMBIGUOUS_MATCH - BCAVA"
+            )
+            record["MATCH_METHOD"] = "TIME_AMBIGUOUS"
+            record["MATCH_CONFIDENCE"] = "LOW"
+        else:
+            record["STATUS_MATCH"] = (
+                "BANK_ONLY_CANDIDATE - BCAVA"
+            )
+            record["MATCH_METHOD"] = (
+                "NO_FMSS_MATCH_TARGET_DATE"
+            )
+            record["MATCH_CONFIDENCE"] = "MEDIUM"
+
+        bank_credit = float(
+            record.get("_CREDIT_NUM", 0)
+            or 0
+        )
+
+        record["EXPECTED_FMSS_NOMINAL"] = (
+            bank_credit - BCAVA_FEE
+            if bank_credit >= BCAVA_FEE
+            else None
+        )
+
+        unmatched_bank.append(record)
+
+    df_matched = pd.DataFrame(matched)
+    df_selisih_int = pd.DataFrame(unmatched_internal)
+    df_selisih_bnk = pd.DataFrame(unmatched_bank)
+
+    # Metadata H0 disimpan di attrs tanpa menambah/merombak UI dashboard.
+    df_selisih_int.attrs[
+        "BCAVA_PENDING_CUTOFF_COUNT"
+    ] = pending_cutoff_count
+    df_selisih_int.attrs[
+        "BCAVA_PENDING_CUTOFF_NOMINAL"
+    ] = pending_cutoff_nominal
+
+    return (
+        df_matched,
+        df_selisih_int,
+        df_selisih_bnk
+    )
+
+
+# ============================================================
 # FAST BANK FILE PROCESSOR
 # ============================================================
 
@@ -3819,11 +5419,22 @@ else:
             f"### 🏦 Mutasi {pilihan_bank}"
         )
 
-        file_bnk_general = st.file_uploader(
-            f"Upload mutasi {pilihan_bank}",
-            type=["csv", "xlsx"],
-            key="bank_general"
-        )
+        if pilihan_bank == "BCAVA":
+
+            file_bnk_general = st.file_uploader(
+                f"Upload mutasi {pilihan_bank}",
+                type=["txt", "csv", "xlsx"],
+                accept_multiple_files=True,
+                key="bank_general"
+            )
+
+        else:
+
+            file_bnk_general = st.file_uploader(
+                f"Upload mutasi {pilihan_bank}",
+                type=["csv", "xlsx"],
+                key="bank_general"
+            )
 
     file_bnk_57888 = None
     file_bnk_57708 = None
@@ -3998,6 +5609,16 @@ if can_process:
                         )
                     )
 
+                elif pilihan_bank == "BCAVA":
+
+                    df_int_sukses["_TANGGAL_DT"] = (
+                        parse_bcava_fmss_datetime(
+                            df_int_sukses[
+                                col_tanggal_int
+                            ]
+                        )
+                    )
+
                 else:
 
                     df_int_sukses["_TANGGAL_DT"] = (
@@ -4065,6 +5686,47 @@ if can_process:
                             ]
                         )
                     )
+
+                elif pilihan_bank == "BCAVA":
+
+                    df_int_sukses["KODE_VA"] = (
+                        extract_bcava_va_series(
+                            df_int_sukses[
+                                col_keterangan_int
+                            ]
+                        )
+                    )
+
+                    df_int_sukses["JENIS_VA"] = (
+                        classify_bcava_va_series(
+                            df_int_sukses[
+                                "KODE_VA"
+                            ]
+                        )
+                    )
+
+                    col_outlet_int = find_column(
+                        df_int_sukses,
+                        [
+                            "id_outlet",
+                            "ID_OUTLET",
+                            "outlet",
+                            "OUTLET"
+                        ],
+                        required=False
+                    )
+
+                    if col_outlet_int is not None:
+                        df_int_sukses["FMSS_OUTLET"] = (
+                            df_int_sukses[
+                                col_outlet_int
+                            ]
+                            .astype("string")
+                            .str.strip()
+                            .str.upper()
+                        )
+                    else:
+                        df_int_sukses["FMSS_OUTLET"] = None
 
                 elif pilihan_bank == "MANDIRIVA":
 
@@ -4197,6 +5859,17 @@ if can_process:
                         + MANDIRIVA_FEE
                     )
 
+                if pilihan_bank == "BCAVA":
+
+                    df_int_valid[
+                        "EXPECTED_BANK"
+                    ] = (
+                        df_int_valid[
+                            "NOMINAL_ASLI"
+                        ]
+                        + BCAVA_FEE
+                    )
+
                 # =================================================
                 # BANK PROCESSING
                 # =================================================
@@ -4248,6 +5921,27 @@ if can_process:
 
                     bank_sources.append(
                         df_bniva
+                    )
+
+                elif pilihan_bank == "BCAVA":
+
+                    # ---------------------------------------------
+                    # BCAVA
+                    # Multi-file / multi-format report BCA.
+                    # Layout uploader tetap sama; hanya uploader bank
+                    # BCAVA yang dapat menerima lebih dari satu file.
+                    # ---------------------------------------------
+
+                    df_bcava = (
+                        prepare_bcava_bank_dataframe(
+                            file_bnk_general,
+                            recon_dates,
+                            "BCAVA"
+                        )
+                    )
+
+                    bank_sources.append(
+                        df_bcava
                     )
 
                 elif pilihan_bank == "MANDIRIVA":
@@ -4338,6 +6032,18 @@ if can_process:
                     ) = fast_match_bniva(
                         df_int_valid,
                         df_bank_valid,
+                        recon_dates
+                    )
+
+                elif pilihan_bank == "BCAVA":
+
+                    (
+                        df_matched,
+                        df_selisih_int,
+                        df_selisih_bnk
+                    ) = fast_match_bcava(
+                        df_int_valid,
+                        df_bank,
                         recon_dates
                     )
 
