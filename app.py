@@ -6408,76 +6408,76 @@ if st.session_state.sudah_diproses:
 
         if not df_selisih_int.empty:
 
-    # ====================================================
-    # INFO KHUSUS BCAVA - PENDING CUTOFF
-    # ====================================================
+            # ====================================================
+            # INFO KHUSUS BCAVA - PENDING CUTOFF
+            # ====================================================
+            # Tidak mengubah logic matching. Bagian ini hanya memberi
+            # konteks kepada PIC jika report BCA setelah cut-off belum
+            # ikut di-upload.
 
-    if (
-        pilihan_bank == "BCAVA"
-        and "STATUS_MATCH" in df_selisih_int.columns
-    ):
+            if (
+                pilihan_bank == "BCAVA"
+                and "STATUS_MATCH" in df_selisih_int.columns
+            ):
 
-        pending_cutoff_mask = (
-            df_selisih_int["STATUS_MATCH"]
-            .astype(str)
-            .eq("PENDING_CUTOFF - BCAVA")
-        )
+                pending_cutoff_mask = (
+                    df_selisih_int["STATUS_MATCH"]
+                    .astype(str)
+                    .eq("PENDING_CUTOFF - BCAVA")
+                )
 
-        pending_cutoff_count = int(
-            pending_cutoff_mask.sum()
-        )
+                pending_cutoff_count = int(
+                    pending_cutoff_mask.sum()
+                )
 
-        if pending_cutoff_count > 0:
+                if pending_cutoff_count > 0:
 
-            st.caption(
-                f"⚠️ **{pending_cutoff_count:,} transaksi FMSS belum memiliki "
-                f"pasangan pada report BCA yang tersedia. Mohon dipastikan "
-                f"kembali bahwa file yang diunggah telah mengikutkan file "
-                f"setelah cut-off bank.**"
+                    st.caption(
+                        f"⚠️ **{pending_cutoff_count:,} transaksi FMSS belum memiliki "
+                        f"pasangan pada report BCA yang tersedia. Mohon dipastikan "
+                        f"kembali bahwa file yang diunggah telah mengikutkan file "
+                        f"setelah cut-off bank.**"
+                    )
+
+            display_int = pd.DataFrame()
+
+            display_int["KODE VA"] = (
+                df_selisih_int["KODE_VA"]
             )
 
-    # ====================================================
-    # TABEL ISSUE FMSS
-    # ====================================================
+            display_int["JENIS VA"] = (
+                df_selisih_int["JENIS_VA"]
+            )
 
-    display_int = pd.DataFrame()
+            display_int["NOMINAL"] = (
+                df_selisih_int["NOMINAL_ASLI"]
+            )
 
-    display_int["KODE VA"] = (
-        df_selisih_int["KODE_VA"]
-    )
+            display_int["EXPECTED BANK"] = (
+                df_selisih_int["EXPECTED_BANK"]
+            )
 
-    display_int["JENIS VA"] = (
-        df_selisih_int["JENIS_VA"]
-    )
+            # Gunakan status asli dari engine.
+            # Khusus BCAVA, transaksi setelah coverage bank terakhir
+            # dapat tampil sebagai PENDING_CUTOFF - BCAVA, bukan
+            # langsung dianggap confirmed FMSS_ONLY.
+            if "STATUS_MATCH" in df_selisih_int.columns:
 
-    display_int["NOMINAL"] = (
-        df_selisih_int["NOMINAL_ASLI"]
-    )
+                display_int["ISSUE"] = (
+                    df_selisih_int["STATUS_MATCH"]
+                )
 
-    display_int["EXPECTED BANK"] = (
-        df_selisih_int["EXPECTED_BANK"]
-    )
+            else:
 
-    # Jangan hardcode FMSS_ONLY.
-    # Gunakan status asli dari engine supaya BCAVA pending cutoff
-    # dapat dibedakan dari confirmed FMSS_ONLY.
-    if "STATUS_MATCH" in df_selisih_int.columns:
+                display_int["ISSUE"] = (
+                    "FMSS_ONLY"
+                )
 
-        display_int["ISSUE"] = (
-            df_selisih_int["STATUS_MATCH"]
-        )
-
-    else:
-
-        display_int["ISSUE"] = (
-            "FMSS_ONLY"
-        )
-
-    st.dataframe(
-        display_int,
-        use_container_width=True,
-        hide_index=True
-    )
+            st.dataframe(
+                display_int,
+                use_container_width=True,
+                hide_index=True
+            )
 
         else:
 
