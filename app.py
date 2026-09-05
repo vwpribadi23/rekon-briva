@@ -3347,8 +3347,11 @@ def fast_match_mandiriva(
 # - Scope transaksi ditentukan dari TANGGAL TRANSAKSI di setiap row,
 #   bukan dari nama file.
 # - Report D dan D+1 digabung untuk menangkap cutoff.
-# - Jika report D+1 belum tersedia (H0), FMSS setelah coverage bank terakhir
-#   tidak dinaikkan menjadi Issue FMSS.
+# - Jika report D+1 belum tersedia (H0 / upload belum lengkap), FMSS setelah
+#   coverage bank terakhir TETAP dimunculkan pada area Issue FMSS existing agar
+#   PIC sadar coverage belum lengkap. Secara internal row diberi status
+#   PENDING_CUTOFF - BCAVA, sehingga saat report D+1 ditambahkan row dapat
+#   otomatis berubah menjadi MATCHED atau FMSS_ONLY final.
 # ============================================================
 
 BCAVA_PREFIX = "15501"
@@ -4460,9 +4463,11 @@ def fast_match_bcava(
         - one-to-one,
         - duplicate diselesaikan secara chronological.
 
-    H0:
+    H0 / upload belum lengkap:
         jika report D+1 belum tersedia, FMSS setelah last bank coverage
-        dianggap pending cutoff dan tidak dihitung sebagai Issue FMSS.
+        tetap dimunculkan pada dataframe Issue FMSS existing agar PIC tidak
+        mengira rekonsiliasi sudah lengkap. Status internalnya tetap
+        PENDING_CUTOFF - BCAVA (belum merupakan confirmed FMSS_ONLY).
     """
 
     target_dates = {
@@ -4796,8 +4801,15 @@ def fast_match_bcava(
         target_date = fmss_dt.date()
         coverage = coverage_by_date[target_date]
 
-        # Saat H0, row FMSS setelah transaksi bank terakhir belum layak
-        # disebut Issue FMSS karena report berikutnya belum tersedia.
+        # Saat H0 / report D+1 belum di-upload, transaksi FMSS setelah
+        # coverage bank terakhir belum boleh dianggap confirmed FMSS_ONLY.
+        # Namun row TETAP dimasukkan ke dataframe selisih internal supaya
+        # UI existing (tanpa perubahan layout/UX) menampilkan jumlahnya pada
+        # card/tabel Issue FMSS. Dengan begitu PIC langsung sadar ada coverage
+        # BCA yang belum lengkap dan terdorong meng-upload report berikutnya.
+        #
+        # Status internal dibedakan menjadi PENDING_CUTOFF - BCAVA agar pada
+        # file export/audit tetap jelas bahwa ini belum confirmed issue.
         if (
             not coverage["right_complete"]
             and pd.notna(coverage["last_bank_dt"])
@@ -4808,6 +4820,25 @@ def fast_match_bcava(
                 int_row.get("NOMINAL_ASLI", 0)
                 or 0
             )
+
+            record = int_row.copy()
+            record["STATUS_MATCH"] = (
+                "PENDING_CUTOFF - BCAVA"
+            )
+            record["MATCH_METHOD"] = (
+                "AWAITING_NEXT_BCA_REPORT"
+            )
+            record["MATCH_CONFIDENCE"] = (
+                "PENDING"
+            )
+            record["BCAVA_COVERAGE_STATUS"] = (
+                "RIGHT_COVERAGE_INCOMPLETE"
+            )
+            record["BCAVA_LAST_BANK_DATETIME"] = (
+                coverage["last_bank_dt"]
+            )
+
+            unmatched_internal.append(record)
             continue
 
         record = int_row.copy()
