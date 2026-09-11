@@ -5387,6 +5387,37 @@ if (
 
 
 # ============================================================
+# GUARD - ENGINE BANK BELUM TERSEDIA
+# ============================================================
+# BSIVA dan MuamalatVA sengaja tetap ditampilkan pada selector
+# agar PIC mengetahui bank tersebut termasuk scope pengembangan.
+# Namun rekonsiliasi DILARANG berjalan sampai engine khususnya
+# sudah dibuat dan divalidasi. Ini mencegah kedua bank tersebut
+# jatuh ke generic fallback dan menghasilkan hasil rekonsiliasi
+# yang terlihat valid padahal rule bank-nya belum tersedia.
+
+BANK_ENGINE_BELUM_TERSEDIA = {
+    "BSIVA",
+    "MuamalatVA"
+}
+
+if pilihan_bank in BANK_ENGINE_BELUM_TERSEDIA:
+
+    st.warning(
+        f"⚠️ Engine rekonsiliasi {pilihan_bank} belum tersedia. "
+        "Proses croscek dinonaktifkan sementara agar tidak "
+        "menghasilkan hasil rekonsiliasi yang keliru."
+    )
+
+    st.info(
+        "Silakan gunakan bank yang engine-nya sudah aktif: "
+        "BRIVA, BNIVA, BCAVA, atau MANDIRIVA."
+    )
+
+    st.stop()
+
+
+# ============================================================
 # UI - UPLOAD
 # ============================================================
 
