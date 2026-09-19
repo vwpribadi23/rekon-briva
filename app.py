@@ -155,6 +155,115 @@ def parse_datetime(series):
     )
 
 
+# ============================================================
+# FMSS INPUT COMPATIBILITY LAYER
+# ============================================================
+# Tujuan:
+# - menerima export FMSS langsung (status = "Sukses"),
+# - menerima hasil query (status = 1 / TRUE / SUCCESS),
+# - tetap tahan jika tanggal dari Excel terbaca sebagai serial number,
+# - TIDAK mengubah logic matching BRIVA / BNIVA / BCAVA / MANDIRIVA.
+
+FMSS_SUCCESS_TEXT_VALUES = {
+    "SUKSES",
+    "SUCCESS",
+    "BERHASIL",
+    "TRUE",
+    "YES",
+    "Y"
+}
+
+
+def normalize_fmss_status_series(series):
+    """
+    Normalisasi status transaksi FMSS ke bentuk canonical.
+
+    Format yang dianggap SUKSES:
+        - Sukses / SUKSES
+        - Success / SUCCESS
+        - Berhasil
+        - 1 / 1.0
+        - True / TRUE
+        - Yes / Y
+
+    Nilai lain tetap dipertahankan sebagai teks uppercase sehingga
+    transaksi non-sukses tidak ikut masuk ke engine rekonsiliasi.
+    """
+
+    text = (
+        series.astype("string")
+        .str.strip()
+        .str.upper()
+    )
+
+    numeric = pd.to_numeric(
+        series,
+        errors="coerce"
+    )
+
+    success_mask = (
+        text.isin(FMSS_SUCCESS_TEXT_VALUES)
+        | numeric.eq(1)
+    )
+
+    normalized = text.astype("object")
+    normalized.loc[success_mask.fillna(False)] = "SUKSES"
+
+    return normalized
+
+
+def normalize_fmss_datetime_source(series):
+    """
+    Menyiapkan sumber tanggal FMSS agar kompatibel dengan export langsung
+    maupun hasil query Excel.
+
+    Beberapa hasil query dapat menyimpan tanggal sebagai Excel serial number,
+    contoh 46284.7125. Nilai seperti ini harus dibaca menggunakan origin
+    Excel 1899-12-30, bukan sebagai Unix/nanosecond timestamp.
+
+    Nilai string/datetime biasa tidak diubah dan tetap diproses oleh parser
+    khusus masing-masing bank yang sudah ada.
+    """
+
+    source = pd.Series(
+        series,
+        index=getattr(series, "index", None)
+    ).copy()
+
+    if pd.api.types.is_datetime64_any_dtype(source):
+        return source
+
+    numeric = pd.to_numeric(
+        source,
+        errors="coerce"
+    )
+
+    # Range konservatif Excel serial untuk tanggal operasional modern.
+    # Sekitar tahun 1954 s/d 2119.
+    excel_serial_mask = numeric.between(
+        20000,
+        80000,
+        inclusive="both"
+    )
+
+    if not excel_serial_mask.any():
+        return source
+
+    result = source.astype("object")
+
+    converted = pd.to_datetime(
+        numeric.loc[excel_serial_mask],
+        unit="D",
+        origin="1899-12-30",
+        errors="coerce"
+    )
+
+    result.loc[excel_serial_mask] = converted
+
+    return result
+
+
+
 def extract_va(text):
     """
     Mengambil VA Fastpay / Rajabiller.
@@ -5632,14 +5741,17 @@ if can_process:
                 # =================================================
                 # FILTER FMSS SUKSES
                 # =================================================
+                # Compatibility layer:
+                # - export FMSS langsung  : status = "Sukses"
+                # - export hasil query    : status = 1 / TRUE / SUCCESS
+                # Urutan kolom tidak berpengaruh karena kolom dicari by name.
 
                 df_int = df_int.copy()
 
                 df_int["_STATUS_CLEAN"] = (
-                    df_int[col_status]
-                    .astype(str)
-                    .str.strip()
-                    .str.upper()
+                    normalize_fmss_status_series(
+                        df_int[col_status]
+                    )
                 )
 
                 df_int_sukses = df_int[
@@ -5650,14 +5762,22 @@ if can_process:
                 # =================================================
                 # TANGGAL REKONSILIASI
                 # =================================================
+                # Query Excel kadang menghasilkan Excel serial number.
+                # Normalisasi dilakukan sebelum masuk parser khusus bank.
+
+                fmss_datetime_source = (
+                    normalize_fmss_datetime_source(
+                        df_int_sukses[
+                            col_tanggal_int
+                        ]
+                    )
+                )
 
                 if pilihan_bank == "BRIVA":
 
                     df_int_sukses["_TANGGAL_DT"] = (
                         parse_briva_datetime(
-                            df_int_sukses[
-                                col_tanggal_int
-                            ]
+                            fmss_datetime_source
                         )
                     )
 
@@ -5665,9 +5785,7 @@ if can_process:
 
                     df_int_sukses["_TANGGAL_DT"] = (
                         parse_bniva_fmss_datetime(
-                            df_int_sukses[
-                                col_tanggal_int
-                            ]
+                            fmss_datetime_source
                         )
                     )
 
@@ -5675,9 +5793,7 @@ if can_process:
 
                     df_int_sukses["_TANGGAL_DT"] = (
                         parse_bcava_fmss_datetime(
-                            df_int_sukses[
-                                col_tanggal_int
-                            ]
+                            fmss_datetime_source
                         )
                     )
 
@@ -5685,9 +5801,7 @@ if can_process:
 
                     df_int_sukses["_TANGGAL_DT"] = (
                         parse_datetime(
-                            df_int_sukses[
-                                col_tanggal_int
-                            ]
+                            fmss_datetime_source
                         )
                     )
 
