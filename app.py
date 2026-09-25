@@ -44,7 +44,9 @@ DEFAULT_STATE = {
     "recon_now_label": "",
     "df_bniva_h1_cutoff": pd.DataFrame(),
     "df_bniva_h1_retry": pd.DataFrame(),
-    "df_bniva_time_anomaly": pd.DataFrame()
+    "df_bniva_time_anomaly": pd.DataFrame(),
+    "df_mandiriva_pending_bank_update": pd.DataFrame(),
+    "mandiriva_freshness_meta": {}
 }
 
 for key, value in DEFAULT_STATE.items():
@@ -3799,6 +3801,411 @@ def fast_match_mandiriva(
         df_selisih_bnk
     )
 
+
+# ============================================================
+# MANDIRIVA H0 FRESHNESS / TRUSTED WINDOW LAYER
+# ============================================================
+# Layer ini berjalan SETELAH fast_match_mandiriva selesai.
+# Core matching MANDIRIVA tidak diubah.
+#
+# Tujuan:
+# - H0 sering memiliki snapshot FMSS dan mutasi Mandiri yang berbeda waktu.
+# - FMSS yang lebih fresh dapat menghasilkan false Issue FMSS karena bank
+#   belum sempat tercakup dalam file mutasi yang sudah lebih dahulu dibuat.
+# - Unmatched FMSS yang berada di luar trusted window diklasifikasikan sebagai
+#   PENDING_BANK_UPDATE - MANDIRIVA, bukan confirmed Issue FMSS.
+#
+# Safety window diturunkan dari lag transaksi yang SUDAH matched pada hari itu.
+# Jika sampel matched tidak cukup, fallback konservatif = 120 detik.
+# ============================================================
+
+MANDIRIVA_H0_MIN_SAFETY_SECONDS = 120
+MANDIRIVA_H0_MAX_SAFETY_SECONDS = 300
+MANDIRIVA_H0_MAX_LAG_SAMPLE_SECONDS = 900
+MANDIRIVA_H0_LAG_EXTRA_BUFFER_SECONDS = 15
+
+
+def extract_h0_snapshot_datetime_from_filename(filename):
+    """
+    Ambil waktu snapshot/export dari nama file.
+
+    Mendukung format compact yang sudah dipakai BNIVA/Mandiri:
+        ..._20260925163947.csv
+
+    dan format export FMSS:
+        ..._2026-09-25_16-48-35.csv
+
+    Return pd.NaT jika timestamp tidak dapat dibaca.
+    """
+
+    compact_value = extract_snapshot_datetime_from_filename(
+        filename
+    )
+
+    if pd.notna(compact_value):
+        return pd.Timestamp(compact_value)
+
+    if filename is None:
+        return pd.NaT
+
+    text_value = str(filename)
+
+    matches = list(
+        re.finditer(
+            r"(20\d{2})[-_](\d{2})[-_](\d{2})[T_ -](\d{2})[-:](\d{2})[-:](\d{2})",
+            text_value
+        )
+    )
+
+    if not matches:
+        return pd.NaT
+
+    match = matches[-1]
+
+    try:
+        return pd.Timestamp(
+            datetime(
+                int(match.group(1)),
+                int(match.group(2)),
+                int(match.group(3)),
+                int(match.group(4)),
+                int(match.group(5)),
+                int(match.group(6))
+            )
+        )
+    except Exception:
+        return pd.NaT
+
+
+def _safe_max_datetime(df, column_name):
+    """
+    Fallback timestamp dari data ketika nama file tidak memuat waktu export.
+    Nilai ini dipakai hanya sebagai estimasi coverage, bukan mengubah data asli.
+    """
+
+    if (
+        df is None
+        or df.empty
+        or column_name not in df.columns
+    ):
+        return pd.NaT
+
+    values = pd.to_datetime(
+        df[column_name],
+        errors="coerce"
+    )
+
+    if values.notna().any():
+        return values.max()
+
+    return pd.NaT
+
+
+def apply_mandiriva_h0_freshness_guard(
+    df_matched,
+    df_selisih_int,
+    df_int_valid,
+    df_bank_valid,
+    fmss_filename,
+    bank_filename,
+    recon_dates,
+    recon_mode
+):
+    """
+    Pisahkan false Issue FMSS MANDIRIVA akibat perbedaan freshness snapshot H0.
+
+    Rule:
+    1. Hanya aktif ketika mode rekonsiliasi = H0.
+    2. Core matching harus sudah selesai terlebih dahulu.
+    3. Estimasi safety window menggunakan transaksi matched SAME DAY:
+           max(120 detik, P95 lag + 15 detik), cap 300 detik.
+    4. Trusted FMSS End:
+           BANK_SNAPSHOT - SAFETY_WINDOW
+    5. Hanya row STATUS_MATCH == FMSS_ONLY dan timestamp FMSS > Trusted End
+       yang dipindahkan menjadi PENDING_BANK_UPDATE - MANDIRIVA.
+    6. AMBIGUOUS_MATCH atau issue yang terjadi di dalam trusted window TIDAK
+       disembunyikan dan tetap berada di Issue FMSS.
+
+    Return:
+        df_issue_fmss_final,
+        df_pending_bank_update,
+        metadata
+    """
+
+    empty_pending = pd.DataFrame()
+
+    meta = {
+        "active": False,
+        "fmss_snapshot": pd.NaT,
+        "bank_snapshot": pd.NaT,
+        "trusted_fmss_end": pd.NaT,
+        "safety_window_seconds": None,
+        "observed_lag_median_seconds": None,
+        "observed_lag_p95_seconds": None,
+        "lag_sample_count": 0,
+        "snapshot_gap_seconds": None,
+        "fmss_snapshot_source": "",
+        "bank_snapshot_source": ""
+    }
+
+    if recon_mode != "H0":
+        return df_selisih_int, empty_pending, meta
+
+    normalized_dates = []
+
+    for value in recon_dates or []:
+        try:
+            normalized_dates.append(
+                pd.to_datetime(value).date()
+            )
+        except Exception:
+            pass
+
+    normalized_dates = sorted(
+        set(normalized_dates)
+    )
+
+    if len(normalized_dates) != 1:
+        return df_selisih_int, empty_pending, meta
+
+    if df_selisih_int is None or df_selisih_int.empty:
+        return df_selisih_int, empty_pending, meta
+
+    # --------------------------------------------------------
+    # SNAPSHOT FMSS
+    # --------------------------------------------------------
+
+    fmss_snapshot = (
+        extract_h0_snapshot_datetime_from_filename(
+            fmss_filename
+        )
+    )
+
+    fmss_snapshot_source = "FILENAME"
+
+    if pd.isna(fmss_snapshot):
+        fmss_snapshot = _safe_max_datetime(
+            df_int_valid,
+            "_TANGGAL_DT"
+        )
+        fmss_snapshot_source = "DATA_MAX_ESTIMATE"
+
+    # --------------------------------------------------------
+    # SNAPSHOT BANK
+    # --------------------------------------------------------
+
+    bank_snapshot = (
+        extract_h0_snapshot_datetime_from_filename(
+            bank_filename
+        )
+    )
+
+    bank_snapshot_source = "FILENAME"
+
+    if pd.isna(bank_snapshot):
+        bank_snapshot = _safe_max_datetime(
+            df_bank_valid,
+            "_TANGGAL_DT"
+        )
+        bank_snapshot_source = "DATA_MAX_ESTIMATE"
+
+    if pd.isna(bank_snapshot):
+        # Tanpa estimasi coverage bank, jangan mengubah classification.
+        return df_selisih_int, empty_pending, meta
+
+    # --------------------------------------------------------
+    # OBSERVED MANDIRI POSTING LAG DARI MATCHED ROW
+    # --------------------------------------------------------
+
+    lag_values = pd.Series(dtype="float64")
+
+    if (
+        df_matched is not None
+        and not df_matched.empty
+        and "TIME_DIFFERENCE_SECONDS" in df_matched.columns
+    ):
+
+        lag_numeric = pd.to_numeric(
+            df_matched["TIME_DIFFERENCE_SECONDS"],
+            errors="coerce"
+        )
+
+        lag_mask = (
+            lag_numeric.notna()
+            & lag_numeric.ge(0)
+            & lag_numeric.le(
+                MANDIRIVA_H0_MAX_LAG_SAMPLE_SECONDS
+            )
+        )
+
+        if "DATE_RELATION" in df_matched.columns:
+            lag_mask = (
+                lag_mask
+                & df_matched["DATE_RELATION"]
+                .astype(str)
+                .eq("SAME DAY")
+            )
+
+        lag_values = (
+            lag_numeric.loc[lag_mask]
+            .astype(float)
+        )
+
+    lag_sample_count = int(
+        len(lag_values)
+    )
+
+    lag_median = None
+    lag_p95 = None
+
+    if lag_sample_count > 0:
+        lag_median = float(
+            lag_values.median()
+        )
+        lag_p95 = float(
+            lag_values.quantile(0.95)
+        )
+
+    # Minimal 120 detik menjaga H0 dari lag normal Mandiri walau sampel sedikit.
+    safety_window_seconds = (
+        MANDIRIVA_H0_MIN_SAFETY_SECONDS
+    )
+
+    if lag_sample_count >= 10 and lag_p95 is not None:
+        dynamic_window = int(
+            round(
+                lag_p95
+                + MANDIRIVA_H0_LAG_EXTRA_BUFFER_SECONDS
+            )
+        )
+
+        safety_window_seconds = max(
+            MANDIRIVA_H0_MIN_SAFETY_SECONDS,
+            dynamic_window
+        )
+
+    safety_window_seconds = min(
+        MANDIRIVA_H0_MAX_SAFETY_SECONDS,
+        safety_window_seconds
+    )
+
+    trusted_fmss_end = (
+        pd.Timestamp(bank_snapshot)
+        - pd.Timedelta(
+            seconds=safety_window_seconds
+        )
+    )
+
+    # --------------------------------------------------------
+    # PENDING CLASSIFICATION
+    # --------------------------------------------------------
+
+    fmss_time = pd.to_datetime(
+        df_selisih_int.get(
+            "_TANGGAL_DT",
+            pd.Series(pd.NaT, index=df_selisih_int.index)
+        ),
+        errors="coerce"
+    )
+
+    if "STATUS_MATCH" in df_selisih_int.columns:
+        status_text = (
+            df_selisih_int["STATUS_MATCH"]
+            .astype(str)
+        )
+    else:
+        status_text = pd.Series(
+            "FMSS_ONLY",
+            index=df_selisih_int.index
+        )
+
+    pending_mask = (
+        status_text.eq("FMSS_ONLY")
+        & fmss_time.notna()
+        & fmss_time.gt(trusted_fmss_end)
+    )
+
+    df_pending = (
+        df_selisih_int.loc[pending_mask]
+        .copy()
+    )
+
+    df_issue_final = (
+        df_selisih_int.loc[~pending_mask]
+        .copy()
+    )
+
+    if not df_pending.empty:
+
+        df_pending["STATUS_MATCH"] = (
+            "PENDING_BANK_UPDATE - MANDIRIVA"
+        )
+
+        df_pending["MATCH_METHOD"] = (
+            "H0_FRESHNESS_GUARD"
+        )
+
+        df_pending["MATCH_CONFIDENCE"] = (
+            "PENDING_COVERAGE"
+        )
+
+        df_pending["MANDIRIVA_BANK_SNAPSHOT"] = (
+            pd.Timestamp(bank_snapshot)
+        )
+
+        df_pending["MANDIRIVA_FMSS_SNAPSHOT"] = (
+            pd.Timestamp(fmss_snapshot)
+            if pd.notna(fmss_snapshot)
+            else pd.NaT
+        )
+
+        df_pending["MANDIRIVA_TRUSTED_FMSS_END"] = (
+            trusted_fmss_end
+        )
+
+        df_pending["MANDIRIVA_SAFETY_WINDOW_SECONDS"] = (
+            safety_window_seconds
+        )
+
+        df_pending["PENDING_REASON"] = (
+            "FMSS berada di luar trusted window H0; "
+            "snapshot bank belum cukup fresh untuk menyatakan FMSS_ONLY."
+        )
+
+    snapshot_gap_seconds = None
+
+    if pd.notna(fmss_snapshot):
+        snapshot_gap_seconds = float(
+            (
+                pd.Timestamp(fmss_snapshot)
+                - pd.Timestamp(bank_snapshot)
+            ).total_seconds()
+        )
+
+    meta = {
+        "active": True,
+        "fmss_snapshot": (
+            pd.Timestamp(fmss_snapshot)
+            if pd.notna(fmss_snapshot)
+            else pd.NaT
+        ),
+        "bank_snapshot": pd.Timestamp(bank_snapshot),
+        "trusted_fmss_end": trusted_fmss_end,
+        "safety_window_seconds": int(safety_window_seconds),
+        "observed_lag_median_seconds": lag_median,
+        "observed_lag_p95_seconds": lag_p95,
+        "lag_sample_count": lag_sample_count,
+        "snapshot_gap_seconds": snapshot_gap_seconds,
+        "fmss_snapshot_source": fmss_snapshot_source,
+        "bank_snapshot_source": bank_snapshot_source
+    }
+
+    return (
+        df_issue_final,
+        df_pending,
+        meta
+    )
+
 # ============================================================
 # BCAVA ENGINE - MULTI FORMAT / MULTI REPORT CUTOFF
 # ============================================================
@@ -5852,6 +6259,8 @@ if (
     st.session_state.df_bniva_h1_cutoff = pd.DataFrame()
     st.session_state.df_bniva_h1_retry = pd.DataFrame()
     st.session_state.df_bniva_time_anomaly = pd.DataFrame()
+    st.session_state.df_mandiriva_pending_bank_update = pd.DataFrame()
+    st.session_state.mandiriva_freshness_meta = {}
 
     st.session_state.pilihan_bank_terakhir = (
         pilihan_bank
@@ -6063,6 +6472,8 @@ if can_process:
                 df_bniva_h1_cutoff = pd.DataFrame()
                 df_bniva_h1_retry = pd.DataFrame()
                 df_bniva_time_anomaly = pd.DataFrame()
+                df_mandiriva_pending_bank_update = pd.DataFrame()
+                mandiriva_freshness_meta = {}
 
                 # =================================================
                 # LOAD FMSS
@@ -6759,6 +7170,30 @@ if can_process:
                     )
 
                 # =================================================
+                # MANDIRIVA - H0 FRESHNESS / TRUSTED WINDOW
+                # =================================================
+                # Core fast_match_mandiriva TIDAK diubah. Layer ini hanya
+                # mengklasifikasikan unmatched FMSS paling akhir yang berada
+                # di luar coverage bank H0 menjadi Pending Bank Update.
+
+                if pilihan_bank == "MANDIRIVA":
+
+                    (
+                        df_selisih_int,
+                        df_mandiriva_pending_bank_update,
+                        mandiriva_freshness_meta
+                    ) = apply_mandiriva_h0_freshness_guard(
+                        df_matched=df_matched,
+                        df_selisih_int=df_selisih_int,
+                        df_int_valid=df_int_valid,
+                        df_bank_valid=df_bank_valid,
+                        fmss_filename=getattr(file_int, "name", ""),
+                        bank_filename=getattr(file_bnk_general, "name", ""),
+                        recon_dates=recon_dates,
+                        recon_mode=st.session_state.recon_mode
+                    )
+
+                # =================================================
                 # SUMMARY
                 # =================================================
 
@@ -6884,6 +7319,14 @@ if can_process:
                     df_bniva_time_anomaly
                 )
 
+                st.session_state.df_mandiriva_pending_bank_update = (
+                    df_mandiriva_pending_bank_update
+                )
+
+                st.session_state.mandiriva_freshness_meta = (
+                    mandiriva_freshness_meta
+                )
+
                 st.session_state.sudah_diproses = (
                     True
                 )
@@ -6939,6 +7382,14 @@ if st.session_state.sudah_diproses:
 
     df_bniva_time_anomaly = (
         st.session_state.df_bniva_time_anomaly
+    )
+
+    df_mandiriva_pending_bank_update = (
+        st.session_state.df_mandiriva_pending_bank_update
+    )
+
+    mandiriva_freshness_meta = (
+        st.session_state.mandiriva_freshness_meta
     )
 
     st.divider()
@@ -7134,6 +7585,126 @@ if st.session_state.sudah_diproses:
                     )
 
     # ========================================================
+    # MANDIRIVA H0 FRESHNESS INDICATOR
+    # ========================================================
+
+    if pilihan_bank == "MANDIRIVA":
+
+        mandiri_pending_count = len(
+            df_mandiriva_pending_bank_update
+        )
+
+        mandiri_pending_nominal = (
+            df_mandiriva_pending_bank_update["NOMINAL_ASLI"].sum()
+            if (
+                not df_mandiriva_pending_bank_update.empty
+                and "NOMINAL_ASLI" in df_mandiriva_pending_bank_update.columns
+            )
+            else 0
+        )
+
+        if mandiri_pending_count > 0:
+
+            bank_snapshot = mandiriva_freshness_meta.get(
+                "bank_snapshot"
+            )
+
+            fmss_snapshot = mandiriva_freshness_meta.get(
+                "fmss_snapshot"
+            )
+
+            trusted_end = mandiriva_freshness_meta.get(
+                "trusted_fmss_end"
+            )
+
+            safety_seconds = mandiriva_freshness_meta.get(
+                "safety_window_seconds"
+            )
+
+            lag_median = mandiriva_freshness_meta.get(
+                "observed_lag_median_seconds"
+            )
+
+            lag_p95 = mandiriva_freshness_meta.get(
+                "observed_lag_p95_seconds"
+            )
+
+            gap_seconds = mandiriva_freshness_meta.get(
+                "snapshot_gap_seconds"
+            )
+
+            info_lines = [
+                f"**{mandiri_pending_count:,} transaksi / "
+                f"{format_rupiah(mandiri_pending_nominal)}** ditahan sebagai "
+                "**Pending Bank Update** dan tidak dihitung sebagai Issue FMSS."
+            ]
+
+            if pd.notna(bank_snapshot):
+                info_lines.append(
+                    "Snapshot Mandiri: "
+                    f"**{pd.Timestamp(bank_snapshot).strftime('%d %B %Y %H:%M:%S')}**."
+                )
+
+            if pd.notna(fmss_snapshot):
+                info_lines.append(
+                    "Snapshot FMSS: "
+                    f"**{pd.Timestamp(fmss_snapshot).strftime('%d %B %Y %H:%M:%S')}**."
+                )
+
+            if gap_seconds is not None and gap_seconds > 0:
+                gap_minutes = gap_seconds / 60
+                info_lines.append(
+                    f"FMSS lebih fresh sekitar **{gap_minutes:.1f} menit** dibanding "
+                    "file mutasi Mandiri."
+                )
+
+            if pd.notna(trusted_end):
+                info_lines.append(
+                    "Trusted FMSS End: "
+                    f"**{pd.Timestamp(trusted_end).strftime('%H:%M:%S')} WIB**."
+                )
+
+            if safety_seconds is not None:
+                info_lines.append(
+                    f"Safety window H0: **{int(safety_seconds)} detik**."
+                )
+
+            if lag_median is not None and lag_p95 is not None:
+                info_lines.append(
+                    "Observed posting lag Mandiri dari transaksi matched: "
+                    f"median **{lag_median:.1f} detik**, P95 **{lag_p95:.1f} detik**."
+                )
+
+            st.info(
+                "⏳ **Coverage H0 MANDIRIVA belum seimbang.**  \n"
+                + "  \n".join(info_lines)
+            )
+
+            with st.expander(
+                f"🔎 Lihat Pending Bank Update ({mandiri_pending_count:,})",
+                expanded=False
+            ):
+
+                pending_cols = [
+                    col
+                    for col in [
+                        "_TANGGAL_DT",
+                        "KODE_VA",
+                        "NOMINAL_ASLI",
+                        "EXPECTED_BANK",
+                        "STATUS_MATCH",
+                        "PENDING_REASON"
+                    ]
+                    if col in df_mandiriva_pending_bank_update.columns
+                ]
+
+                st.dataframe(
+                    df_mandiriva_pending_bank_update[pending_cols],
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+    # ========================================================
     # MATCH RATE
     # ========================================================
 
@@ -7167,8 +7738,16 @@ if st.session_state.sudah_diproses:
 
     r1, r2 = st.columns(2)
 
+    fmss_rate_label = "📈 Match Rate FMSS"
+
+    if (
+        pilihan_bank == "MANDIRIVA"
+        and not df_mandiriva_pending_bank_update.empty
+    ):
+        fmss_rate_label = "📈 Match Rate FMSS (Trusted Window)"
+
     r1.metric(
-        "📈 Match Rate FMSS",
+        fmss_rate_label,
         f"{fmss_match_rate:.4f}%"
     )
 
@@ -7301,10 +7880,24 @@ if st.session_state.sudah_diproses:
 
         else:
 
-            st.success(
-                "Tidak ada issue FMSS. "
-                "Semua transaksi FMSS memiliki pasangan bank."
-            )
+            if (
+                pilihan_bank == "MANDIRIVA"
+                and not df_mandiriva_pending_bank_update.empty
+            ):
+
+                st.info(
+                    "Tidak ada **confirmed Issue FMSS** di dalam trusted window. "
+                    f"Sebanyak **{len(df_mandiriva_pending_bank_update):,} transaksi** "
+                    "masih berstatus **Pending Bank Update** karena coverage file bank "
+                    "lebih tertinggal / masih berada dalam safety window H0."
+                )
+
+            else:
+
+                st.success(
+                    "Tidak ada issue FMSS. "
+                    "Semua transaksi FMSS memiliki pasangan bank."
+                )
 
     # ========================================================
     # ISSUE BANK
@@ -7562,6 +8155,47 @@ if st.session_state.sudah_diproses:
                     ignore_index=True
                 )
 
+            if pilihan_bank == "MANDIRIVA":
+
+                pending_nominal_export = (
+                    df_mandiriva_pending_bank_update["NOMINAL_ASLI"].sum()
+                    if (
+                        not df_mandiriva_pending_bank_update.empty
+                        and "NOMINAL_ASLI" in df_mandiriva_pending_bank_update.columns
+                    )
+                    else 0
+                )
+
+                extra_summary_rows = pd.DataFrame({
+                    "METRIC": [
+                        "Mode Rekonsiliasi",
+                        "MANDIRIVA Pending Bank Update",
+                        "Nominal MANDIRIVA Pending Bank Update",
+                        "MANDIRIVA FMSS Snapshot",
+                        "MANDIRIVA Bank Snapshot",
+                        "MANDIRIVA Trusted FMSS End",
+                        "MANDIRIVA Safety Window Seconds",
+                        "MANDIRIVA Observed Lag Median Seconds",
+                        "MANDIRIVA Observed Lag P95 Seconds"
+                    ],
+                    "VALUE": [
+                        st.session_state.recon_mode,
+                        len(df_mandiriva_pending_bank_update),
+                        pending_nominal_export,
+                        str(mandiriva_freshness_meta.get("fmss_snapshot", "")),
+                        str(mandiriva_freshness_meta.get("bank_snapshot", "")),
+                        str(mandiriva_freshness_meta.get("trusted_fmss_end", "")),
+                        mandiriva_freshness_meta.get("safety_window_seconds", ""),
+                        mandiriva_freshness_meta.get("observed_lag_median_seconds", ""),
+                        mandiriva_freshness_meta.get("observed_lag_p95_seconds", "")
+                    ]
+                })
+
+                summary_export = pd.concat(
+                    [summary_export, extra_summary_rows],
+                    ignore_index=True
+                )
+
             summary_export.to_excel(
                 writer,
                 sheet_name="SUMMARY",
@@ -7707,6 +8341,19 @@ if st.session_state.sudah_diproses:
                     df_bniva_time_anomaly.to_excel(
                         writer,
                         sheet_name="BNI_TIME_ANOMALY",
+                        index=False
+                    )
+
+            # ------------------------------------------------
+            # MANDIRIVA H0 PENDING BANK UPDATE
+            # ------------------------------------------------
+
+            if pilihan_bank == "MANDIRIVA":
+
+                if not df_mandiriva_pending_bank_update.empty:
+                    df_mandiriva_pending_bank_update.to_excel(
+                        writer,
+                        sheet_name="MANDIRI_PENDING_BANK",
                         index=False
                     )
 
