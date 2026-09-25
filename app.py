@@ -4,6 +4,7 @@ import re
 import io
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
+from zoneinfo import ZoneInfo
 
 
 # ============================================================
@@ -38,7 +39,12 @@ DEFAULT_STATE = {
     "df_invalid_bnk": pd.DataFrame(),
     "recon_dates": [],
     "summary": {},
-    "pilihan_bank_terakhir": ""
+    "pilihan_bank_terakhir": "",
+    "recon_mode": "",
+    "recon_now_label": "",
+    "df_bniva_h1_cutoff": pd.DataFrame(),
+    "df_bniva_h1_retry": pd.DataFrame(),
+    "df_bniva_time_anomaly": pd.DataFrame()
 }
 
 for key, value in DEFAULT_STATE.items():
@@ -153,6 +159,72 @@ def parse_datetime(series):
         series,
         errors="coerce"
     )
+
+
+# ============================================================
+# H0 / INTRADAY AWARENESS
+# ============================================================
+# Layer ini hanya menentukan konteks tanggal rekonsiliasi dan tidak
+# mengubah matching dasar BRIVA / BNIVA / BCAVA / MANDIRIVA.
+
+JAKARTA_TIMEZONE = ZoneInfo("Asia/Jakarta")
+H0_FUTURE_TIME_TOLERANCE_MINUTES = 5
+
+
+def get_jakarta_now():
+    """
+    Waktu lokal operasional Fastpay (Asia/Jakarta).
+    """
+
+    return datetime.now(JAKARTA_TIMEZONE)
+
+
+def get_jakarta_now_naive():
+    """
+    Versi naive untuk dibandingkan dengan datetime dari file bank/FMSS.
+    """
+
+    return get_jakarta_now().replace(tzinfo=None)
+
+
+def get_recon_mode(recon_dates, now_value=None):
+    """
+    Auto-detect mode rekonsiliasi.
+
+    H0:
+        hanya ada satu target date dan tanggal tersebut sama dengan hari ini.
+
+    HISTORICAL:
+        target date sudah lewat / multi-date.
+    """
+
+    if now_value is None:
+        now_value = get_jakarta_now()
+
+    normalized_dates = []
+
+    for value in recon_dates or []:
+        try:
+            normalized_dates.append(pd.to_datetime(value).date())
+        except Exception:
+            pass
+
+    normalized_dates = sorted(set(normalized_dates))
+
+    if (
+        len(normalized_dates) == 1
+        and normalized_dates[0] == now_value.date()
+    ):
+        return "H0"
+
+    return "HISTORICAL"
+
+
+def format_recon_now_label(now_value=None):
+    if now_value is None:
+        now_value = get_jakarta_now()
+
+    return now_value.strftime("%d %B %Y %H:%M:%S WIB")
 
 
 # ============================================================
@@ -1449,6 +1521,267 @@ def parse_bniva_fmss_datetime(series):
     return parsed
 
 
+# ============================================================
+# BNIVA H0 / CROSS-DAY HELPERS
+# ============================================================
+
+BNIVA_SOURCE_DATETIME_REGEX = re.compile(
+    r"(?<!\d)(\d{1,2}/\d{1,2}/\d{2,4})\s+"
+    r"(\d{1,2}[\.:]\d{2}[\.:]\d{2})(?!\d)"
+)
+
+
+def extract_bniva_source_datetime_value(value):
+    """
+    Membaca datetime sumber transaksi dari keterangan FMSS retry BNIVA.
+
+    Contoh yang tervalidasi:
+        24/09/26 09.46.13
+        TRANSFER DARI ...
+
+    Parser sengaja konservatif: hanya keterangan yang mengandung
+    'TRANSFER DARI' yang dipertimbangkan sebagai sumber transaksi bank.
+    """
+
+    if value is None or pd.isna(value):
+        return pd.NaT
+
+    text_value = str(value).strip()
+
+    if "TRANSFER DARI" not in text_value.upper():
+        return pd.NaT
+
+    match = BNIVA_SOURCE_DATETIME_REGEX.search(text_value)
+
+    if not match:
+        return pd.NaT
+
+    date_part = match.group(1)
+    time_part = match.group(2).replace(".", ":")
+    candidate = f"{date_part} {time_part}"
+
+    parsed = pd.to_datetime(
+        candidate,
+        errors="coerce",
+        dayfirst=True
+    )
+
+    return parsed
+
+
+def extract_bniva_source_datetime_series(series):
+    return series.apply(
+        extract_bniva_source_datetime_value
+    )
+
+
+def build_bniva_h1_retry_mask(df, recon_dates):
+    """
+    Identifikasi posting FMSS pada target date D yang isi keterangannya
+    secara eksplisit menunjuk transaksi bank pada D-1.
+
+    Record ini tidak boleh dianggap current-day Issue FMSS.
+    """
+
+    if df is None or df.empty:
+        return pd.Series(False, index=getattr(df, "index", []), dtype=bool)
+
+    target_dates = {
+        pd.to_datetime(d).date()
+        for d in (recon_dates or [])
+    }
+
+    if len(target_dates) != 1:
+        return pd.Series(False, index=df.index, dtype=bool)
+
+    target_date = next(iter(target_dates))
+    h1_date = target_date - timedelta(days=1)
+
+    if "FMSS_SOURCE_DATETIME" not in df.columns:
+        return pd.Series(False, index=df.index, dtype=bool)
+
+    source_dt = pd.to_datetime(
+        df["FMSS_SOURCE_DATETIME"],
+        errors="coerce"
+    )
+
+    post_dt = pd.to_datetime(
+        df["_TANGGAL_DT"],
+        errors="coerce"
+    )
+
+    return (
+        source_dt.notna()
+        & post_dt.notna()
+        & source_dt.dt.date.eq(h1_date)
+        & post_dt.dt.date.eq(target_date)
+    )
+
+
+def extract_snapshot_datetime_from_filename(filename):
+    """
+    Ambil timestamp export dari nama file jika tersedia.
+
+    Contoh BNI:
+        Transaction_Inquiry_Download_Single_20260925145640208.csv
+        -> 2026-09-25 14:56:40.208
+
+    Jika tidak ditemukan, return NaT.
+    """
+
+    if filename is None:
+        return pd.NaT
+
+    text_value = str(filename)
+
+    matches = list(
+        re.finditer(
+            r"(20\d{6})(\d{6})(\d{3})?",
+            text_value
+        )
+    )
+
+    if not matches:
+        return pd.NaT
+
+    match = matches[-1]
+    date_part = match.group(1)
+    time_part = match.group(2)
+    milli_part = match.group(3) or "000"
+
+    try:
+        base = datetime.strptime(
+            date_part + time_part,
+            "%Y%m%d%H%M%S"
+        )
+
+        return pd.Timestamp(
+            base + timedelta(
+                milliseconds=int(milli_part)
+            )
+        )
+
+    except Exception:
+        return pd.NaT
+
+
+def mark_bniva_h0_bank_anomalies(
+    df,
+    recon_dates,
+    now_value=None,
+    snapshot_datetime=None
+):
+    """
+    Menandai timestamp bank BNIVA yang belum mungkin terjadi pada saat
+    file diekspor / pada waktu H0 saat ini.
+
+    Prioritas pembanding:
+        1) timestamp export yang terbaca dari nama file BNI,
+        2) waktu Jakarta saat proses dijalankan (fallback H0).
+
+    Jika Journal No. valid, record diberi label kandidat cutoff H-1.
+    Jika Journal tidak tersedia, record tetap dikarantina sebagai anomali
+    waktu agar tidak menjadi false Issue Bank / false MATCH current-day.
+    """
+
+    result = df.copy()
+
+    result["_BNIVA_H0_MODE"] = False
+    result["_BNIVA_FUTURE_TIME"] = False
+    result["_BNIVA_POTENTIAL_H1_CUTOFF"] = False
+    result["_BNIVA_TIME_ANOMALY"] = False
+
+    if result.empty:
+        return result
+
+    if now_value is None:
+        now_value = get_jakarta_now_naive()
+
+    mode = get_recon_mode(
+        recon_dates,
+        now_value.replace(tzinfo=JAKARTA_TIMEZONE)
+        if now_value.tzinfo is None
+        else now_value
+    )
+
+    parsed_snapshot = pd.to_datetime(
+        snapshot_datetime,
+        errors="coerce"
+    )
+
+    target_dates = {
+        pd.to_datetime(d).date()
+        for d in (recon_dates or [])
+    }
+
+    single_target_date = (
+        next(iter(target_dates))
+        if len(target_dates) == 1
+        else None
+    )
+
+    snapshot_same_target = (
+        pd.notna(parsed_snapshot)
+        and single_target_date is not None
+        and parsed_snapshot.date() == single_target_date
+    )
+
+    # Guard utama untuk H0. Jika file H0 yang sama baru dibuka kembali
+    # pada hari berikutnya, timestamp export yang tanggalnya sama dengan
+    # target date tetap dapat dipakai untuk mempertahankan klasifikasi.
+    # Neighbor D+1 pada rekonsiliasi historical TIDAK dikarantina karena
+    # record tersebut memang merupakan search pool cutoff yang sah.
+    if mode != "H0" and not snapshot_same_target:
+        return result
+
+    if pd.notna(parsed_snapshot):
+        reference_datetime = parsed_snapshot.to_pydatetime()
+
+    elif mode == "H0":
+        reference_datetime = now_value.replace(tzinfo=None)
+
+    else:
+        return result
+
+    threshold = (
+        reference_datetime
+        + timedelta(minutes=H0_FUTURE_TIME_TOLERANCE_MINUTES)
+    )
+
+    bank_dt = pd.to_datetime(
+        result["_TANGGAL_DT"],
+        errors="coerce"
+    )
+
+    future_mask = (
+        bank_dt.notna()
+        & (bank_dt > threshold)
+    )
+
+    journal_valid = (
+        result["BANK_JOURNAL"]
+        .astype("string")
+        .fillna("")
+        .str.strip()
+        .ne("")
+    )
+
+    result.loc[:, "_BNIVA_H0_MODE"] = (mode == "H0")
+    result.loc[future_mask, "_BNIVA_FUTURE_TIME"] = True
+    result.loc[
+        future_mask & journal_valid,
+        "_BNIVA_POTENTIAL_H1_CUTOFF"
+    ] = True
+    result.loc[
+        future_mask & ~journal_valid,
+        "_BNIVA_TIME_ANOMALY"
+    ] = True
+
+    return result
+
+
+
+
 def build_bniva_search_dates(recon_dates):
     """
     Membentuk search window D-1 / D / D+1
@@ -1495,6 +1828,18 @@ def prepare_bniva_bank_dataframe(
     Transaksi tanpa VA pada neighbor date tidak ikut menambah Invalid VA
     rekonsiliasi tanggal target.
     """
+
+    bniva_source_filename = getattr(
+        uploaded_file,
+        "name",
+        ""
+    )
+
+    bniva_snapshot_datetime = (
+        extract_snapshot_datetime_from_filename(
+            bniva_source_filename
+        )
+    )
 
     df = read_uploaded_file(
         uploaded_file
@@ -1650,6 +1995,18 @@ def prepare_bniva_bank_dataframe(
         normalize_bniva_journal_series(
             df[col_journal]
         )
+    )
+
+    # --------------------------------------------------------
+    # H0 FUTURE-TIME / POTENTIAL H-1 CUTOFF
+    # --------------------------------------------------------
+    # Record future-time tidak dihapus di sini. Record tetap disimpan
+    # untuk audit, lalu dipisahkan dari pool matching current-day di main.
+
+    df = mark_bniva_h0_bank_anomalies(
+        df,
+        recon_dates,
+        snapshot_datetime=bniva_snapshot_datetime
     )
 
     # --------------------------------------------------------
@@ -5490,6 +5847,12 @@ if (
 
     st.session_state.summary = {}
 
+    st.session_state.recon_mode = ""
+    st.session_state.recon_now_label = ""
+    st.session_state.df_bniva_h1_cutoff = pd.DataFrame()
+    st.session_state.df_bniva_h1_retry = pd.DataFrame()
+    st.session_state.df_bniva_time_anomaly = pd.DataFrame()
+
     st.session_state.pilihan_bank_terakhir = (
         pilihan_bank
     )
@@ -5694,6 +6057,14 @@ if can_process:
             ):
 
                 # =================================================
+                # H0 / CROSS-DAY WORKING DATA
+                # =================================================
+
+                df_bniva_h1_cutoff = pd.DataFrame()
+                df_bniva_h1_retry = pd.DataFrame()
+                df_bniva_time_anomaly = pd.DataFrame()
+
+                # =================================================
                 # LOAD FMSS
                 # =================================================
 
@@ -5833,6 +6204,21 @@ if can_process:
                     recon_dates
                 )
 
+                recon_now = get_jakarta_now()
+
+                st.session_state.recon_mode = (
+                    get_recon_mode(
+                        recon_dates,
+                        recon_now
+                    )
+                )
+
+                st.session_state.recon_now_label = (
+                    format_recon_now_label(
+                        recon_now
+                    )
+                )
+
                 # =================================================
                 # EXTRACT VA FMSS - VECTORIZED
                 # =================================================
@@ -5857,6 +6243,14 @@ if can_process:
 
                     df_int_sukses["FMSS_JOURNAL"] = (
                         extract_bniva_fmss_journal_series(
+                            df_int_sukses[
+                                col_keterangan_int
+                            ]
+                        )
+                    )
+
+                    df_int_sukses["FMSS_SOURCE_DATETIME"] = (
+                        extract_bniva_source_datetime_series(
                             df_int_sukses[
                                 col_keterangan_int
                             ]
@@ -6047,6 +6441,48 @@ if can_process:
                     )
 
                 # =================================================
+                # BNIVA - H-1 RETRY / CARRYOVER FMSS
+                # =================================================
+                # Hanya record yang keterangannya secara eksplisit menunjuk
+                # source transaction D-1. Record dipisahkan dari current-day
+                # matching agar tidak menjadi false Issue FMSS / false MATCH.
+
+                if pilihan_bank == "BNIVA":
+
+                    bniva_h1_retry_mask = (
+                        build_bniva_h1_retry_mask(
+                            df_int_valid,
+                            recon_dates
+                        )
+                    )
+
+                    if bniva_h1_retry_mask.any():
+
+                        df_bniva_h1_retry = (
+                            df_int_valid.loc[
+                                bniva_h1_retry_mask
+                            ].copy()
+                        )
+
+                        df_bniva_h1_retry["STATUS_MATCH"] = (
+                            "H-1 RETRY / CARRYOVER - BNIVA"
+                        )
+
+                        df_bniva_h1_retry["MATCH_METHOD"] = (
+                            "FMSS_SOURCE_DATE_D-1"
+                        )
+
+                        df_bniva_h1_retry["MATCH_CONFIDENCE"] = (
+                            "CROSS-DAY INDICATOR"
+                        )
+
+                        df_int_valid = (
+                            df_int_valid.loc[
+                                ~bniva_h1_retry_mask
+                            ].copy()
+                        )
+
+                # =================================================
                 # BANK PROCESSING
                 # =================================================
 
@@ -6194,6 +6630,70 @@ if can_process:
                         ].notna()
                     ].copy()
                 )
+
+                # =================================================
+                # BNIVA - H0 FUTURE-TIME / CROSS-DAY QUARANTINE
+                # =================================================
+                # Saat H0, row bank dengan timestamp yang belum mungkin terjadi
+                # pada waktu sekarang dikeluarkan dari matching current-day.
+                # Journal valid -> POTENTIAL H-1 CUTOFF.
+
+                if pilihan_bank == "BNIVA" and not df_bank_valid.empty:
+
+                    cutoff_mask = (
+                        df_bank_valid
+                        .get(
+                            "_BNIVA_POTENTIAL_H1_CUTOFF",
+                            pd.Series(False, index=df_bank_valid.index)
+                        )
+                        .fillna(False)
+                        .astype(bool)
+                    )
+
+                    time_anomaly_mask = (
+                        df_bank_valid
+                        .get(
+                            "_BNIVA_TIME_ANOMALY",
+                            pd.Series(False, index=df_bank_valid.index)
+                        )
+                        .fillna(False)
+                        .astype(bool)
+                    )
+
+                    if cutoff_mask.any():
+
+                        df_bniva_h1_cutoff = (
+                            df_bank_valid.loc[
+                                cutoff_mask
+                            ].copy()
+                        )
+
+                        df_bniva_h1_cutoff["STATUS_MATCH"] = (
+                            "POTENTIAL H-1 CUTOFF - BNIVA"
+                        )
+
+                    if time_anomaly_mask.any():
+
+                        df_bniva_time_anomaly = (
+                            df_bank_valid.loc[
+                                time_anomaly_mask
+                            ].copy()
+                        )
+
+                        df_bniva_time_anomaly["STATUS_MATCH"] = (
+                            "BANK TIME ANOMALY - BNIVA"
+                        )
+
+                    quarantine_mask = (
+                        cutoff_mask
+                        | time_anomaly_mask
+                    )
+
+                    df_bank_valid = (
+                        df_bank_valid.loc[
+                            ~quarantine_mask
+                        ].copy()
+                    )
 
                 # =================================================
                 # FAST MATCHING ENGINE
@@ -6372,6 +6872,18 @@ if can_process:
                     summary
                 )
 
+                st.session_state.df_bniva_h1_cutoff = (
+                    df_bniva_h1_cutoff
+                )
+
+                st.session_state.df_bniva_h1_retry = (
+                    df_bniva_h1_retry
+                )
+
+                st.session_state.df_bniva_time_anomaly = (
+                    df_bniva_time_anomaly
+                )
+
                 st.session_state.sudah_diproses = (
                     True
                 )
@@ -6417,6 +6929,18 @@ if st.session_state.sudah_diproses:
         st.session_state.summary
     )
 
+    df_bniva_h1_cutoff = (
+        st.session_state.df_bniva_h1_cutoff
+    )
+
+    df_bniva_h1_retry = (
+        st.session_state.df_bniva_h1_retry
+    )
+
+    df_bniva_time_anomaly = (
+        st.session_state.df_bniva_time_anomaly
+    )
+
     st.divider()
 
     # ========================================================
@@ -6431,6 +6955,17 @@ if st.session_state.sudah_diproses:
         f"Periode rekonsiliasi: "
         f"**{safe_date_string(st.session_state.recon_dates)}**"
     )
+
+    if st.session_state.recon_mode == "H0":
+
+        st.info(
+            "🟦 **Rekonsiliasi H0 / Intraday terdeteksi.** "
+            f"Tanggal target sama dengan hari ini. Waktu sistem: "
+            f"**{st.session_state.recon_now_label}**. "
+            "Hasil merupakan snapshot berjalan; engine akan memberi "
+            "indikator khusus jika ditemukan aktivitas cross-day atau "
+            "timestamp bank yang belum mungkin terjadi."
+        )
 
     # ========================================================
     # METRIC
@@ -6457,6 +6992,146 @@ if st.session_state.sudah_diproses:
         "🚨 Invalid VA",
         f"{summary['invalid_int_count'] + summary['invalid_bnk_count']:,} Trx"
     )
+
+    # ========================================================
+    # BNIVA CROSS-DAY / H0 INDICATOR
+    # ========================================================
+
+    if pilihan_bank == "BNIVA":
+
+        bniva_cutoff_count = len(df_bniva_h1_cutoff)
+        bniva_retry_count = len(df_bniva_h1_retry)
+        bniva_time_anomaly_count = len(df_bniva_time_anomaly)
+
+        bniva_cutoff_nominal = (
+            df_bniva_h1_cutoff["_CREDIT_NUM"].sum()
+            if (
+                not df_bniva_h1_cutoff.empty
+                and "_CREDIT_NUM" in df_bniva_h1_cutoff.columns
+            )
+            else 0
+        )
+
+        bniva_retry_nominal = (
+            df_bniva_h1_retry["NOMINAL_ASLI"].sum()
+            if (
+                not df_bniva_h1_retry.empty
+                and "NOMINAL_ASLI" in df_bniva_h1_retry.columns
+            )
+            else 0
+        )
+
+        if (
+            bniva_cutoff_count > 0
+            or bniva_retry_count > 0
+            or bniva_time_anomaly_count > 0
+        ):
+
+            info_parts = []
+
+            if bniva_cutoff_count > 0:
+                info_parts.append(
+                    f"**{bniva_cutoff_count:,} transaksi / "
+                    f"{format_rupiah(bniva_cutoff_nominal)}** "
+                    "ditandai sebagai **Potential H-1 Cutoff** "
+                    "karena Post Date berada setelah waktu snapshot file / H0 "
+                    "dan Journal No. valid tersedia."
+                )
+
+            if bniva_retry_count > 0:
+                info_parts.append(
+                    f"**{bniva_retry_count:,} transaksi FMSS / "
+                    f"{format_rupiah(bniva_retry_nominal)}** "
+                    "ditandai sebagai **H-1 Retry / Carryover** karena "
+                    "keterangan FMSS menunjuk source transaction D-1."
+                )
+
+            if bniva_time_anomaly_count > 0:
+                info_parts.append(
+                    f"**{bniva_time_anomaly_count:,} transaksi bank** "
+                    "memiliki timestamp future-time tetapi Journal No. "
+                    "tidak cukup untuk klasifikasi cutoff; transaksi "
+                    "dikarantina sebagai Bank Time Anomaly."
+                )
+
+            st.info(
+                "ℹ️ **Aktivitas Cross-Day BNIVA terdeteksi.**  "
+                + "  \n".join(info_parts)
+            )
+
+            with st.expander(
+                "🔎 Lihat detail aktivitas Cross-Day BNIVA",
+                expanded=False
+            ):
+
+                if not df_bniva_h1_cutoff.empty:
+                    st.markdown(
+                        "### Potential H-1 Cutoff — Bank"
+                    )
+
+                    cutoff_cols = [
+                        col
+                        for col in [
+                            "_TANGGAL_DT",
+                            "KODE_VA",
+                            "BANK_JOURNAL",
+                            "_CREDIT_NUM",
+                            "STATUS_MATCH"
+                        ]
+                        if col in df_bniva_h1_cutoff.columns
+                    ]
+
+                    st.dataframe(
+                        df_bniva_h1_cutoff[cutoff_cols],
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                if not df_bniva_h1_retry.empty:
+                    st.markdown(
+                        "### H-1 Retry / Carryover — FMSS"
+                    )
+
+                    retry_cols = [
+                        col
+                        for col in [
+                            "_TANGGAL_DT",
+                            "FMSS_SOURCE_DATETIME",
+                            "KODE_VA",
+                            "NOMINAL_ASLI",
+                            "STATUS_MATCH"
+                        ]
+                        if col in df_bniva_h1_retry.columns
+                    ]
+
+                    st.dataframe(
+                        df_bniva_h1_retry[retry_cols],
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                if not df_bniva_time_anomaly.empty:
+                    st.markdown(
+                        "### Bank Time Anomaly"
+                    )
+
+                    anomaly_cols = [
+                        col
+                        for col in [
+                            "_TANGGAL_DT",
+                            "KODE_VA",
+                            "BANK_JOURNAL",
+                            "_CREDIT_NUM",
+                            "STATUS_MATCH"
+                        ]
+                        if col in df_bniva_time_anomaly.columns
+                    ]
+
+                    st.dataframe(
+                        df_bniva_time_anomaly[anomaly_cols],
+                        use_container_width=True,
+                        hide_index=True
+                    )
 
     # ========================================================
     # MATCH RATE
@@ -6865,6 +7540,28 @@ if st.session_state.sudah_diproses:
                 ]
             })
 
+            if pilihan_bank == "BNIVA":
+
+                extra_summary_rows = pd.DataFrame({
+                    "METRIC": [
+                        "Mode Rekonsiliasi",
+                        "BNIVA Potential H-1 Cutoff",
+                        "BNIVA H-1 Retry FMSS",
+                        "BNIVA Bank Time Anomaly"
+                    ],
+                    "VALUE": [
+                        st.session_state.recon_mode,
+                        len(df_bniva_h1_cutoff),
+                        len(df_bniva_h1_retry),
+                        len(df_bniva_time_anomaly)
+                    ]
+                })
+
+                summary_export = pd.concat(
+                    [summary_export, extra_summary_rows],
+                    ignore_index=True
+                )
+
             summary_export.to_excel(
                 writer,
                 sheet_name="SUMMARY",
@@ -6985,6 +7682,33 @@ if st.session_state.sudah_diproses:
                     sheet_name="ISSUE_BANK",
                     index=False
                 )
+
+            # ------------------------------------------------
+            # BNIVA CROSS-DAY ACTIVITY
+            # ------------------------------------------------
+
+            if pilihan_bank == "BNIVA":
+
+                if not df_bniva_h1_cutoff.empty:
+                    df_bniva_h1_cutoff.to_excel(
+                        writer,
+                        sheet_name="BNI_H1_BANK_CUTOFF",
+                        index=False
+                    )
+
+                if not df_bniva_h1_retry.empty:
+                    df_bniva_h1_retry.to_excel(
+                        writer,
+                        sheet_name="BNI_H1_FMSS_RETRY",
+                        index=False
+                    )
+
+                if not df_bniva_time_anomaly.empty:
+                    df_bniva_time_anomaly.to_excel(
+                        writer,
+                        sheet_name="BNI_TIME_ANOMALY",
+                        index=False
+                    )
 
             # ------------------------------------------------
             # INVALID FMSS
