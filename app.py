@@ -2,6 +2,9 @@ import streamlit as st
 import pandas as pd
 import re
 import io
+import csv
+import statistics
+from functools import lru_cache
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from zoneinfo import ZoneInfo
@@ -46,7 +49,11 @@ DEFAULT_STATE = {
     "df_bniva_h1_retry": pd.DataFrame(),
     "df_bniva_time_anomaly": pd.DataFrame(),
     "df_mandiriva_pending_bank_update": pd.DataFrame(),
-    "mandiriva_freshness_meta": {}
+    "mandiriva_freshness_meta": {},
+    "df_permata_pending_fmss": pd.DataFrame(),
+    "df_permata_pending_bank": pd.DataFrame(),
+    "df_permata_non_faspay": pd.DataFrame(),
+    "permata_coverage_meta": {}
 }
 
 for key, value in DEFAULT_STATE.items():
@@ -5838,6 +5845,376 @@ def fast_match_bcava(
 
 
 # ============================================================
+# PERMATAVA ENGINE (FASPAY 72100) — OWNED, SELF-CONTAINED
+# ============================================================
+# Regression baseline:
+# 02 Oct 2026: 24/24 matched (Rp24,122,000 FMSS)
+# 03 Oct 2026: 22/22 matched (Rp12,345,000 FMSS)
+# 04 Oct 2026 H0: 13/13 matched (Rp7,372,000 FMSS)
+# Bank credit = FMSS nominal + 1,000, exact VA, one-to-one.
+# None of the functions for the four existing engines are changed.
+
+PERMATAVA_PREFIX = "72100"
+PERMATAVA_FEE = 1000
+PERMATAVA_VA_REGEX = re.compile(r"(?<!\d)(72100\d{8})(?!\d)")
+PERMATAVA_TIME_REGEX = re.compile(r"(?<!\d)([01]\d|2[0-3]):[0-5]\d:[0-5]\d(?!\d)")
+
+
+def permatava_unique_va(value):
+    """Allow repeated copies of SAME VA in Permata ME descriptions."""
+    found = set(PERMATAVA_VA_REGEX.findall(str(value or "")))
+    if len(found) == 1:
+        return next(iter(found))
+    return None
+
+
+def extract_permatava_va_series(series):
+    return series.apply(permatava_unique_va).astype("object")
+
+
+def classify_permatava_va_series(series):
+    return series.apply(
+        lambda value: "PERMATAVA"
+        if isinstance(value, str) and PERMATAVA_VA_REGEX.fullmatch(value)
+        else "INVALID"
+    )
+
+
+def _permatava_number(value):
+    """Bank statement uses decimal dot and thousands comma: 2,350,000.00."""
+    from decimal import Decimal, InvalidOperation
+    cleaned = str(value or "").strip().replace(",", "").replace("+", "")
+    if not cleaned or cleaned == "-":
+        return 0
+    try:
+        amount = Decimal(cleaned)
+    except InvalidOperation as exc:
+        raise ValueError(f"Permata: nominal tidak dapat dibaca: {value!r}") from exc
+    if amount != amount.to_integral_value():
+        raise ValueError(f"Permata: nominal memiliki pecahan rupiah: {value!r}")
+    return int(amount)
+
+
+def _permatava_outlet_check(row):
+    outlet = str(row.get("id_outlet", "") or "").strip().upper()
+    va = row.get("KODE_VA")
+    match = re.fullmatch(r"FA(\d{1,7})", outlet)
+    if not match or not va:
+        return "NOT_CHECKED"
+    expected_va = PERMATAVA_PREFIX + ("5" + match.group(1)).zfill(8)
+    return "CONSISTENT" if va == expected_va else "REVIEW_OUTLET_MISMATCH"
+
+
+def _permatava_decode_file(uploaded_file):
+    uploaded_file.seek(0)
+    raw = uploaded_file.read()
+    if isinstance(raw, str):
+        return raw
+    for encoding in ("utf-8-sig", "cp1252", "latin1"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("Permata: encoding CSV tidak dikenali.")
+
+
+def prepare_permatava_bank_dataframe(uploaded_file, recon_dates, source_bank="PERMATAVA"):
+    """
+    Read official Permata two-line-header CSV, not pandas' ordinary CSV parser.
+    Credit-only FASPAY rows. Footer/opening/closing never become transactions.
+    Other credit rows are quarantined in attrs, not silently discarded.
+    """
+    text = _permatava_decode_file(uploaded_file)
+    rows = list(csv.reader(io.StringIO(text, newline="")))
+    header_idx = next((i for i, r in enumerate(rows)
+        if len(r) >= 9 and r[0].strip().casefold() == "transaction date"
+        and r[8].strip().casefold() == "description"), None)
+    if header_idx is None or header_idx + 1 >= len(rows):
+        raise ValueError("Format mutasi Permata tidak dikenali: header Transaction Date/Description tidak ada.")
+    labels = [str(x).strip().casefold() for x in rows[header_idx + 1]]
+    if len(labels) < 6 or labels[4] != "debit" or labels[5] != "credit":
+        raise ValueError("Format mutasi Permata tidak dikenali: kolom Debit/Credit dua tingkat berubah.")
+
+    targets = set(recon_dates)
+    active = []
+    non_faspay = []
+    meta = {"bank_snapshot_verified": False, "bank_snapshot_reason":
+            "Nama file/isi mutasi Permata tidak memuat jam ekspor yang terverifikasi.",
+            "all_credit_count": 0, "all_credit_nominal": 0, "all_debit_nominal": 0,
+            "excluded_other_credit_count": 0, "excluded_other_credit_nominal": 0,
+            "opening_balance": None, "closing_balance": None,
+            "declared_credit_total": None, "balance_check": "NOT_AVAILABLE"}
+
+    def optional_amount(x):
+        try: return _permatava_number(x)
+        except ValueError: return None
+
+    for rowno, original in enumerate(rows[header_idx + 2:], start=header_idx + 3):
+        row = list(original) + [""] * max(0, 11 - len(original))
+        first = row[0].strip()
+        lower = first.lower()
+        if lower.startswith("opening balance"):
+            meta["opening_balance"] = optional_amount(row[5])
+            continue
+        if lower.startswith("closing balance"):
+            meta["closing_balance"] = optional_amount(row[5])
+            continue
+        if lower.startswith("grand total") or lower.startswith("total per"):
+            meta["declared_credit_total"] = optional_amount(row[5])
+            continue
+        if not re.fullmatch(r"\d{2}/\d{2}/\d{2}", first):
+            # Empty/formatting rows are safe to ignore, unexpected substantive rows fail.
+            if any(str(x).strip() for x in row):
+                raise ValueError(f"Permata baris {rowno} tidak dikenali: {row[:3]}")
+            continue
+        try:
+            bank_date = datetime.strptime(first, "%d/%m/%y").date()
+        except ValueError as exc:
+            raise ValueError(f"Tanggal bank Permata invalid baris {rowno}: {first!r}") from exc
+        credit = _permatava_number(row[5])
+        debit = _permatava_number(row[4])
+        meta["all_credit_nominal"] += credit
+        meta["all_debit_nominal"] += debit
+        if credit > 0:
+            meta["all_credit_count"] += 1
+        if bank_date not in targets or credit <= 0:
+            continue
+        if row[3].strip().upper() != "C" or debit != 0:
+            raise ValueError(f"Permata baris {rowno}: credit positif tetapi Type/Debit tidak konsisten.")
+        description = str(row[8] or "").strip()
+        if not re.search(r"\bPAY\s+FASPAY\b", description, flags=re.I):
+            non_faspay.append({"SOURCE_ROW": rowno, "BANK_DATE": str(bank_date),
+                                "CREDIT": credit, "DESCRIPTION": description})
+            meta["excluded_other_credit_count"] += 1
+            meta["excluded_other_credit_nominal"] += credit
+            continue
+        vas = set(PERMATAVA_VA_REGEX.findall(description))
+        va = next(iter(vas)) if len(vas) == 1 else None
+        va_status = ("VALID" if len(vas) == 1 else
+                     "MULTIPLE_DIFFERENT_VA" if len(vas) > 1 else "VA_NOT_FOUND")
+        tm = PERMATAVA_TIME_REGEX.search(description)
+        bank_dt = (datetime.combine(bank_date, datetime.strptime(tm.group(), "%H:%M:%S").time())
+                   if tm else pd.NaT)
+        active.append({
+            "_TANGGAL_DT": bank_dt,
+            "_TANGGAL_ONLY": pd.Timestamp(bank_date),
+            "_PERMATA_TXN_DATE": bank_date,
+            "_CREDIT_NUM": credit,
+            "KODE_VA": va,
+            "JENIS_VA": "PERMATAVA" if va is not None else "INVALID",
+            "SOURCE_BANK": source_bank,
+            "_BANK_TYPE": "PERMATAVA",
+            "_DESC_VALUE": description,
+            "_PERMATA_VA_PARSE_STATUS": va_status,
+            "_PERMATA_SOURCE_ROW": rowno,
+            "_PERMATA_REFERENCE_NUMBER": str(row[7] or "").strip(),
+            "_PERMATA_CUSTOMER_REFERENCE": str(row[9] or "").strip(),
+            "_PERMATA_PAYMENT_CHANNEL": (
+                "PERMATA ME" if "PERMATA ME" in description.upper() else
+                "ATM BERSAMA" if "ATM BERSAMA" in description.upper() else
+                "ATM PRIMA" if "ATM PRIMA" in description.upper() else
+                "PERMATA GATEWAY" if "PERMATA GATEWAY" in description.upper() else "OTHER FASPAY"),
+            "_PERMATA_TIME_PRESENT": tm is not None,
+        })
+    if (meta["opening_balance"] is not None and
+        meta["closing_balance"] is not None):
+        expected_closing = (meta["opening_balance"] + meta["all_credit_nominal"]
+                            - meta["all_debit_nominal"])
+        meta["balance_check"] = ("PASS" if expected_closing == meta["closing_balance"]
+                                 else "REVIEW_BALANCE_MISMATCH")
+    if (meta["declared_credit_total"] is not None and
+        meta["declared_credit_total"] != meta["all_credit_nominal"]):
+        meta["balance_check"] = "REVIEW_DECLARED_TOTAL_MISMATCH"
+    meta["non_faspay"] = pd.DataFrame(non_faspay)
+    columns = ["_TANGGAL_DT", "_TANGGAL_ONLY", "_PERMATA_TXN_DATE", "_CREDIT_NUM",
+               "KODE_VA", "JENIS_VA", "SOURCE_BANK", "_BANK_TYPE", "_DESC_VALUE",
+               "_PERMATA_VA_PARSE_STATUS", "_PERMATA_SOURCE_ROW", "_PERMATA_REFERENCE_NUMBER",
+               "_PERMATA_CUSTOMER_REFERENCE", "_PERMATA_PAYMENT_CHANNEL", "_PERMATA_TIME_PRESENT"]
+    out = pd.DataFrame(active, columns=columns)
+    if not out.empty:
+        out["_TANGGAL_DT"] = pd.to_datetime(out["_TANGGAL_DT"], errors="coerce")
+    meta["faspay_credit_count"] = len(out)
+    out.attrs["permata_meta"] = meta
+    return out
+
+
+def _permatava_monotonic_pairing(fs, bs):
+    """Maximize paired rows, then minimize absolute time difference, with no hard time cutoff."""
+    n, m = len(fs), len(bs)
+    if n == m:
+        return [(i, i) for i in range(n)], False
+    if n * m > 10000:
+        return [], True  # avoid speculative matching with excessive duplicates
+
+    @lru_cache(maxsize=None)
+    def solve(i, j):
+        if i == n or j == m:
+            return (0, 0.0, (), 1)
+        choices = []
+        a = solve(i+1, j)
+        choices.append((a[0], a[1], a[2], a[3]))
+        b = solve(i, j+1)
+        choices.append((b[0], b[1], b[2], b[3]))
+        c = solve(i+1, j+1)
+        diff = abs((fs[i]["_TANGGAL_DT"] - bs[j]["_TANGGAL_DT"]).total_seconds())
+        choices.append((c[0]+1, c[1]+diff, ((i,j),)+c[2], c[3]))
+        top_count = max(x[0] for x in choices)
+        best_cost = min(x[1] for x in choices if x[0] == top_count)
+        optimal = [x for x in choices if x[0]==top_count and abs(x[1]-best_cost) < 1e-7]
+        multiplicity = min(2, sum(x[3] for x in optimal))
+        return optimal[0][0], optimal[0][1], optimal[0][2], multiplicity
+
+    result = solve(0,0)
+    return list(result[2]), result[3] > 1
+
+
+def fast_match_permatava(df_int_valid, df_bank_valid, recon_dates):
+    """Strict target-date, VA + expected bank exact, one-to-one and chronological duplicates."""
+    fmss = df_int_valid.to_dict("records")
+    bank = df_bank_valid.to_dict("records")
+    fmap, bmap = defaultdict(list), defaultdict(list)
+    for i, row in enumerate(fmss):
+        dt = pd.to_datetime(row.get("_TANGGAL_DT"), errors="coerce")
+        if pd.isna(dt):
+            continue
+        key=(dt.date(), str(row["KODE_VA"]), int(row["EXPECTED_BANK"]))
+        fmap[key].append(i)
+    for i, row in enumerate(bank):
+        key=(row["_PERMATA_TXN_DATE"], str(row["KODE_VA"]), int(row["_CREDIT_NUM"]))
+        bmap[key].append(i)
+    matched, issue_fmss, issue_bank = [], [], []
+    consumed_f, consumed_b = set(), set()
+    for key in set(fmap) | set(bmap):
+        fi = fmap.get(key, [])
+        bi = bmap.get(key, [])
+        if not fi or not bi:
+            continue
+        if len(fi) == len(bi) == 1:
+            pairs=[(fi[0], bi[0])]
+            method="VA_NOMINAL_DATE_UNIQUE"
+        else:
+            sf = sorted(fi, key=lambda i: (pd.isna(fmss[i].get("_TANGGAL_DT")), fmss[i].get("_TANGGAL_DT")))
+            sb = sorted(bi, key=lambda i: (pd.isna(bank[i].get("_TANGGAL_DT")), bank[i].get("_TANGGAL_DT")))
+            tsf = [fmss[i]["_TANGGAL_DT"] for i in sf]
+            tsb = [bank[i]["_TANGGAL_DT"] for i in sb]
+            if (any(pd.isna(t) for t in tsf+tsb) or len(set(tsf)) != len(tsf)
+                or len(set(tsb)) != len(tsb)):
+                # leave all in audit, do not force a pairing without unique chronology
+                for i in fi:
+                    x=fmss[i].copy();x["STATUS_MATCH"]="AMBIGUOUS_MATCH - PERMATAVA";issue_fmss.append(x);consumed_f.add(i)
+                for i in bi:
+                    x=bank[i].copy();x["STATUS_MATCH"]="AMBIGUOUS_MATCH - PERMATAVA";issue_bank.append(x);consumed_b.add(i)
+                continue
+            sfrows=[fmss[i] for i in sf]; sbrows=[bank[i] for i in sb]
+            resolved, is_tied=_permatava_monotonic_pairing(sfrows, sbrows)
+            if is_tied:
+                for i in fi:
+                    x=fmss[i].copy();x["STATUS_MATCH"]="AMBIGUOUS_MATCH - PERMATAVA";issue_fmss.append(x);consumed_f.add(i)
+                for i in bi:
+                    x=bank[i].copy();x["STATUS_MATCH"]="AMBIGUOUS_MATCH - PERMATAVA";issue_bank.append(x);consumed_b.add(i)
+                continue
+            pairs=[(sf[i],sb[j]) for i,j in resolved]
+            method="TIME_RESOLVED"
+        for i,j in pairs:
+            if i in consumed_f or j in consumed_b:
+                raise AssertionError("Permata: bank/FMSS row reused in one-to-one matching")
+            f=fmss[i].copy();b=bank[j]
+            f.update({"MATCH_MUTASI_KREDIT": b["_CREDIT_NUM"],
+                      "MATCH_DESK_TRAN": b["_DESC_VALUE"],
+                      "MATCH_BANK_DATETIME": b.get("_TANGGAL_DT"),
+                      "MATCH_BANK_SOURCE_ROW": b.get("_PERMATA_SOURCE_ROW"),
+                      "SOURCE_BANK": "PERMATAVA", "BANK_TYPE": "PERMATAVA",
+                      "STATUS_MATCH": "MATCHED", "MATCH_METHOD": method,
+                      "MATCH_CONFIDENCE": "HIGH"})
+            matched.append(f); consumed_f.add(i); consumed_b.add(j)
+    for i,f in enumerate(fmss):
+        if i not in consumed_f:
+            x=f.copy();x["STATUS_MATCH"]="FMSS_ONLY";issue_fmss.append(x)
+    for j,b in enumerate(bank):
+        if j not in consumed_b:
+            x=b.copy();x["STATUS_MATCH"]="BANK_ONLY_CANDIDATE - PERMATAVA";issue_bank.append(x)
+    return pd.DataFrame(matched), pd.DataFrame(issue_fmss), pd.DataFrame(issue_bank)
+
+
+def apply_permatava_h0_coverage_guard(df_matched, df_selisih_int, df_selisih_bnk,
+                                      df_int_valid, df_bank_valid, fmss_filename,
+                                      recon_mode):
+    """
+    H0 only. Because Permata statement lacks export time, do NOT claim confirmed
+    bank freshness from last transaction alone. Quarantine only unmatched rows
+    in the observed trailing edge, visibly labelled COVERAGE UNVERIFIED.
+    Exact matching never changed and historical runs are unaffected.
+    """
+    meta={"mode":recon_mode, "bank_snapshot_verified":False,
+          "coverage_status":"BANK_SNAPSHOT_TIME_UNVERIFIED",
+          "fmss_snapshot":extract_h0_snapshot_datetime_from_filename(fmss_filename),
+          "bank_snapshot":None, "last_bank_transaction":None,
+          "last_fmss_transaction":None, "safety_window_seconds":None,
+          "observed_lag_median_seconds":None, "observed_lag_p95_seconds":None,
+          "pending_bank_count":0,"pending_fmss_count":0}
+    empty_int = pd.DataFrame(columns=list(df_selisih_int.columns) if not df_selisih_int.empty else list(df_int_valid.columns))
+    empty_bank = pd.DataFrame(columns=list(df_selisih_bnk.columns) if not df_selisih_bnk.empty else list(df_bank_valid.columns))
+    if recon_mode != "H0":
+        meta["coverage_status"]="HISTORICAL_NO_H0_GUARD"
+        return df_selisih_int,df_selisih_bnk,empty_int,empty_bank,meta
+    latest_bank = pd.to_datetime(df_bank_valid.get("_TANGGAL_DT", pd.Series(dtype="datetime64[ns]")),errors="coerce").dropna()
+    latest_fmss = pd.to_datetime(df_int_valid.get("_TANGGAL_DT", pd.Series(dtype="datetime64[ns]")),errors="coerce").dropna()
+    if not latest_bank.empty: meta["last_bank_transaction"]=latest_bank.max()
+    if not latest_fmss.empty: meta["last_fmss_transaction"]=latest_fmss.max()
+    lags=[]
+    if not df_matched.empty and "MATCH_BANK_DATETIME" in df_matched.columns:
+        left=pd.to_datetime(df_matched["_TANGGAL_DT"],errors="coerce")
+        right=pd.to_datetime(df_matched["MATCH_BANK_DATETIME"],errors="coerce")
+        lag=(left-right).dt.total_seconds().dropna()
+        lags=[float(t) for t in lag if -60 <= t <= 600]
+    # Observed lag determines only an edge-safety window, NEVER a matching cutoff.
+    if lags:
+        p95=float(pd.Series(lags).quantile(.95))
+        meta["observed_lag_median_seconds"]=round(float(statistics.median(lags)),3)
+        meta["observed_lag_p95_seconds"]=round(p95,3)
+        safety=max(60, int(max(0,p95)+20 + .999))
+    else:
+        safety=60
+    meta["safety_window_seconds"]=safety
+    if latest_bank.empty or latest_fmss.empty:
+        meta["coverage_status"]="INSUFFICIENT_OBSERVED_TRANSACTIONS"
+        return df_selisih_int,df_selisih_bnk,empty_int,empty_bank,meta
+    # Last event is only an observed boundary, NOT a verified export timestamp.
+    fmss_edge=latest_bank.max()-timedelta(seconds=safety)
+    bank_edge=latest_fmss.max()-timedelta(seconds=safety)
+    meta["fmss_observed_review_edge"]=fmss_edge
+    meta["bank_observed_review_edge"]=bank_edge
+    if not df_selisih_int.empty and "STATUS_MATCH" in df_selisih_int.columns:
+        times=pd.to_datetime(df_selisih_int.get("_TANGGAL_DT"),errors="coerce")
+        mask=(df_selisih_int["STATUS_MATCH"].astype(str).eq("FMSS_ONLY")
+              & times.notna() & (times > fmss_edge))
+        pending_int=df_selisih_int.loc[mask].copy()
+        df_selisih_int=df_selisih_int.loc[~mask].copy()
+    else: pending_int=empty_int.copy()
+    if not df_selisih_bnk.empty and "STATUS_MATCH" in df_selisih_bnk.columns:
+        times=pd.to_datetime(df_selisih_bnk.get("_TANGGAL_DT"),errors="coerce")
+        # FMSS export filename, when present, is actual snapshot proof. Using its
+        # end instead of last FMSS event avoids falsely deferring old bank issues.
+        fmss_snapshot=meta["fmss_snapshot"]
+        threshold=(max(bank_edge, pd.Timestamp(fmss_snapshot)-timedelta(seconds=safety))
+                   if pd.notna(fmss_snapshot) else bank_edge)
+        mask=(df_selisih_bnk["STATUS_MATCH"].astype(str).eq("BANK_ONLY_CANDIDATE - PERMATAVA")
+              & times.notna() & (times > threshold))
+        pending_bank=df_selisih_bnk.loc[mask].copy()
+        df_selisih_bnk=df_selisih_bnk.loc[~mask].copy()
+    else: pending_bank=empty_bank.copy()
+    if not pending_int.empty:
+        pending_int["STATUS_MATCH"]="PENDING_BANK_COVERAGE_REVIEW - PERMATAVA"
+        pending_int["PENDING_REASON"]="H0: belum ada bukti jam ekspor mutasi Permata; unmatched berada di tepi transaksi bank teramati."
+    if not pending_bank.empty:
+        pending_bank["STATUS_MATCH"]="PENDING_FMSS_UPDATE - PERMATAVA"
+        pending_bank["PENDING_REASON"]="H0: transaksi bank terlalu dekat dengan coverage/snapshot FMSS."
+    meta["pending_bank_count"]=len(pending_int)
+    meta["pending_fmss_count"]=len(pending_bank)
+    return df_selisih_int,df_selisih_bnk,pending_int,pending_bank,meta
+
+
+# ============================================================
 # FAST BANK FILE PROCESSOR
 # ============================================================
 
@@ -6209,6 +6586,7 @@ opsi_bank = [
     "BNIVA",
     "BCAVA",
     "MANDIRIVA",
+    "PERMATAVA",
     "BSIVA",
     "MuamalatVA"
 ]
@@ -6261,6 +6639,10 @@ if (
     st.session_state.df_bniva_time_anomaly = pd.DataFrame()
     st.session_state.df_mandiriva_pending_bank_update = pd.DataFrame()
     st.session_state.mandiriva_freshness_meta = {}
+    st.session_state.df_permata_pending_fmss = pd.DataFrame()
+    st.session_state.df_permata_pending_bank = pd.DataFrame()
+    st.session_state.df_permata_non_faspay = pd.DataFrame()
+    st.session_state.permata_coverage_meta = {}
 
     st.session_state.pilihan_bank_terakhir = (
         pilihan_bank
@@ -6292,7 +6674,7 @@ if pilihan_bank in BANK_ENGINE_BELUM_TERSEDIA:
 
     st.info(
         "Silakan gunakan bank yang engine-nya sudah aktif: "
-        "BRIVA, BNIVA, BCAVA, atau MANDIRIVA."
+        "BRIVA, BNIVA, BCAVA, MANDIRIVA, atau PERMATAVA."
     )
 
     st.stop()
@@ -6474,6 +6856,10 @@ if can_process:
                 df_bniva_time_anomaly = pd.DataFrame()
                 df_mandiriva_pending_bank_update = pd.DataFrame()
                 mandiriva_freshness_meta = {}
+                df_permata_pending_fmss = pd.DataFrame()
+                df_permata_pending_bank = pd.DataFrame()
+                df_permata_non_faspay = pd.DataFrame()
+                permata_coverage_meta = {}
 
                 # =================================================
                 # LOAD FMSS
@@ -6709,6 +7095,22 @@ if can_process:
                     else:
                         df_int_sukses["FMSS_OUTLET"] = None
 
+                elif pilihan_bank == "PERMATAVA":
+
+                    df_int_sukses["KODE_VA"] = (
+                        extract_permatava_va_series(
+                            df_int_sukses[col_keterangan_int]
+                        )
+                    )
+                    df_int_sukses["JENIS_VA"] = (
+                        classify_permatava_va_series(
+                            df_int_sukses["KODE_VA"]
+                        )
+                    )
+                    df_int_sukses["PERMATA_OUTLET_CHECK"] = (
+                        df_int_sukses.apply(_permatava_outlet_check, axis=1)
+                    )
+
                 elif pilihan_bank == "MANDIRIVA":
 
                     df_int_sukses["KODE_VA"] = (
@@ -6840,6 +7242,12 @@ if can_process:
                         + MANDIRIVA_FEE
                     )
 
+                if pilihan_bank == "PERMATAVA":
+
+                    df_int_valid["EXPECTED_BANK"] = (
+                        df_int_valid["NOMINAL_ASLI"] + PERMATAVA_FEE
+                    )
+
                 if pilihan_bank == "BCAVA":
 
                     df_int_valid[
@@ -6966,6 +7374,17 @@ if can_process:
                     bank_sources.append(
                         df_bcava
                     )
+
+                elif pilihan_bank == "PERMATAVA":
+
+                    df_permata = prepare_permatava_bank_dataframe(
+                        file_bnk_general, recon_dates, "PERMATAVA"
+                    )
+                    permata_coverage_meta = df_permata.attrs.get("permata_meta", {})
+                    df_permata_non_faspay = permata_coverage_meta.pop(
+                        "non_faspay", pd.DataFrame()
+                    )
+                    bank_sources.append(df_permata)
 
                 elif pilihan_bank == "MANDIRIVA":
 
@@ -7134,6 +7553,16 @@ if can_process:
                         recon_dates
                     )
 
+                elif pilihan_bank == "PERMATAVA":
+
+                    (
+                        df_matched,
+                        df_selisih_int,
+                        df_selisih_bnk
+                    ) = fast_match_permatava(
+                        df_int_valid, df_bank_valid, recon_dates
+                    )
+
                 elif pilihan_bank == "MANDIRIVA":
 
                     (
@@ -7192,6 +7621,25 @@ if can_process:
                         recon_dates=recon_dates,
                         recon_mode=st.session_state.recon_mode
                     )
+
+                # =================================================
+                # PERMATAVA H0 — CONSERVATIVE COVERAGE REVIEW
+                # =================================================
+                if pilihan_bank == "PERMATAVA":
+                    (
+                        df_selisih_int, df_selisih_bnk,
+                        df_permata_pending_fmss, df_permata_pending_bank,
+                        permata_h0_meta
+                    ) = apply_permatava_h0_coverage_guard(
+                        df_matched=df_matched,
+                        df_selisih_int=df_selisih_int,
+                        df_selisih_bnk=df_selisih_bnk,
+                        df_int_valid=df_int_valid,
+                        df_bank_valid=df_bank_valid,
+                        fmss_filename=getattr(file_int, "name", ""),
+                        recon_mode=st.session_state.recon_mode
+                    )
+                    permata_coverage_meta.update(permata_h0_meta)
 
                 # =================================================
                 # SUMMARY
@@ -7326,6 +7774,10 @@ if can_process:
                 st.session_state.mandiriva_freshness_meta = (
                     mandiriva_freshness_meta
                 )
+                st.session_state.df_permata_pending_fmss = df_permata_pending_fmss
+                st.session_state.df_permata_pending_bank = df_permata_pending_bank
+                st.session_state.df_permata_non_faspay = df_permata_non_faspay
+                st.session_state.permata_coverage_meta = permata_coverage_meta
 
                 st.session_state.sudah_diproses = (
                     True
@@ -7391,6 +7843,10 @@ if st.session_state.sudah_diproses:
     mandiriva_freshness_meta = (
         st.session_state.mandiriva_freshness_meta
     )
+    df_permata_pending_fmss = st.session_state.df_permata_pending_fmss
+    df_permata_pending_bank = st.session_state.df_permata_pending_bank
+    df_permata_non_faspay = st.session_state.df_permata_non_faspay
+    permata_coverage_meta = st.session_state.permata_coverage_meta
 
     st.divider()
 
@@ -7443,6 +7899,47 @@ if st.session_state.sudah_diproses:
         "🚨 Invalid VA",
         f"{summary['invalid_int_count'] + summary['invalid_bnk_count']:,} Trx"
     )
+
+    # ========================================================
+    # PERMATAVA H0 COVERAGE INDICATOR
+    # ========================================================
+    if pilihan_bank == "PERMATAVA":
+        if permata_coverage_meta.get("balance_check") not in ("PASS", "NOT_AVAILABLE", None):
+            st.warning("⚠️ Kontrol saldo/total mutasi Permata memerlukan review: "
+                       f"{permata_coverage_meta.get('balance_check')}.")
+        if not df_permata_non_faspay.empty:
+            st.warning(f"Ada {len(df_permata_non_faspay):,} kredit non-FASPAY yang dipisahkan dari "
+                       "pool rekonsiliasi. Detail tersedia pada Excel audit.")
+        if st.session_state.recon_mode == "H0":
+            st.info(
+                "ℹ️ **H0 PermataVA — waktu snapshot mutasi belum terverifikasi.** "
+                "Nama file mutasi tidak mengandung jam ekspor; transaksi terakhir "
+                "hanya menunjukkan aktivitas terakhir, bukan bukti cutoff/snapshot. "
+                f"Last Bank Txn: **{str(permata_coverage_meta.get('last_bank_transaction') or '-')}**; "
+                f"Last FMSS Txn: **{str(permata_coverage_meta.get('last_fmss_transaction') or '-')}**."
+            )
+            if not df_permata_pending_fmss.empty or not df_permata_pending_bank.empty:
+                st.warning(
+                    f"⏳ **Pending Bank Coverage Review: {len(df_permata_pending_fmss):,} trx** "
+                    f"/ **Pending FMSS Update: {len(df_permata_pending_bank):,} trx**. "
+                    "Transaksi tetap dapat diaudit, tetapi tidak menjadi false Issue H0 "
+                    "sebelum coverage kedua sumber dapat dibandingkan secara layak."
+                )
+                with st.expander("🔎 Lihat detail Pending H0 PermataVA", expanded=False):
+                    if not df_permata_pending_fmss.empty:
+                        st.markdown("**FMSS menunggu verifikasi coverage bank**")
+                        st.dataframe(df_permata_pending_fmss[
+                            [c for c in ["KODE_VA", "_TANGGAL_DT", "NOMINAL_ASLI",
+                                         "EXPECTED_BANK", "STATUS_MATCH", "PENDING_REASON"]
+                             if c in df_permata_pending_fmss.columns]],
+                            use_container_width=True,hide_index=True)
+                    if not df_permata_pending_bank.empty:
+                        st.markdown("**Bank menunggu update FMSS**")
+                        st.dataframe(df_permata_pending_bank[
+                            [c for c in ["KODE_VA", "_TANGGAL_DT", "_CREDIT_NUM",
+                                         "STATUS_MATCH", "PENDING_REASON"]
+                             if c in df_permata_pending_bank.columns]],
+                            use_container_width=True,hide_index=True)
 
     # ========================================================
     # BNIVA CROSS-DAY / H0 INDICATOR
@@ -7743,6 +8240,9 @@ if st.session_state.sudah_diproses:
     if (
         pilihan_bank == "MANDIRIVA"
         and not df_mandiriva_pending_bank_update.empty
+    ) or (
+        pilihan_bank == "PERMATAVA"
+        and not df_permata_pending_fmss.empty
     ):
         fmss_rate_label = "📈 Match Rate FMSS (Trusted Window)"
 
@@ -7892,6 +8392,12 @@ if st.session_state.sudah_diproses:
                     "lebih tertinggal / masih berada dalam safety window H0."
                 )
 
+            elif pilihan_bank == "PERMATAVA" and not df_permata_pending_fmss.empty:
+                st.info(
+                    "Tidak ada Issue FMSS pada window yang dapat dievaluasi. "
+                    f"Sebanyak {len(df_permata_pending_fmss):,} transaksi masih "
+                    "Pending Bank Coverage Review (H0)."
+                )
             else:
 
                 st.success(
@@ -7944,11 +8450,14 @@ if st.session_state.sudah_diproses:
             )
 
         else:
-
-            st.success(
-                "Tidak ada issue Bank. "
-                "Semua transaksi bank memiliki pasangan FMSS."
-            )
+            if pilihan_bank == "PERMATAVA" and not df_permata_pending_bank.empty:
+                st.info(f"Tidak ada Issue Bank pada trusted window; "
+                        f"{len(df_permata_pending_bank):,} transaksi masih Pending FMSS Update (H0).")
+            else:
+                st.success(
+                    "Tidak ada issue Bank. "
+                    "Semua transaksi bank memiliki pasangan FMSS."
+                )
 
     # ========================================================
     # INVALID VA
@@ -8196,6 +8705,28 @@ if st.session_state.sudah_diproses:
                     ignore_index=True
                 )
 
+            if pilihan_bank == "PERMATAVA":
+                pend_fmss_nominal = (df_permata_pending_fmss["NOMINAL_ASLI"].sum()
+                                     if not df_permata_pending_fmss.empty else 0)
+                pend_bank_nominal = (df_permata_pending_bank["_CREDIT_NUM"].sum()
+                                     if not df_permata_pending_bank.empty else 0)
+                extra_perm = pd.DataFrame({"METRIC": [
+                    "Mode Rekonsiliasi", "PERMATAVA Pending Bank Coverage",
+                    "Nominal Pending Bank Coverage (FMSS)", "PERMATAVA Pending FMSS Update",
+                    "Nominal Pending FMSS Update (Bank)", "Bank Snapshot Verified",
+                    "Bank Statement Balance Check", "Permata Observed Last Bank Transaction",
+                    "Permata Observed Last FMSS Transaction", "Permata Safety Window Seconds",
+                    "Excluded Non-FASPAY Credit Count"],
+                    "VALUE": [st.session_state.recon_mode, len(df_permata_pending_fmss),
+                              pend_fmss_nominal, len(df_permata_pending_bank),pend_bank_nominal,
+                              bool(permata_coverage_meta.get("bank_snapshot_verified",False)),
+                              permata_coverage_meta.get("balance_check"),
+                              str(permata_coverage_meta.get("last_bank_transaction") or ""),
+                              str(permata_coverage_meta.get("last_fmss_transaction") or ""),
+                              permata_coverage_meta.get("safety_window_seconds", ""),
+                              len(df_permata_non_faspay)]})
+                summary_export = pd.concat([summary_export, extra_perm],ignore_index=True)
+
             summary_export.to_excel(
                 writer,
                 sheet_name="SUMMARY",
@@ -8356,6 +8887,23 @@ if st.session_state.sudah_diproses:
                         sheet_name="MANDIRI_PENDING_BANK",
                         index=False
                     )
+
+            # ------------------------------------------------
+            # PERMATAVA H0 / BANK DATA QUALITY (OPTIONAL AUDIT SHEETS)
+            # ------------------------------------------------
+            if pilihan_bank == "PERMATAVA":
+                if not df_permata_pending_fmss.empty:
+                    df_permata_pending_fmss.to_excel(
+                        writer, sheet_name="PERMATA_PENDING_BANK", index=False)
+                if not df_permata_pending_bank.empty:
+                    df_permata_pending_bank.to_excel(
+                        writer, sheet_name="PERMATA_PENDING_FMSS", index=False)
+                if not df_permata_non_faspay.empty:
+                    df_permata_non_faspay.to_excel(
+                        writer, sheet_name="PERMATA_NON_FASPAY", index=False)
+                pd.DataFrame({"METRIC": list(permata_coverage_meta.keys()),
+                              "VALUE": [str(v) for v in permata_coverage_meta.values()]}).to_excel(
+                    writer, sheet_name="PERMATA_COVERAGE", index=False)
 
             # ------------------------------------------------
             # INVALID FMSS
