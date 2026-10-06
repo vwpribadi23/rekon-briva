@@ -53,7 +53,11 @@ DEFAULT_STATE = {
     "df_permata_pending_fmss": pd.DataFrame(),
     "df_permata_pending_bank": pd.DataFrame(),
     "df_permata_non_faspay": pd.DataFrame(),
-    "permata_coverage_meta": {}
+    "permata_coverage_meta": {},
+    "df_britiket_results": pd.DataFrame(),
+    "df_britiket_bank_review": pd.DataFrame(),
+    "df_britiket_ambiguous": pd.DataFrame(),
+    "britiket_meta": {}
 }
 
 for key, value in DEFAULT_STATE.items():
@@ -6575,6 +6579,1675 @@ def fast_match(
 
 
 # ============================================================
+# BRI TIKET ENGINE — OWNED, SELF-CONTAINED
+# ============================================================
+# Prinsip isolasi:
+# - Tidak mengubah BRIVA / BNIVA / BCAVA / MANDIRIVA / PERMATAVA.
+# - FMSS BRI Tiket TIDAK boleh melewati filter global "SUKSES + VA",
+#   karena incident yang dicari justru dapat berstatus Belum Diproses / Gagal.
+# - Matching utama: nominal tiket penuh + chronology + window 2 jam.
+# - Reference ESB / deskripsi bank dipakai sebagai strong evidence jika tersedia.
+# - Cutoff tidak di-hardcode ke jam tertentu. Early expiry aktual dari FMSS
+#   dipakai sebagai indikator cutoff dinamis.
+# - Mutasi D+1 boleh di-upload sebagai search pool. Sisa D+1 tidak menjadi
+#   BANK_ONLY untuk tanggal D.
+# ============================================================
+
+BRITIKET_VALIDITY_MINUTES = 120
+BRITIKET_EARLY_CUTOFF_MARGIN_MINUTES = 10
+BRITIKET_LATE_REVIEW_HOURS = 24
+
+BRITIKET_REFERENCE_REGEX = re.compile(
+    r"ESB:[A-Z0-9]+:[A-Z0-9]+:[A-Z0-9]+",
+    flags=re.IGNORECASE
+)
+
+BRITIKET_PREVIOUS_TIME_REGEX = re.compile(
+    r"tanggal\s+transaksi\s+sebelumnya\s*=\s*"
+    r"(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?)",
+    flags=re.IGNORECASE
+)
+
+BRITIKET_SOURCE_DATE_REGEX = re.compile(
+    r"\[BRIFMNCORPORATE\]\s*(20\d{2}-\d{2}-\d{2})",
+    flags=re.IGNORECASE
+)
+
+
+def _britiket_text(value):
+    if value is None or pd.isna(value):
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip().upper()
+
+
+def extract_britiket_reference_value(value):
+    text_value = _britiket_text(value)
+    match = BRITIKET_REFERENCE_REGEX.search(text_value)
+    if not match:
+        return None
+    return re.sub(r"\s+", "", match.group(0).upper())
+
+
+def britiket_reference_equivalent(left, right):
+    if not left or not right:
+        return False
+    a = re.sub(r"\s+", "", str(left).upper())
+    b = re.sub(r"\s+", "", str(right).upper())
+    # BFST pada FMSS historis dapat terpotong beberapa digit di belakang.
+    return a == b or a.startswith(b) or b.startswith(a)
+
+
+def extract_britiket_original_request_value(current_value, description_value):
+    """Ambil request time paling awal yang dapat dibuktikan dari FMSS."""
+    candidates = []
+
+    current_dt = pd.to_datetime(current_value, errors="coerce")
+    if pd.notna(current_dt):
+        candidates.append(pd.Timestamp(current_dt))
+
+    if description_value is not None and not pd.isna(description_value):
+        for raw_value in BRITIKET_PREVIOUS_TIME_REGEX.findall(
+            str(description_value)
+        ):
+            parsed = pd.to_datetime(raw_value, errors="coerce")
+            if pd.notna(parsed):
+                candidates.append(pd.Timestamp(parsed))
+
+    if not candidates:
+        return pd.NaT
+
+    return min(candidates)
+
+
+def extract_britiket_source_date_value(description_value):
+    if description_value is None or pd.isna(description_value):
+        return None
+
+    match = BRITIKET_SOURCE_DATE_REGEX.search(str(description_value))
+    if not match:
+        return None
+
+    parsed = pd.to_datetime(match.group(1), errors="coerce")
+    if pd.isna(parsed):
+        return None
+
+    return pd.Timestamp(parsed).date()
+
+
+def prepare_britiket_fmss_dataframe(uploaded_file):
+    """Load SEMUA status FMSS untuk BRI Tiket; tidak memakai filter SUKSES global."""
+    df = read_uploaded_file(uploaded_file).copy()
+
+    col_status = find_column(df, ["status", "STATUS"])
+    col_nominal = find_column(df, ["nominal", "NOMINAL", "amount", "AMOUNT"])
+    col_request = find_column(
+        df,
+        ["tanggal_transaksi", "TANGGAL_TRANSAKSI"]
+    )
+    col_transfer = find_column(
+        df,
+        ["tanggal_transfer", "TANGGAL_TRANSFER"],
+        required=False
+    )
+    col_description = find_column(
+        df,
+        ["keterangan", "KETERANGAN", "description", "DESKRIPSI"],
+        required=False
+    )
+    col_user = find_column(
+        df,
+        ["id_user", "ID_USER", "user", "USER"],
+        required=False
+    )
+
+    if col_description is None:
+        description = pd.Series("", index=df.index, dtype="object")
+    else:
+        description = df[col_description].fillna("").astype(str)
+
+    df["_FMSS_STATUS"] = normalize_fmss_status_series(df[col_status])
+    df["NOMINAL_ASLI"] = clean_numeric(df[col_nominal])
+    df["EXPECTED_BANK"] = df["NOMINAL_ASLI"]
+    df["_FMSS_KETERANGAN"] = description
+
+    df["_FMSS_REQUEST_DT"] = [
+        extract_britiket_original_request_value(current, desc)
+        for current, desc in zip(df[col_request], description)
+    ]
+    df["_TANGGAL_DT"] = pd.to_datetime(
+        df["_FMSS_REQUEST_DT"],
+        errors="coerce"
+    )
+
+    if col_transfer is not None:
+        df["_FMSS_TRANSFER_DT"] = parse_briva_datetime(df[col_transfer])
+    else:
+        df["_FMSS_TRANSFER_DT"] = pd.NaT
+
+    if col_user is not None:
+        df["_FMSS_USER"] = (
+            df[col_user]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+    else:
+        df["_FMSS_USER"] = ""
+
+    df["_BRI_CONFIRMED"] = (
+        df["_FMSS_KETERANGAN"]
+        .str.contains("BRIFMNCORPORATE", case=False, regex=False)
+    )
+
+    df["FMSS_BANK_REFERENCE"] = (
+        df["_FMSS_KETERANGAN"]
+        .apply(extract_britiket_reference_value)
+    )
+
+    df["_FMSS_SOURCE_DATE"] = (
+        df["_FMSS_KETERANGAN"]
+        .apply(extract_britiket_source_date_value)
+    )
+
+    nominal_int = (
+        pd.to_numeric(df["NOMINAL_ASLI"], errors="coerce")
+        .fillna(0)
+        .round()
+        .astype("int64")
+    )
+
+    df["TICKET_3D"] = (
+        (nominal_int % 1000)
+        .astype(str)
+        .str.zfill(3)
+    )
+    df["KODE_VA"] = "TIKET-" + df["TICKET_3D"]
+    df["JENIS_VA"] = "BRI TIKET"
+
+    df["_STANDARD_EXPIRES_AT"] = (
+        df["_FMSS_REQUEST_DT"]
+        + pd.Timedelta(minutes=BRITIKET_VALIDITY_MINUTES)
+    )
+
+    is_expired = (
+        df["_FMSS_STATUS"].astype(str).eq("GAGAL")
+        & df["_FMSS_KETERANGAN"].str.contains(
+            "EXPIRED",
+            case=False,
+            regex=False
+        )
+        & pd.to_datetime(
+            df["_FMSS_TRANSFER_DT"],
+            errors="coerce"
+        ).notna()
+    )
+
+    early_cutoff = (
+        is_expired
+        & (df["_FMSS_TRANSFER_DT"] >= df["_FMSS_REQUEST_DT"])
+        & (
+            df["_FMSS_TRANSFER_DT"]
+            < (
+                df["_STANDARD_EXPIRES_AT"]
+                - pd.Timedelta(
+                    minutes=BRITIKET_EARLY_CUTOFF_MARGIN_MINUTES
+                )
+            )
+        )
+    )
+
+    df["_EARLY_CUTOFF_DETECTED"] = early_cutoff.fillna(False)
+    df["_EFFECTIVE_EXPIRES_AT"] = df["_STANDARD_EXPIRES_AT"]
+    df.loc[
+        df["_EARLY_CUTOFF_DETECTED"],
+        "_EFFECTIVE_EXPIRES_AT"
+    ] = df.loc[
+        df["_EARLY_CUTOFF_DETECTED"],
+        "_FMSS_TRANSFER_DT"
+    ]
+
+    # Hanya row dengan nominal dan request time valid yang boleh menjadi
+    # kandidat matching. Row lain tetap tidak dibuang dari file asli, tetapi
+    # tidak digunakan untuk membuat pairing spekulatif.
+    df["_BRITIKET_FMSS_VALID"] = (
+        df["_FMSS_REQUEST_DT"].notna()
+        & (df["NOMINAL_ASLI"] > 0)
+    )
+
+    return df
+
+
+def _britiket_read_uploaded_bytes(uploaded_file):
+    uploaded_file.seek(0)
+    raw = uploaded_file.read()
+    uploaded_file.seek(0)
+    if isinstance(raw, str):
+        return raw.encode("utf-8", errors="replace")
+    return raw
+
+
+def prepare_britiket_bank_dataframe(
+    uploaded_files,
+    recon_dates,
+    source_bank="BRI TIKET"
+):
+    """Mutasi BRI D + optional D+1; duplicate upload di-dedupe secara aman."""
+    if not isinstance(uploaded_files, (list, tuple)):
+        uploaded_files = [uploaded_files]
+
+    uploaded_files = [item for item in uploaded_files if item is not None]
+    if not uploaded_files:
+        raise ValueError("Mutasi BRI Tiket belum di-upload.")
+
+    target_dates = {
+        pd.Timestamp(value).date()
+        for value in recon_dates
+    }
+    search_dates = set(target_dates)
+    search_dates.update(
+        value + timedelta(days=1)
+        for value in target_dates
+    )
+
+    frames = []
+    seen_signatures = set()
+    snapshot_candidates = []
+    source_files = []
+
+    for source_id, uploaded_file in enumerate(uploaded_files, start=1):
+        raw = _britiket_read_uploaded_bytes(uploaded_file)
+        signature = (
+            len(raw),
+            raw[:512],
+            raw[-512:] if len(raw) >= 512 else raw
+        )
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+
+        source_name = getattr(
+            uploaded_file,
+            "name",
+            f"BRI_TIKET_{source_id}.csv"
+        )
+        source_files.append(source_name)
+
+        snapshot_dt = extract_h0_snapshot_datetime_from_filename(source_name)
+        if pd.notna(snapshot_dt):
+            snapshot_candidates.append(pd.Timestamp(snapshot_dt))
+
+        df = read_uploaded_file(uploaded_file).copy()
+
+        col_date = find_column(
+            df,
+            ["TGL_TRAN", "tgl_tran", "TANGGAL", "tanggal"]
+        )
+        col_credit = find_column(
+            df,
+            ["MUTASI_KREDIT", "mutasi_kredit", "KREDIT", "kredit"]
+        )
+        col_desc = find_column(
+            df,
+            ["DESK_TRAN", "desk_tran", "KETERANGAN", "keterangan"],
+            required=False
+        )
+        col_seq = find_column(df, ["SEQ", "seq"], required=False)
+        col_tlbds1 = find_column(df, ["TLBDS1", "tlbds1"], required=False)
+        col_tlbds2 = find_column(df, ["TLBDS2", "tlbds2"], required=False)
+        col_trremk = find_column(df, ["TRREMK", "trremk"], required=False)
+
+        out = pd.DataFrame(index=df.index)
+        out["_TANGGAL_DT"] = parse_briva_datetime(df[col_date])
+        out["_CREDIT_NUM"] = clean_numeric(df[col_credit])
+
+        if col_desc is not None:
+            out["_DESC_VALUE"] = df[col_desc].fillna("").astype(str)
+        else:
+            out["_DESC_VALUE"] = ""
+
+        reference_source = pd.Series("", index=df.index, dtype="object")
+        for optional_col in [col_desc, col_tlbds1, col_tlbds2, col_trremk]:
+            if optional_col is not None:
+                reference_source = (
+                    reference_source
+                    + " "
+                    + df[optional_col].fillna("").astype(str)
+                )
+
+        out["BANK_REFERENCE"] = (
+            reference_source
+            .apply(extract_britiket_reference_value)
+        )
+
+        if col_trremk is not None:
+            core_desc = df[col_trremk].fillna("").astype(str)
+        else:
+            core_desc = out["_DESC_VALUE"].astype(str)
+
+        # Hapus suffix ESB dari core description untuk strong text fallback.
+        out["_BANK_CORE_DESC"] = (
+            core_desc
+            .str.replace(
+                r"\s*ESB:[A-Z0-9]+:[A-Z0-9]+:[A-Z0-9]+.*$",
+                "",
+                regex=True,
+                flags=re.IGNORECASE
+            )
+            .map(_britiket_text)
+        )
+
+        if col_seq is not None:
+            out["BANK_SEQ"] = (
+                df[col_seq]
+                .astype("string")
+                .str.strip()
+            )
+        else:
+            out["BANK_SEQ"] = pd.NA
+
+        out["SOURCE_FILE"] = source_name
+        out["SOURCE_ROW"] = range(1, len(out) + 1)
+        out["SOURCE_BANK"] = source_bank
+        out["_BANK_TYPE"] = "BRI TIKET"
+        out["JENIS_VA"] = "BRI TIKET"
+
+        nominal_int = (
+            pd.to_numeric(out["_CREDIT_NUM"], errors="coerce")
+            .fillna(0)
+            .round()
+            .astype("int64")
+        )
+        out["TICKET_3D"] = (
+            (nominal_int % 1000)
+            .astype(str)
+            .str.zfill(3)
+        )
+        out["KODE_VA"] = "TIKET-" + out["TICKET_3D"]
+
+        frames.append(out)
+
+    if not frames:
+        raise ValueError("Tidak ada mutasi BRI Tiket unik yang dapat diproses.")
+
+    bank = pd.concat(frames, ignore_index=True, sort=False)
+    bank = bank[
+        (bank["_CREDIT_NUM"] > 0)
+        & bank["_TANGGAL_DT"].notna()
+        & bank["_TANGGAL_DT"].dt.date.isin(search_dates)
+    ].copy()
+
+    # Dedupe overlap file D/D+1 atau file yang di-export ulang.
+    ref_key = bank["BANK_REFERENCE"].fillna("").astype(str)
+    fallback_key = (
+        bank["_TANGGAL_DT"].astype(str)
+        + "|" + bank["_CREDIT_NUM"].astype(str)
+        + "|" + bank["BANK_SEQ"].astype(str)
+        + "|" + bank["_DESC_VALUE"].astype(str)
+    )
+    bank["_BRITIKET_DEDUP_KEY"] = ref_key.where(
+        ref_key.ne(""),
+        fallback_key
+    )
+    bank = bank.drop_duplicates(
+        "_BRITIKET_DEDUP_KEY",
+        keep="first"
+    ).reset_index(drop=True)
+
+    coverage_dates = sorted(
+        set(bank["_TANGGAL_DT"].dropna().dt.date)
+    )
+
+    bank.attrs["britiket_bank_meta"] = {
+        "source_files": source_files,
+        "coverage_dates": coverage_dates,
+        "snapshot_verified": bool(snapshot_candidates),
+        "snapshot_datetime": (
+            max(snapshot_candidates)
+            if snapshot_candidates
+            else pd.NaT
+        ),
+        "observed_last_transaction": (
+            bank["_TANGGAL_DT"].max()
+            if not bank.empty
+            else pd.NaT
+        )
+    }
+
+    return bank
+
+
+def _britiket_valid_pairing(fmss_rows, bank_rows):
+    """Monotonic one-to-one pairing; match hanya jika bank hit 0..120 menit."""
+    n = len(fmss_rows)
+    m = len(bank_rows)
+
+    if n == 0 or m == 0:
+        return [], False
+
+    if n * m > 10000:
+        return [], True
+
+    @lru_cache(maxsize=None)
+    def solve(i, j):
+        if i == n or j == m:
+            return (0, 0.0, (), 1)
+
+        choices = []
+
+        skip_fmss = solve(i + 1, j)
+        choices.append(skip_fmss)
+
+        skip_bank = solve(i, j + 1)
+        choices.append(skip_bank)
+
+        fmss_dt = pd.to_datetime(
+            fmss_rows[i].get("_FMSS_REQUEST_DT"),
+            errors="coerce"
+        )
+        bank_dt = pd.to_datetime(
+            bank_rows[j].get("_TANGGAL_DT"),
+            errors="coerce"
+        )
+
+        if pd.notna(fmss_dt) and pd.notna(bank_dt):
+            delta_seconds = (bank_dt - fmss_dt).total_seconds()
+
+            if 0 <= delta_seconds <= BRITIKET_VALIDITY_MINUTES * 60:
+                matched_next = solve(i + 1, j + 1)
+                choices.append((
+                    matched_next[0] + 1,
+                    matched_next[1] + delta_seconds,
+                    ((i, j),) + matched_next[2],
+                    matched_next[3]
+                ))
+
+        best_count = max(item[0] for item in choices)
+        best_cost = min(
+            item[1]
+            for item in choices
+            if item[0] == best_count
+        )
+        optimal = [
+            item
+            for item in choices
+            if item[0] == best_count
+            and abs(item[1] - best_cost) < 1e-7
+        ]
+        multiplicity = min(
+            2,
+            sum(item[3] for item in optimal)
+        )
+
+        return (
+            optimal[0][0],
+            optimal[0][1],
+            optimal[0][2],
+            multiplicity
+        )
+
+    result = solve(0, 0)
+    return list(result[2]), result[3] > 1
+
+
+def _britiket_pair_record(
+    fmss_row,
+    bank_row,
+    match_method,
+    match_confidence
+):
+    record = fmss_row.copy()
+
+    bank_dt = pd.to_datetime(
+        bank_row.get("_TANGGAL_DT"),
+        errors="coerce"
+    )
+    request_dt = pd.to_datetime(
+        fmss_row.get("_FMSS_REQUEST_DT"),
+        errors="coerce"
+    )
+
+    delta_seconds = None
+    if pd.notna(bank_dt) and pd.notna(request_dt):
+        delta_seconds = (bank_dt - request_dt).total_seconds()
+
+    record.update({
+        "MATCH_BANK_DATETIME": bank_dt,
+        "MATCH_MUTASI_KREDIT": bank_row.get("_CREDIT_NUM", 0),
+        "MATCH_DESK_TRAN": bank_row.get("_DESC_VALUE", ""),
+        "BANK_REFERENCE": bank_row.get("BANK_REFERENCE"),
+        "BANK_SEQ": bank_row.get("BANK_SEQ"),
+        "SOURCE_FILE_BANK": bank_row.get("SOURCE_FILE", ""),
+        "SOURCE_ROW_BANK": bank_row.get("SOURCE_ROW"),
+        "SOURCE_BANK": "BRI TIKET",
+        "BANK_TYPE": "BRI TIKET",
+        "MATCH_METHOD": match_method,
+        "MATCH_CONFIDENCE": match_confidence,
+        "TIME_DIFFERENCE_SECONDS": delta_seconds,
+        "TIME_DIFFERENCE_MINUTES": (
+            delta_seconds / 60
+            if delta_seconds is not None
+            else None
+        )
+    })
+
+    status = str(fmss_row.get("_FMSS_STATUS", "")).upper()
+    user = str(fmss_row.get("_FMSS_USER", "")).strip().lower()
+    ket = str(fmss_row.get("_FMSS_KETERANGAN", "")).upper()
+
+    valid_window = (
+        delta_seconds is not None
+        and 0 <= delta_seconds <= BRITIKET_VALIDITY_MINUTES * 60
+    )
+
+    effective_expiry = pd.to_datetime(
+        fmss_row.get("_EFFECTIVE_EXPIRES_AT"),
+        errors="coerce"
+    )
+    early_cutoff = bool(
+        fmss_row.get("_EARLY_CUTOFF_DETECTED", False)
+    )
+
+    # Reference/description yang kuat membuktikan pasangan bank. Pada transaksi
+    # manual lama, timestamp request asli kadang sudah tidak tersimpan; bank dapat
+    # terlihat lebih awal daripada tanggal_transaksi yang sebenarnya adalah waktu
+    # PIC melakukan recovery. Jangan salah label menjadi incident time anomaly.
+    if (
+        status == "SUKSES"
+        and user != "system api"
+        and delta_seconds is not None
+        and delta_seconds < 0
+        and match_method in {
+            "ESB_REFERENCE_NOMINAL",
+            "BANK_DESCRIPTION_NOMINAL",
+            "MANUAL_BACKWARD_UNIQUE"
+        }
+    ):
+        classification = "MANUAL_RECOVERED_REQUEST_TIME_UNKNOWN"
+
+    elif delta_seconds is not None and delta_seconds < -1:
+        classification = "TIME_ANOMALY_REVIEW"
+
+    elif (
+        early_cutoff
+        and pd.notna(effective_expiry)
+        and pd.notna(bank_dt)
+        and bank_dt > effective_expiry
+    ):
+        classification = "POST_CUTOFF_TRANSFER"
+
+    elif status == "SUKSES" and user == "system api" and valid_window:
+        classification = "AUTO_SUCCESS"
+
+    elif status == "SUKSES" and user == "system api":
+        classification = "AUTO_SUCCESS_OUTSIDE_WINDOW_REVIEW"
+
+    elif status == "SUKSES" and user != "system api" and valid_window:
+        classification = "MANUAL_RECOVERED"
+
+    elif status == "SUKSES" and user != "system api":
+        classification = "LATE_TRANSFER_MANUAL_RECOVERY"
+
+    elif status == "BELUM DIPROSES" and valid_window:
+        classification = "BANK_HIT_FMSS_PENDING"
+
+    elif status == "GAGAL" and "EXPIRED" in ket and valid_window:
+        classification = "BANK_HIT_FMSS_EXPIRED"
+
+    elif status == "GAGAL" and valid_window:
+        classification = "BANK_HIT_FMSS_FAILED"
+
+    elif (
+        delta_seconds is not None
+        and delta_seconds > BRITIKET_VALIDITY_MINUTES * 60
+    ):
+        classification = "LATE_TRANSFER_REVIEW"
+
+    else:
+        classification = "MATCH_REVIEW"
+
+    record["STATUS_MATCH"] = classification
+    return record
+
+
+def _britiket_make_audit_record(row, status, method, confidence, note=""):
+    record = row.copy()
+    record["STATUS_MATCH"] = status
+    record["MATCH_METHOD"] = method
+    record["MATCH_CONFIDENCE"] = confidence
+    record["BRITIKET_NOTE"] = note
+    return record
+
+
+def reconcile_britiket(fmss_file, bank_files):
+    """Main BRI Tiket reconciliation. Return all FMSS-oriented results + bank review."""
+    fmss = prepare_britiket_fmss_dataframe(fmss_file)
+
+    valid_request_dates = (
+        pd.to_datetime(
+            fmss.loc[
+                fmss["_BRITIKET_FMSS_VALID"],
+                "_FMSS_REQUEST_DT"
+            ],
+            errors="coerce"
+        )
+        .dropna()
+        .dt.date
+    )
+
+    recon_dates = sorted(set(valid_request_dates))
+    if not recon_dates:
+        raise ValueError(
+            "Tidak ada tanggal request FMSS BRI Tiket yang valid."
+        )
+
+    bank = prepare_britiket_bank_dataframe(
+        bank_files,
+        recon_dates,
+        "BRI TIKET"
+    )
+    bank_meta = bank.attrs.get("britiket_bank_meta", {}).copy()
+
+    fmss_records = fmss.to_dict("records")
+    bank_records = bank.to_dict("records")
+
+    used_fmss = set()
+    used_bank = set()
+    blocked_bank = set()
+
+    results = []
+    ambiguous = []
+
+    # --------------------------------------------------------
+    # A. H-1 MANUAL CARRYOVER YANG TERBUKTI DARI KETERANGAN
+    # --------------------------------------------------------
+    for fmss_idx, row in enumerate(fmss_records):
+        if not row.get("_BRI_CONFIRMED"):
+            continue
+
+        source_date = row.get("_FMSS_SOURCE_DATE")
+        request_dt = pd.to_datetime(
+            row.get("_FMSS_REQUEST_DT"),
+            errors="coerce"
+        )
+
+        if (
+            source_date is not None
+            and pd.notna(request_dt)
+            and source_date < request_dt.date()
+            and str(row.get("_FMSS_USER", "")).strip().lower()
+            != "system api"
+        ):
+            results.append(
+                _britiket_make_audit_record(
+                    row,
+                    "H_MINUS_1_MANUAL_CARRYOVER",
+                    "FMSS_SOURCE_DATE_H_MINUS_1",
+                    "HIGH",
+                    "Keterangan FMSS menunjuk transaksi bank hari sebelumnya; "
+                    "tidak dipaksa match ke mutasi tanggal target."
+                )
+            )
+            used_fmss.add(fmss_idx)
+
+    # --------------------------------------------------------
+    # B. DUPLICATE FMSS REFERENCE — JANGAN REUSE 1 BANK KE 2 FMSS
+    # --------------------------------------------------------
+    reference_groups = defaultdict(list)
+    for fmss_idx, row in enumerate(fmss_records):
+        if fmss_idx in used_fmss:
+            continue
+        if not row.get("_BRI_CONFIRMED"):
+            continue
+        reference = row.get("FMSS_BANK_REFERENCE")
+        if reference:
+            reference_groups[str(reference)].append(fmss_idx)
+
+    for reference, indexes in reference_groups.items():
+        if len(indexes) <= 1:
+            continue
+
+        bank_candidates = [
+            bank_idx
+            for bank_idx, bank_row in enumerate(bank_records)
+            if bank_idx not in used_bank
+            and britiket_reference_equivalent(
+                reference,
+                bank_row.get("BANK_REFERENCE")
+            )
+        ]
+
+        for fmss_idx in indexes:
+            results.append(
+                _britiket_make_audit_record(
+                    fmss_records[fmss_idx],
+                    "DUPLICATE_FMSS_REFERENCE_REVIEW",
+                    "DUPLICATE_FMSS_BANK_REFERENCE",
+                    "REVIEW",
+                    f"Reference bank yang sama muncul pada {len(indexes)} row FMSS."
+                )
+            )
+            used_fmss.add(fmss_idx)
+
+        # Bank yang jelas terkait reference duplicate diblok agar tidak muncul
+        # lagi sebagai BANK_ONLY. Tidak ada pairing spekulatif ke salah satu FMSS.
+        blocked_bank.update(bank_candidates)
+
+    # --------------------------------------------------------
+    # C. STRONG MATCH: REFERENCE + NOMINAL
+    # --------------------------------------------------------
+    for fmss_idx, row in enumerate(fmss_records):
+        if fmss_idx in used_fmss:
+            continue
+        if not row.get("_BRI_CONFIRMED"):
+            continue
+
+        reference = row.get("FMSS_BANK_REFERENCE")
+        if not reference:
+            continue
+
+        amount = int(round(float(row.get("NOMINAL_ASLI", 0) or 0)))
+        candidates = [
+            bank_idx
+            for bank_idx, bank_row in enumerate(bank_records)
+            if bank_idx not in used_bank
+            and bank_idx not in blocked_bank
+            and int(round(float(bank_row.get("_CREDIT_NUM", 0) or 0)))
+            == amount
+            and britiket_reference_equivalent(
+                reference,
+                bank_row.get("BANK_REFERENCE")
+            )
+        ]
+
+        if len(candidates) == 1:
+            bank_idx = candidates[0]
+            results.append(
+                _britiket_pair_record(
+                    row,
+                    bank_records[bank_idx],
+                    "ESB_REFERENCE_NOMINAL",
+                    "HIGH"
+                )
+            )
+            used_fmss.add(fmss_idx)
+            used_bank.add(bank_idx)
+
+        elif len(candidates) > 1:
+            ambiguous.append(
+                _britiket_make_audit_record(
+                    row,
+                    "AMBIGUOUS_MATCH - BRI TIKET",
+                    "MULTIPLE_REFERENCE_MATCH",
+                    "LOW",
+                    f"Reference+nominal menemukan {len(candidates)} kandidat bank."
+                )
+            )
+            used_fmss.add(fmss_idx)
+            blocked_bank.update(candidates)
+
+    # --------------------------------------------------------
+    # D. STRONG TEXT FALLBACK UNTUK CHANNEL TANPA ESB DI FMSS
+    # --------------------------------------------------------
+    for fmss_idx, row in enumerate(fmss_records):
+        if fmss_idx in used_fmss:
+            continue
+        if not row.get("_BRI_CONFIRMED"):
+            continue
+
+        amount = int(round(float(row.get("NOMINAL_ASLI", 0) or 0)))
+        fmss_text = _britiket_text(row.get("_FMSS_KETERANGAN", ""))
+
+        candidates = []
+        for bank_idx, bank_row in enumerate(bank_records):
+            if bank_idx in used_bank or bank_idx in blocked_bank:
+                continue
+            if int(round(float(bank_row.get("_CREDIT_NUM", 0) or 0))) != amount:
+                continue
+
+            core_desc = _britiket_text(bank_row.get("_BANK_CORE_DESC", ""))
+            if len(core_desc) >= 12 and core_desc in fmss_text:
+                candidates.append(bank_idx)
+
+        if len(candidates) == 1:
+            bank_idx = candidates[0]
+            results.append(
+                _britiket_pair_record(
+                    row,
+                    bank_records[bank_idx],
+                    "BANK_DESCRIPTION_NOMINAL",
+                    "HIGH"
+                )
+            )
+            used_fmss.add(fmss_idx)
+            used_bank.add(bank_idx)
+
+    # --------------------------------------------------------
+    # D2. DUPLICATE TICKET WINDOW COLLISION GUARD
+    # --------------------------------------------------------
+    # Ticket BRI hanya 000..999 dan berjalan sequential. Karena sequence dapat
+    # berputar dalam hari yang sama / lintas hari, nominal penuh yang sama dapat
+    # muncul lagi untuk outlet berbeda. Jika dua request nominal sama memiliki
+    # lifecycle 2 jam yang overlap, mutasi bank tanpa reference/description kuat
+    # TIDAK BOLEH dipilih berdasarkan waktu terdekat karena berisiko salah outlet.
+    # Strong evidence pada tahap C/D sudah diproses terlebih dahulu; guard ini
+    # hanya berlaku untuk sisa pairing berbasis nominal + waktu.
+
+    remaining_by_amount = defaultdict(list)
+
+    for fmss_idx, row in enumerate(fmss_records):
+        if fmss_idx in used_fmss:
+            continue
+        if not row.get("_BRITIKET_FMSS_VALID"):
+            continue
+
+        request_dt = pd.to_datetime(
+            row.get("_FMSS_REQUEST_DT"),
+            errors="coerce"
+        )
+        if pd.isna(request_dt):
+            continue
+
+        effective_expiry = pd.to_datetime(
+            row.get("_EFFECTIVE_EXPIRES_AT"),
+            errors="coerce"
+        )
+        if pd.isna(effective_expiry) or effective_expiry < request_dt:
+            effective_expiry = (
+                request_dt
+                + pd.Timedelta(minutes=BRITIKET_VALIDITY_MINUTES)
+            )
+
+        amount = int(round(float(row.get("NOMINAL_ASLI", 0) or 0)))
+        remaining_by_amount[amount].append(
+            (fmss_idx, request_dt, effective_expiry)
+        )
+
+    for amount, items in remaining_by_amount.items():
+        if len(items) <= 1:
+            continue
+
+        items = sorted(items, key=lambda item: (item[1], item[0]))
+
+        # Bentuk connected components berdasarkan overlap interval lifecycle.
+        components = []
+        current = [items[0]]
+        current_end = items[0][2]
+
+        for item in items[1:]:
+            _, start_dt, end_dt = item
+
+            # Inclusive overlap: bank tepat di boundary 2 jam masih berpotensi
+            # eligible untuk request lama dan request baru.
+            if start_dt <= current_end:
+                current.append(item)
+                if end_dt > current_end:
+                    current_end = end_dt
+            else:
+                components.append(current)
+                current = [item]
+                current_end = end_dt
+
+        components.append(current)
+
+        for component in components:
+            if len(component) <= 1:
+                continue
+
+            component_fmss_indexes = [item[0] for item in component]
+
+            candidate_bank_indexes = []
+            for bank_idx, bank_row in enumerate(bank_records):
+                if bank_idx in used_bank or bank_idx in blocked_bank:
+                    continue
+
+                bank_amount = int(round(float(
+                    bank_row.get("_CREDIT_NUM", 0) or 0
+                )))
+                if bank_amount != amount:
+                    continue
+
+                bank_dt = pd.to_datetime(
+                    bank_row.get("_TANGGAL_DT"),
+                    errors="coerce"
+                )
+                if pd.isna(bank_dt):
+                    continue
+
+                eligible_count = sum(
+                    1
+                    for _, start_dt, end_dt in component
+                    if start_dt <= bank_dt <= end_dt
+                )
+
+                if eligible_count > 0:
+                    candidate_bank_indexes.append(bank_idx)
+
+            # Tanpa credit bank yang menyentuh collision window, jangan mengubah
+            # status FMSS. Guard hanya mencegah salah atribusi ketika benar-benar
+            # ada mutasi yang bisa diklaim oleh lebih dari satu request.
+            if not candidate_bank_indexes:
+                continue
+
+            outlet_labels = []
+            for fmss_idx in component_fmss_indexes:
+                row = fmss_records[fmss_idx]
+                outlet = str(row.get("id_outlet", "") or "").strip()
+                req = pd.to_datetime(
+                    row.get("_FMSS_REQUEST_DT"),
+                    errors="coerce"
+                )
+                outlet_labels.append(
+                    f"{outlet or 'UNKNOWN'}@{req}"
+                )
+
+            note = (
+                "Nominal tiket penuh yang sama memiliki lifecycle overlap pada "
+                f"{len(component_fmss_indexes)} request FMSS: "
+                + "; ".join(outlet_labels)
+                + f". Ditemukan {len(candidate_bank_indexes)} credit bank pada "
+                "collision window. Tanpa strong reference, engine sengaja tidak "
+                "menentukan outlet berdasarkan waktu terdekat."
+            )
+
+            for fmss_idx in component_fmss_indexes:
+                ambiguous.append(
+                    _britiket_make_audit_record(
+                        fmss_records[fmss_idx],
+                        "AMBIGUOUS_MATCH - BRI TIKET",
+                        "DUPLICATE_TICKET_OVERLAP",
+                        "LOW",
+                        note
+                    )
+                )
+                used_fmss.add(fmss_idx)
+
+            # Semua credit yang bersinggungan dengan collision component diblok
+            # agar tidak muncul lagi sebagai BANK_ONLY atau dipakai oleh fallback.
+            blocked_bank.update(candidate_bank_indexes)
+
+    # --------------------------------------------------------
+    # E. CONFIRMED BRI TANPA REF/TEXT: NOMINAL + REQUEST WINDOW 2 JAM
+    # --------------------------------------------------------
+    confirmed_groups = defaultdict(list)
+    bank_groups = defaultdict(list)
+
+    for fmss_idx, row in enumerate(fmss_records):
+        if fmss_idx in used_fmss:
+            continue
+        if not row.get("_BRI_CONFIRMED"):
+            continue
+        if not row.get("_BRITIKET_FMSS_VALID"):
+            continue
+        amount = int(round(float(row.get("NOMINAL_ASLI", 0) or 0)))
+        confirmed_groups[amount].append(fmss_idx)
+
+    for bank_idx, row in enumerate(bank_records):
+        if bank_idx in used_bank or bank_idx in blocked_bank:
+            continue
+        amount = int(round(float(row.get("_CREDIT_NUM", 0) or 0)))
+        bank_groups[amount].append(bank_idx)
+
+    for amount, fmss_indexes in confirmed_groups.items():
+        bank_indexes = bank_groups.get(amount, [])
+        if not bank_indexes:
+            continue
+
+        sorted_fmss = sorted(
+            fmss_indexes,
+            key=lambda idx: (
+                pd.to_datetime(
+                    fmss_records[idx].get("_FMSS_REQUEST_DT"),
+                    errors="coerce"
+                ),
+                idx
+            )
+        )
+        sorted_bank = sorted(
+            bank_indexes,
+            key=lambda idx: (
+                pd.to_datetime(
+                    bank_records[idx].get("_TANGGAL_DT"),
+                    errors="coerce"
+                ),
+                idx
+            )
+        )
+
+        pair_positions, is_tied = _britiket_valid_pairing(
+            [fmss_records[idx] for idx in sorted_fmss],
+            [bank_records[idx] for idx in sorted_bank]
+        )
+
+        if is_tied and pair_positions:
+            for fmss_pos, bank_pos in pair_positions:
+                fmss_idx = sorted_fmss[fmss_pos]
+                bank_idx = sorted_bank[bank_pos]
+                ambiguous.append(
+                    _britiket_make_audit_record(
+                        fmss_records[fmss_idx],
+                        "AMBIGUOUS_MATCH - BRI TIKET",
+                        "CONFIRMED_NOMINAL_TIME_TIE",
+                        "LOW",
+                        "Nominal+window 2 jam memiliki pairing optimal lebih dari satu."
+                    )
+                )
+                used_fmss.add(fmss_idx)
+                blocked_bank.add(bank_idx)
+            continue
+
+        for fmss_pos, bank_pos in pair_positions:
+            fmss_idx = sorted_fmss[fmss_pos]
+            bank_idx = sorted_bank[bank_pos]
+
+            if fmss_idx in used_fmss or bank_idx in used_bank:
+                continue
+
+            results.append(
+                _britiket_pair_record(
+                    fmss_records[fmss_idx],
+                    bank_records[bank_idx],
+                    "CONFIRMED_NOMINAL_TIME_2H",
+                    "HIGH"
+                )
+            )
+            used_fmss.add(fmss_idx)
+            used_bank.add(bank_idx)
+
+    # --------------------------------------------------------
+    # F. MANUAL SAME-DAY — BANK DAPAT TERLIHAT SEBELUM WAKTU PIC
+    # --------------------------------------------------------
+    # Fallback hanya jika amount exact dan kandidat bank tunggal dalam 6 jam
+    # sebelum timestamp FMSS. Dipakai karena pada manual historical timestamp
+    # request asli kadang tidak lagi tersedia.
+    for fmss_idx, row in enumerate(fmss_records):
+        if fmss_idx in used_fmss:
+            continue
+        if not row.get("_BRI_CONFIRMED"):
+            continue
+        if str(row.get("_FMSS_USER", "")).strip().lower() == "system api":
+            continue
+
+        request_dt = pd.to_datetime(
+            row.get("_FMSS_REQUEST_DT"),
+            errors="coerce"
+        )
+        if pd.isna(request_dt):
+            continue
+
+        amount = int(round(float(row.get("NOMINAL_ASLI", 0) or 0)))
+        candidates = []
+
+        for bank_idx, bank_row in enumerate(bank_records):
+            if bank_idx in used_bank or bank_idx in blocked_bank:
+                continue
+            if int(round(float(bank_row.get("_CREDIT_NUM", 0) or 0))) != amount:
+                continue
+
+            bank_dt = pd.to_datetime(
+                bank_row.get("_TANGGAL_DT"),
+                errors="coerce"
+            )
+            if pd.isna(bank_dt):
+                continue
+
+            backward_seconds = (request_dt - bank_dt).total_seconds()
+            if 0 <= backward_seconds <= 6 * 3600:
+                candidates.append(bank_idx)
+
+        if len(candidates) == 1:
+            bank_idx = candidates[0]
+            results.append(
+                _britiket_pair_record(
+                    row,
+                    bank_records[bank_idx],
+                    "MANUAL_BACKWARD_UNIQUE",
+                    "MEDIUM"
+                )
+            )
+            used_fmss.add(fmss_idx)
+            used_bank.add(bank_idx)
+
+    # --------------------------------------------------------
+    # G. INCIDENT DISCOVERY: NON-SUKSES + EXACT NOMINAL + 2 JAM
+    # --------------------------------------------------------
+    unresolved_groups = defaultdict(list)
+    remaining_bank_groups = defaultdict(list)
+
+    for fmss_idx, row in enumerate(fmss_records):
+        if fmss_idx in used_fmss:
+            continue
+        if row.get("_BRI_CONFIRMED"):
+            continue
+        if str(row.get("_FMSS_STATUS", "")).upper() == "SUKSES":
+            continue
+        if not row.get("_BRITIKET_FMSS_VALID"):
+            continue
+
+        amount = int(round(float(row.get("NOMINAL_ASLI", 0) or 0)))
+        unresolved_groups[amount].append(fmss_idx)
+
+    for bank_idx, row in enumerate(bank_records):
+        if bank_idx in used_bank or bank_idx in blocked_bank:
+            continue
+        amount = int(round(float(row.get("_CREDIT_NUM", 0) or 0)))
+        remaining_bank_groups[amount].append(bank_idx)
+
+    for amount, fmss_indexes in unresolved_groups.items():
+        bank_indexes = remaining_bank_groups.get(amount, [])
+        if not bank_indexes:
+            continue
+
+        sorted_fmss = sorted(
+            fmss_indexes,
+            key=lambda idx: (
+                pd.to_datetime(
+                    fmss_records[idx].get("_FMSS_REQUEST_DT"),
+                    errors="coerce"
+                ),
+                idx
+            )
+        )
+        sorted_bank = sorted(
+            bank_indexes,
+            key=lambda idx: (
+                pd.to_datetime(
+                    bank_records[idx].get("_TANGGAL_DT"),
+                    errors="coerce"
+                ),
+                idx
+            )
+        )
+
+        pair_positions, is_tied = _britiket_valid_pairing(
+            [fmss_records[idx] for idx in sorted_fmss],
+            [bank_records[idx] for idx in sorted_bank]
+        )
+
+        if is_tied and pair_positions:
+            for fmss_pos, bank_pos in pair_positions:
+                fmss_idx = sorted_fmss[fmss_pos]
+                bank_idx = sorted_bank[bank_pos]
+                ambiguous.append(
+                    _britiket_make_audit_record(
+                        fmss_records[fmss_idx],
+                        "AMBIGUOUS_MATCH - BRI TIKET",
+                        "NOMINAL_TIME_2H_TIE",
+                        "LOW",
+                        "Exact nominal+window 2 jam tidak cukup membedakan kandidat."
+                    )
+                )
+                used_fmss.add(fmss_idx)
+                blocked_bank.add(bank_idx)
+            continue
+
+        for fmss_pos, bank_pos in pair_positions:
+            fmss_idx = sorted_fmss[fmss_pos]
+            bank_idx = sorted_bank[bank_pos]
+
+            if fmss_idx in used_fmss or bank_idx in used_bank:
+                continue
+
+            results.append(
+                _britiket_pair_record(
+                    fmss_records[fmss_idx],
+                    bank_records[bank_idx],
+                    "NOMINAL_TIME_WINDOW_2H",
+                    "HIGH"
+                )
+            )
+            used_fmss.add(fmss_idx)
+            used_bank.add(bank_idx)
+
+    # --------------------------------------------------------
+    # H. LATE TRANSFER > 2 JAM
+    # --------------------------------------------------------
+    # Tidak di-auto-pair untuk FMSS non-confirmed. Setelah >2 jam, exact nominal
+    # saja tidak cukup aman untuk membuktikan bahwa credit bank berasal dari tiket
+    # yang sudah expired. Record bank tetap masuk BANK_ONLY_REVIEW dan dapat
+    # ditelusuri manual. Late transfer yang SUDAH mempunyai BRIFMNCORPORATE/ref
+    # tetap dapat terklasifikasi dari strong match pada tahap sebelumnya.
+
+    # --------------------------------------------------------
+    # I. CONFIRMED BRI FMSS YANG TIDAK ADA DI UPLOAD BANK
+    # --------------------------------------------------------
+    bank_observed_last = bank_meta.get("observed_last_transaction", pd.NaT)
+
+    for fmss_idx, row in enumerate(fmss_records):
+        if fmss_idx in used_fmss:
+            continue
+        if not row.get("_BRI_CONFIRMED"):
+            continue
+
+        transfer_dt = pd.to_datetime(
+            row.get("_FMSS_TRANSFER_DT"),
+            errors="coerce"
+        )
+
+        if (
+            pd.notna(bank_observed_last)
+            and pd.notna(transfer_dt)
+            and transfer_dt > pd.Timestamp(bank_observed_last)
+        ):
+            status = "NEED_BANK_COVERAGE"
+            note = (
+                "FMSS sudah membuktikan channel BRIFMNCORPORATE, tetapi waktu "
+                "proses FMSS berada setelah transaksi terakhir pada mutasi bank yang di-upload."
+            )
+        else:
+            status = "CONFIRMED_BRI_BANK_NOT_FOUND"
+            note = (
+                "FMSS sudah BRIFMNCORPORATE tetapi pasangan bank tidak ditemukan "
+                "pada file yang di-upload; cek coverage/cutoff/file D+1."
+            )
+
+        results.append(
+            _britiket_make_audit_record(
+                row,
+                status,
+                "CONFIRMED_BRI_NO_BANK_ROW",
+                "REVIEW",
+                note
+            )
+        )
+        used_fmss.add(fmss_idx)
+
+    # --------------------------------------------------------
+    # J. BANK YANG TERSISA — HANYA TARGET DATE D YANG DIREVIEW
+    # --------------------------------------------------------
+    target_dates = set(recon_dates)
+    fmss_snapshot = extract_h0_snapshot_datetime_from_filename(
+        getattr(fmss_file, "name", "")
+    )
+
+    bank_review = []
+
+    for bank_idx, row in enumerate(bank_records):
+        if bank_idx in used_bank or bank_idx in blocked_bank:
+            continue
+
+        bank_dt = pd.to_datetime(
+            row.get("_TANGGAL_DT"),
+            errors="coerce"
+        )
+        if pd.isna(bank_dt) or bank_dt.date() not in target_dates:
+            # D+1 hanya search pool cutoff, bukan issue D.
+            continue
+
+        record = row.copy()
+
+        if pd.notna(fmss_snapshot) and bank_dt > pd.Timestamp(fmss_snapshot):
+            record["STATUS_MATCH"] = "PENDING_FMSS_SNAPSHOT"
+            record["MATCH_METHOD"] = "BANK_NEWER_THAN_FMSS_SNAPSHOT"
+            record["MATCH_CONFIDENCE"] = "PENDING_COVERAGE"
+        else:
+            record["STATUS_MATCH"] = "BANK_ONLY_REVIEW"
+            record["MATCH_METHOD"] = "NO_SAFE_FMSS_MATCH"
+            record["MATCH_CONFIDENCE"] = "REVIEW"
+
+        bank_review.append(record)
+
+    result_df = pd.DataFrame(results)
+    bank_review_df = pd.DataFrame(bank_review)
+    ambiguous_df = pd.DataFrame(ambiguous)
+
+    # --------------------------------------------------------
+    # META / REGRESSION AUDIT
+    # --------------------------------------------------------
+    recon_mode = get_recon_mode(recon_dates, get_jakarta_now())
+
+    status_counts = (
+        result_df["STATUS_MATCH"].value_counts().to_dict()
+        if not result_df.empty
+        and "STATUS_MATCH" in result_df.columns
+        else {}
+    )
+
+    critical_statuses = {
+        "BANK_HIT_FMSS_PENDING",
+        "BANK_HIT_FMSS_EXPIRED",
+        "BANK_HIT_FMSS_FAILED"
+    }
+    manual_statuses = {
+        "MANUAL_RECOVERED",
+        "MANUAL_RECOVERED_REQUEST_TIME_UNKNOWN",
+        "LATE_TRANSFER_MANUAL_RECOVERY"
+    }
+    cutoff_late_statuses = {
+        "POST_CUTOFF_TRANSFER",
+        "LATE_TRANSFER_REVIEW"
+    }
+
+    critical_mask = (
+        result_df["STATUS_MATCH"].isin(critical_statuses)
+        if not result_df.empty
+        else pd.Series(dtype=bool)
+    )
+
+    meta = {
+        "recon_dates": recon_dates,
+        "recon_mode": recon_mode,
+        "fmss_snapshot": fmss_snapshot,
+        "bank_snapshot": bank_meta.get("snapshot_datetime", pd.NaT),
+        "bank_snapshot_verified": bank_meta.get("snapshot_verified", False),
+        "bank_observed_last_transaction": bank_meta.get(
+            "observed_last_transaction",
+            pd.NaT
+        ),
+        "bank_coverage_dates": bank_meta.get("coverage_dates", []),
+        "bank_source_files": bank_meta.get("source_files", []),
+        "fmss_total_rows": len(fmss),
+        "bank_credit_rows_in_search_pool": len(bank),
+        "auto_success_count": int(status_counts.get("AUTO_SUCCESS", 0)),
+        "manual_recovered_count": int(sum(
+            status_counts.get(status, 0)
+            for status in manual_statuses
+        )),
+        "critical_count": int(sum(
+            status_counts.get(status, 0)
+            for status in critical_statuses
+        )),
+        "critical_nominal": float(
+            result_df.loc[critical_mask, "NOMINAL_ASLI"].sum()
+            if not result_df.empty
+            and "NOMINAL_ASLI" in result_df.columns
+            else 0
+        ),
+        "cutoff_late_count": int(sum(
+            status_counts.get(status, 0)
+            for status in cutoff_late_statuses
+        )),
+        "bank_review_count": len(bank_review_df),
+        "ambiguous_count": len(ambiguous_df),
+        "status_counts": status_counts
+    }
+
+    return (
+        result_df,
+        bank_review_df,
+        ambiguous_df,
+        meta
+    )
+
+
+def render_britiket_dashboard():
+    """Dedicated UI BRI Tiket. Existing dashboard VA tidak disentuh."""
+    results = st.session_state.df_britiket_results
+    bank_review = st.session_state.df_britiket_bank_review
+    ambiguous = st.session_state.df_britiket_ambiguous
+    meta = st.session_state.britiket_meta
+
+    st.divider()
+    st.subheader("🎫 Ringkasan Rekonsiliasi BRI Tiket")
+    st.caption(
+        "Periode rekonsiliasi: "
+        f"**{safe_date_string(meta.get('recon_dates', []))}** | "
+        "Masa berlaku tiket: **2 jam**"
+    )
+
+    if meta.get("recon_mode") == "H0":
+        st.info(
+            "🟦 **Mode H0 / Intraday.** Hasil mengikuti snapshot FMSS dan mutasi "
+            "BRI yang di-upload. Mutasi yang lebih baru daripada snapshot FMSS "
+            "ditahan sebagai Pending FMSS Snapshot, bukan langsung dianggap issue."
+        )
+
+    coverage_dates = meta.get("bank_coverage_dates", [])
+    if coverage_dates:
+        st.caption(
+            "Coverage tanggal mutasi BRI yang terbaca: **"
+            + ", ".join(
+                pd.Timestamp(value).strftime("%d/%m/%Y")
+                for value in coverage_dates
+            )
+            + "**"
+        )
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric(
+        "✅ Auto Success",
+        f"{meta.get('auto_success_count', 0):,} Trx"
+    )
+    m2.metric(
+        "🛠️ Manual Recovered",
+        f"{meta.get('manual_recovered_count', 0):,} Trx"
+    )
+    m3.metric(
+        "🚨 Bank Hit / FMSS Issue",
+        f"{meta.get('critical_count', 0):,} Trx"
+    )
+    m4.metric(
+        "🟠 Cutoff / Late",
+        f"{meta.get('cutoff_late_count', 0):,} Trx"
+    )
+
+    st.metric(
+        "💰 Nominal Bank Hit tetapi FMSS bermasalah",
+        format_rupiah(meta.get("critical_nominal", 0))
+    )
+
+    critical_statuses = {
+        "BANK_HIT_FMSS_PENDING",
+        "BANK_HIT_FMSS_EXPIRED",
+        "BANK_HIT_FMSS_FAILED"
+    }
+    manual_statuses = {
+        "MANUAL_RECOVERED",
+        "MANUAL_RECOVERED_REQUEST_TIME_UNKNOWN",
+        "LATE_TRANSFER_MANUAL_RECOVERY"
+    }
+    cutoff_late_statuses = {
+        "POST_CUTOFF_TRANSFER",
+        "LATE_TRANSFER_REVIEW"
+    }
+    coverage_review_statuses = {
+        "NEED_BANK_COVERAGE",
+        "CONFIRMED_BRI_BANK_NOT_FOUND",
+        "DUPLICATE_FMSS_REFERENCE_REVIEW",
+        "AUTO_SUCCESS_OUTSIDE_WINDOW_REVIEW",
+        "TIME_ANOMALY_REVIEW",
+        "MATCH_REVIEW",
+        "H_MINUS_1_MANUAL_CARRYOVER"
+    }
+
+    if not results.empty:
+        critical = results[
+            results["STATUS_MATCH"].isin(critical_statuses)
+        ].copy()
+        manual = results[
+            results["STATUS_MATCH"].isin(manual_statuses)
+        ].copy()
+        cutoff_late = results[
+            results["STATUS_MATCH"].isin(cutoff_late_statuses)
+        ].copy()
+        coverage_review = results[
+            results["STATUS_MATCH"].isin(coverage_review_statuses)
+        ].copy()
+        auto_success = results[
+            results["STATUS_MATCH"].eq("AUTO_SUCCESS")
+        ].copy()
+    else:
+        critical = pd.DataFrame()
+        manual = pd.DataFrame()
+        cutoff_late = pd.DataFrame()
+        coverage_review = pd.DataFrame()
+        auto_success = pd.DataFrame()
+
+    def show_fmss_table(frame):
+        cols = [
+            col
+            for col in [
+                "id_deposit",
+                "id_outlet",
+                "nama_pemilik",
+                "TICKET_3D",
+                "NOMINAL_ASLI",
+                "_FMSS_REQUEST_DT",
+                "MATCH_BANK_DATETIME",
+                "TIME_DIFFERENCE_MINUTES",
+                "_FMSS_STATUS",
+                "_FMSS_USER",
+                "STATUS_MATCH",
+                "MATCH_METHOD",
+                "MATCH_CONFIDENCE",
+                "BANK_REFERENCE",
+                "FMSS_BANK_REFERENCE",
+                "BRITIKET_NOTE"
+            ]
+            if col in frame.columns
+        ]
+        st.dataframe(
+            frame[cols],
+            use_container_width=True,
+            hide_index=True
+        )
+
+    st.divider()
+    st.subheader("🚨 Prioritas CS — Bank Sudah Hit, FMSS Belum Normal")
+    if not critical.empty:
+        st.error(
+            f"Ditemukan **{len(critical):,} transaksi** di mana uang sudah masuk BRI "
+            "dalam lifecycle tiket tetapi FMSS masih Pending/Gagal/Expired."
+        )
+        show_fmss_table(critical)
+    else:
+        st.success("Tidak ada Bank Hit / FMSS Issue yang terkonfirmasi pada data ini.")
+
+    if not cutoff_late.empty:
+        with st.expander(
+            f"🟠 Cutoff / Late Transfer ({len(cutoff_late):,})",
+            expanded=False
+        ):
+            st.caption(
+                "POST_CUTOFF_TRANSFER berarti FMSS menutup tiket lebih awal daripada "
+                "window 2 jam dan uang masuk setelah effective close tersebut. "
+                "LATE_TRANSFER_REVIEW berarti transfer ditemukan setelah >2 jam."
+            )
+            show_fmss_table(cutoff_late)
+
+    if not manual.empty:
+        with st.expander(
+            f"🛠️ Manual Recovered ({len(manual):,})",
+            expanded=False
+        ):
+            show_fmss_table(manual)
+
+    if not coverage_review.empty:
+        with st.expander(
+            f"🔎 Coverage / Data Review ({len(coverage_review):,})",
+            expanded=False
+        ):
+            show_fmss_table(coverage_review)
+
+    if not ambiguous.empty:
+        with st.expander(
+            f"⚠️ Ambiguous Match ({len(ambiguous):,})",
+            expanded=False
+        ):
+            show_fmss_table(ambiguous)
+
+    if not bank_review.empty:
+        with st.expander(
+            f"🏦 Bank Only / Pending Snapshot Review ({len(bank_review):,})",
+            expanded=False
+        ):
+            bank_cols = [
+                col
+                for col in [
+                    "_TANGGAL_DT",
+                    "TICKET_3D",
+                    "_CREDIT_NUM",
+                    "BANK_REFERENCE",
+                    "BANK_SEQ",
+                    "_DESC_VALUE",
+                    "STATUS_MATCH",
+                    "MATCH_METHOD",
+                    "MATCH_CONFIDENCE",
+                    "SOURCE_FILE",
+                    "SOURCE_ROW"
+                ]
+                if col in bank_review.columns
+            ]
+            st.dataframe(
+                bank_review[bank_cols],
+                use_container_width=True,
+                hide_index=True
+            )
+
+    if not auto_success.empty:
+        with st.expander(
+            f"✅ Auto Success Normal ({len(auto_success):,})",
+            expanded=False
+        ):
+            show_fmss_table(auto_success)
+
+    # --------------------------------------------------------
+    # EXPORT KHUSUS BRI TIKET
+    # --------------------------------------------------------
+    st.divider()
+    st.subheader("📥 Export Laporan BRI Tiket")
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        status_counts = meta.get("status_counts", {})
+        summary_rows = [
+            ("Mode Rekonsiliasi", meta.get("recon_mode", "")),
+            ("Auto Success", meta.get("auto_success_count", 0)),
+            ("Manual Recovered", meta.get("manual_recovered_count", 0)),
+            ("Critical Bank Hit / FMSS Issue", meta.get("critical_count", 0)),
+            ("Critical Nominal", meta.get("critical_nominal", 0)),
+            ("Cutoff / Late", meta.get("cutoff_late_count", 0)),
+            ("Bank Review", meta.get("bank_review_count", 0)),
+            ("Ambiguous", meta.get("ambiguous_count", 0)),
+            ("FMSS Snapshot", str(meta.get("fmss_snapshot", ""))),
+            ("Bank Snapshot", str(meta.get("bank_snapshot", ""))),
+            ("Bank Last Transaction", str(meta.get("bank_observed_last_transaction", ""))),
+            ("Bank Coverage Dates", ", ".join(str(x) for x in meta.get("bank_coverage_dates", [])))
+        ]
+        for status_name, count in sorted(status_counts.items()):
+            summary_rows.append((f"STATUS::{status_name}", count))
+
+        pd.DataFrame(
+            summary_rows,
+            columns=["METRIC", "VALUE"]
+        ).to_excel(writer, sheet_name="SUMMARY", index=False)
+
+        def export_sheet(frame, sheet_name, empty_text):
+            if frame is not None and not frame.empty:
+                frame.to_excel(writer, sheet_name=sheet_name, index=False)
+            else:
+                pd.DataFrame({"INFO": [empty_text]}).to_excel(
+                    writer,
+                    sheet_name=sheet_name,
+                    index=False
+                )
+
+        export_sheet(auto_success, "AUTO_SUCCESS", "Tidak ada AUTO_SUCCESS.")
+        export_sheet(critical, "INCIDENT_FMSS", "Tidak ada Bank Hit / FMSS Issue.")
+        export_sheet(manual, "MANUAL_RECOVERED", "Tidak ada manual recovery.")
+        export_sheet(cutoff_late, "CUTOFF_LATE", "Tidak ada cutoff/late transfer.")
+        export_sheet(coverage_review, "COVERAGE_REVIEW", "Tidak ada coverage/data review.")
+        export_sheet(bank_review, "BANK_REVIEW", "Tidak ada bank review.")
+        export_sheet(ambiguous, "AMBIGUOUS", "Tidak ada ambiguous match.")
+        export_sheet(results, "ALL_FMSS_RESULTS", "Tidak ada hasil FMSS BRI Tiket.")
+
+    output.seek(0)
+    st.download_button(
+        label="📥 Download Laporan BRI Tiket (.xlsx)",
+        data=output.getvalue(),
+        file_name=(
+            "Laporan_Rekonsiliasi_BRI_TIKET_"
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        ),
+        mime=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+        type="primary",
+        use_container_width=True
+    )
+
+
+# ============================================================
 # UI - PILIH BANK
 # ============================================================
 
@@ -6587,6 +8260,7 @@ opsi_bank = [
     "BCAVA",
     "MANDIRIVA",
     "PERMATAVA",
+    "BRI TIKET",
     "BSIVA",
     "MuamalatVA"
 ]
@@ -6643,6 +8317,10 @@ if (
     st.session_state.df_permata_pending_bank = pd.DataFrame()
     st.session_state.df_permata_non_faspay = pd.DataFrame()
     st.session_state.permata_coverage_meta = {}
+    st.session_state.df_britiket_results = pd.DataFrame()
+    st.session_state.df_britiket_bank_review = pd.DataFrame()
+    st.session_state.df_britiket_ambiguous = pd.DataFrame()
+    st.session_state.britiket_meta = {}
 
     st.session_state.pilihan_bank_terakhir = (
         pilihan_bank
@@ -6674,7 +8352,7 @@ if pilihan_bank in BANK_ENGINE_BELUM_TERSEDIA:
 
     st.info(
         "Silakan gunakan bank yang engine-nya sudah aktif: "
-        "BRIVA, BNIVA, BCAVA, MANDIRIVA, atau PERMATAVA."
+        "BRIVA, BNIVA, BCAVA, MANDIRIVA, PERMATAVA, atau BRI TIKET."
     )
 
     st.stop()
@@ -6723,6 +8401,35 @@ if pilihan_bank == "BRIVA":
             type=["csv", "xlsx"],
             key="briva_57708"
         )
+
+elif pilihan_bank == "BRI TIKET":
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("### 📄 FMSS")
+        file_int = st.file_uploader(
+            "Upload data FMSS BRI Tiket",
+            type=["csv", "xlsx"],
+            key="fmss_britiket"
+        )
+
+    with col2:
+        st.markdown("### 🏦 Mutasi BRI Tiket")
+        file_bnk_general = st.file_uploader(
+            "Upload mutasi BRI Tiket (boleh 1 file rentang D s.d. D+1, atau beberapa file)",
+            type=["csv", "xlsx"],
+            accept_multiple_files=True,
+            key="bank_britiket"
+        )
+        st.caption(
+            "Satu file boleh berisi rentang beberapa tanggal, misalnya 5–6 Oktober. "
+            "Alternatifnya, beberapa file juga boleh di-upload sekaligus. Engine membaca "
+            "tanggal per transaksi; file/row overlap otomatis di-dedupe."
+        )
+
+    file_bnk_57888 = None
+    file_bnk_57708 = None
 
 else:
 
@@ -6840,6 +8547,64 @@ if can_process:
     ):
 
         st.session_state.sudah_diproses = False
+
+        # =====================================================
+        # BRI TIKET — DEDICATED PIPELINE
+        # =====================================================
+        # Bypass pipeline VA existing agar status Pending/Gagal tetap terbaca.
+        # Setelah selesai, rerun dan dedicated renderer akan mengambil alih.
+        if pilihan_bank == "BRI TIKET":
+            try:
+                with st.spinner("Sedang memproses rekonsiliasi BRI Tiket..."):
+                    (
+                        df_britiket_results,
+                        df_britiket_bank_review,
+                        df_britiket_ambiguous,
+                        britiket_meta
+                    ) = reconcile_britiket(
+                        file_int,
+                        file_bnk_general
+                    )
+
+                    st.session_state.df_britiket_results = (
+                        df_britiket_results
+                    )
+                    st.session_state.df_britiket_bank_review = (
+                        df_britiket_bank_review
+                    )
+                    st.session_state.df_britiket_ambiguous = (
+                        df_britiket_ambiguous
+                    )
+                    st.session_state.britiket_meta = britiket_meta
+                    st.session_state.recon_dates = britiket_meta.get(
+                        "recon_dates",
+                        []
+                    )
+                    st.session_state.recon_mode = britiket_meta.get(
+                        "recon_mode",
+                        ""
+                    )
+                    st.session_state.recon_now_label = (
+                        format_recon_now_label(get_jakarta_now())
+                    )
+
+                    # Generic state sengaja dikosongkan agar tidak membawa
+                    # hasil bank sebelumnya bila user berganti engine.
+                    st.session_state.df_matched = pd.DataFrame()
+                    st.session_state.df_selisih_int = pd.DataFrame()
+                    st.session_state.df_selisih_bnk = pd.DataFrame()
+                    st.session_state.df_invalid_int = pd.DataFrame()
+                    st.session_state.df_invalid_bnk = pd.DataFrame()
+                    st.session_state.summary = {}
+                    st.session_state.sudah_diproses = True
+
+                st.rerun()
+
+            except Exception as e:
+                st.session_state.sudah_diproses = False
+                st.error("❌ Terjadi kesalahan saat memproses BRI Tiket.")
+                st.exception(e)
+                st.stop()
 
         try:
 
@@ -7799,6 +9564,10 @@ if can_process:
 # ============================================================
 
 if st.session_state.sudah_diproses:
+
+    if pilihan_bank == "BRI TIKET":
+        render_britiket_dashboard()
+        st.stop()
 
     df_matched = (
         st.session_state.df_matched
@@ -8997,6 +10766,14 @@ elif pilihan_bank == "BRIVA":
     st.info(
         "💡 Upload **3 file** terlebih dahulu: "
         "FMSS, Mutasi BRIVA 57888, dan Mutasi BRIVA 57708."
+    )
+
+elif pilihan_bank == "BRI TIKET":
+
+    st.info(
+        "💡 Upload **FMSS + Mutasi BRI Tiket tanggal target**. "
+        "Jika transaksi mendekati cutoff/lintas hari, tambahkan mutasi **D+1** "
+        "pada uploader Mutasi BRI Tiket yang sama."
     )
 
 elif pilihan_bank != "":
