@@ -6593,7 +6593,7 @@ def fast_match(
 #   BANK_ONLY untuk tanggal D.
 # ============================================================
 
-BRITIKET_ENGINE_VERSION = "V3-2026-10-06"
+BRITIKET_ENGINE_VERSION = "V4-2026-10-06-SESSION-SAFE"
 BRITIKET_VALIDITY_MINUTES = 120
 BRITIKET_EARLY_CUTOFF_MARGIN_MINUTES = 10
 BRITIKET_LATE_REVIEW_HOURS = 24
@@ -7988,11 +7988,21 @@ def render_britiket_dashboard():
 
     st.divider()
     st.subheader("🎫 Ringkasan Rekonsiliasi BRI Tiket")
+    # Jangan pernah menampilkan versi engine CURRENT untuk hasil session lama.
+    # Jika meta tidak menyimpan engine_version, hasil tersebut dianggap legacy/stale.
+    rendered_engine_version = (
+        meta.get("engine_version")
+        if isinstance(meta, dict)
+        else None
+    )
+    if not rendered_engine_version:
+        rendered_engine_version = "LEGACY/STALE RESULT"
+
     st.caption(
         "Tanggal request FMSS yang terdeteksi: "
         f"**{safe_date_string(meta.get('recon_dates', []))}** | "
         "Masa berlaku tiket: **2 jam** | "
-        f"Engine: **{meta.get('engine_version', BRITIKET_ENGINE_VERSION)}**"
+        f"Engine hasil: **{rendered_engine_version}**"
     )
 
     if meta.get("recon_mode") == "H0":
@@ -8354,6 +8364,63 @@ if (
     st.session_state.pilihan_bank_terakhir = (
         pilihan_bank
     )
+
+
+# ============================================================
+# BRI TIKET - SESSION VERSION GUARD
+# ============================================================
+# Streamlit dapat mempertahankan st.session_state ketika source code di-deploy
+# ulang. Tanpa guard ini, hasil engine versi lama dapat tetap tampil dengan UI
+# versi baru. Untuk rekonsiliasi finansial hal tersebut tidak boleh terjadi.
+#
+# Guard hanya menyentuh state BRI TIKET. State / engine VA lain tidak diubah.
+
+if pilihan_bank == "BRI TIKET":
+
+    stored_britiket_meta = st.session_state.get(
+        "britiket_meta",
+        {}
+    )
+
+    if not isinstance(stored_britiket_meta, dict):
+        stored_britiket_meta = {}
+
+    stored_engine_version = stored_britiket_meta.get(
+        "engine_version"
+    )
+
+    has_britiket_result_state = (
+        bool(stored_britiket_meta)
+        or not st.session_state.get(
+            "df_britiket_results",
+            pd.DataFrame()
+        ).empty
+        or not st.session_state.get(
+            "df_britiket_bank_review",
+            pd.DataFrame()
+        ).empty
+        or not st.session_state.get(
+            "df_britiket_ambiguous",
+            pd.DataFrame()
+        ).empty
+    )
+
+    if (
+        has_britiket_result_state
+        and stored_engine_version != BRITIKET_ENGINE_VERSION
+    ):
+        st.session_state.sudah_diproses = False
+        st.session_state.df_britiket_results = pd.DataFrame()
+        st.session_state.df_britiket_bank_review = pd.DataFrame()
+        st.session_state.df_britiket_ambiguous = pd.DataFrame()
+        st.session_state.britiket_meta = {}
+
+        st.warning(
+            "♻️ **Hasil BRI Tiket dari engine lama sudah di-reset otomatis.** "
+            f"Engine aktif sekarang: **{BRITIKET_ENGINE_VERSION}**. "
+            "File upload boleh tetap digunakan; klik **Proses Rekonsiliasi** "
+            "kembali agar seluruh angka dihitung ulang oleh engine terbaru."
+        )
 
 
 # ============================================================
