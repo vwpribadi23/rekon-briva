@@ -6593,6 +6593,7 @@ def fast_match(
 #   BANK_ONLY untuk tanggal D.
 # ============================================================
 
+BRITIKET_ENGINE_VERSION = "V3-2026-10-06"
 BRITIKET_VALIDITY_MINUTES = 120
 BRITIKET_EARLY_CUTOFF_MARGIN_MINUTES = 10
 BRITIKET_LATE_REVIEW_HOURS = 24
@@ -7958,6 +7959,15 @@ def reconcile_britiket(fmss_file, bank_files):
         )),
         "bank_review_count": len(bank_review_df),
         "ambiguous_count": len(ambiguous_df),
+        "engine_version": BRITIKET_ENGINE_VERSION,
+        "auto_success_esb_count": int(
+            ((result_df["STATUS_MATCH"] == "AUTO_SUCCESS")
+             & (result_df["MATCH_METHOD"] == "ESB_REFERENCE_NOMINAL")).sum()
+        ) if (not result_df.empty and "MATCH_METHOD" in result_df.columns) else 0,
+        "auto_success_description_count": int(
+            ((result_df["STATUS_MATCH"] == "AUTO_SUCCESS")
+             & (result_df["MATCH_METHOD"] == "BANK_DESCRIPTION_NOMINAL")).sum()
+        ) if (not result_df.empty and "MATCH_METHOD" in result_df.columns) else 0,
         "status_counts": status_counts
     }
 
@@ -7979,9 +7989,10 @@ def render_britiket_dashboard():
     st.divider()
     st.subheader("🎫 Ringkasan Rekonsiliasi BRI Tiket")
     st.caption(
-        "Periode rekonsiliasi: "
+        "Tanggal request FMSS yang terdeteksi: "
         f"**{safe_date_string(meta.get('recon_dates', []))}** | "
-        "Masa berlaku tiket: **2 jam**"
+        "Masa berlaku tiket: **2 jam** | "
+        f"Engine: **{meta.get('engine_version', BRITIKET_ENGINE_VERSION)}**"
     )
 
     if meta.get("recon_mode") == "H0":
@@ -8023,6 +8034,13 @@ def render_britiket_dashboard():
     st.metric(
         "💰 Nominal Bank Hit tetapi FMSS bermasalah",
         format_rupiah(meta.get("critical_nominal", 0))
+    )
+
+    st.caption(
+        "Auto Success breakdown: "
+        f"**{meta.get('auto_success_esb_count', 0):,} via ESB/reference** + "
+        f"**{meta.get('auto_success_description_count', 0):,} via bank-description fallback** "
+        f"= **{meta.get('auto_success_count', 0):,} transaksi**."
     )
 
     critical_statuses = {
@@ -8071,6 +8089,17 @@ def render_britiket_dashboard():
         cutoff_late = pd.DataFrame()
         coverage_review = pd.DataFrame()
         auto_success = pd.DataFrame()
+
+    rv1, rv2, rv3 = st.columns(3)
+    rv1.metric("🔎 Coverage / Data Review", f"{len(coverage_review):,} Trx")
+    rv2.metric("🏦 Bank Review", f"{len(bank_review):,} Trx")
+    rv3.metric("⚠️ Ambiguous", f"{len(ambiguous):,} Trx")
+
+    if len(coverage_review) or len(bank_review) or len(ambiguous):
+        st.warning(
+            "Critical Bank Hit/FMSS Issue boleh 0, tetapi rekonsiliasi belum boleh "
+            "dianggap sepenuhnya clean sebelum transaksi Review/Ambiguous di bawah diperiksa."
+        )
 
     def show_fmss_table(frame):
         cols = [
