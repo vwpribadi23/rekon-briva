@@ -6593,7 +6593,7 @@ def fast_match(
 #   BANK_ONLY untuk tanggal D.
 # ============================================================
 
-BRITIKET_ENGINE_VERSION = "V4-2026-10-06-SESSION-SAFE"
+BRITIKET_ENGINE_VERSION = "V5-2026-10-06-SIGNATURE-FALLBACK"
 BRITIKET_VALIDITY_MINUTES = 120
 BRITIKET_EARLY_CUTOFF_MARGIN_MINUTES = 10
 BRITIKET_LATE_REVIEW_HOURS = 24
@@ -6614,6 +6614,16 @@ BRITIKET_SOURCE_DATE_REGEX = re.compile(
     flags=re.IGNORECASE
 )
 
+# Signature transaksi BRI non-ESB, contoh:
+# 6276530132584590#000000370381#MP #TRFHMB
+# 6038443206238185#000000004234#ATM#TRFLA
+# Whitespace di antara channel/type dinormalisasi agar hasil konsisten lintas
+# versi pandas / cara CSV dibaca Streamlit.
+BRITIKET_TRANSACTION_SIGNATURE_REGEX = re.compile(
+    r"([A-Z0-9]{8,})#([A-Z0-9]{6,})#([A-Z]{2,8})\s*#([A-Z0-9]{4,16})",
+    flags=re.IGNORECASE
+)
+
 
 def _britiket_text(value):
     if value is None or pd.isna(value):
@@ -6627,6 +6637,36 @@ def extract_britiket_reference_value(value):
     if not match:
         return None
     return re.sub(r"\s+", "", match.group(0).upper())
+
+
+def extract_britiket_transaction_signature_value(value):
+    """
+    Signature kuat untuk transaksi BRI yang tidak membawa ESB.
+    Dibentuk dari token transaksi pada deskripsi bank/FMSS dan tidak bergantung
+    pada jumlah spasi, sehingga lebih stabil lintas environment.
+    """
+    text_value = _britiket_text(value)
+    match = BRITIKET_TRANSACTION_SIGNATURE_REGEX.search(text_value)
+    if not match:
+        return None
+
+    return "#".join(
+        re.sub(r"\s+", "", part.upper())
+        for part in match.groups()
+    )
+
+
+def _britiket_core_description_value(value):
+    """Pure-Python normalization; hindari perbedaan StringMethods antar pandas."""
+    if value is None or pd.isna(value):
+        return ""
+    text_value = re.sub(
+        r"\s*ESB:[A-Z0-9]+:[A-Z0-9]+:[A-Z0-9]+.*$",
+        "",
+        str(value),
+        flags=re.IGNORECASE
+    )
+    return _britiket_text(text_value)
 
 
 def britiket_reference_equivalent(left, right):
@@ -6743,6 +6783,11 @@ def prepare_britiket_fmss_dataframe(uploaded_file):
     df["FMSS_BANK_REFERENCE"] = (
         df["_FMSS_KETERANGAN"]
         .apply(extract_britiket_reference_value)
+    )
+
+    df["FMSS_BANK_SIGNATURE"] = (
+        df["_FMSS_KETERANGAN"]
+        .apply(extract_britiket_transaction_signature_value)
     )
 
     df["_FMSS_SOURCE_DATE"] = (
@@ -6920,21 +6965,23 @@ def prepare_britiket_bank_dataframe(
             .apply(extract_britiket_reference_value)
         )
 
+        # Signature non-ESB dibaca dari gabungan seluruh field deskripsi bank.
+        # Ini sengaja tidak bergantung pada satu kolom tertentu (TRREMK/DESK_TRAN).
+        out["BANK_TRANSACTION_SIGNATURE"] = (
+            reference_source
+            .apply(extract_britiket_transaction_signature_value)
+        )
+
         if col_trremk is not None:
             core_desc = df[col_trremk].fillna("").astype(str)
         else:
             core_desc = out["_DESC_VALUE"].astype(str)
 
-        # Hapus suffix ESB dari core description untuk strong text fallback.
+        # Hapus suffix ESB dengan pure-Python normalization agar konsisten pada
+        # pandas yang berbeda di local test vs Streamlit Cloud.
         out["_BANK_CORE_DESC"] = (
             core_desc
-            .str.replace(
-                r"\s*ESB:[A-Z0-9]+:[A-Z0-9]+:[A-Z0-9]+.*$",
-                "",
-                regex=True,
-                flags=re.IGNORECASE
-            )
-            .map(_britiket_text)
+            .map(_britiket_core_description_value)
         )
 
         if col_seq is not None:
@@ -7389,6 +7436,10 @@ def reconcile_britiket(fmss_file, bank_files):
     # --------------------------------------------------------
     # D. STRONG TEXT FALLBACK UNTUK CHANNEL TANPA ESB DI FMSS
     # --------------------------------------------------------
+    # Prioritas D1: signature transaksi terstruktur + nominal.
+    # Prioritas D2: containment core description + nominal (legacy V4).
+    # Keduanya tetap one-to-one dan hanya berjalan untuk FMSS yang sudah
+    # terkonfirmasi BRIFMNCORPORATE.
     for fmss_idx, row in enumerate(fmss_records):
         if fmss_idx in used_fmss:
             continue
@@ -7397,17 +7448,36 @@ def reconcile_britiket(fmss_file, bank_files):
 
         amount = int(round(float(row.get("NOMINAL_ASLI", 0) or 0)))
         fmss_text = _britiket_text(row.get("_FMSS_KETERANGAN", ""))
+        fmss_signature = row.get("FMSS_BANK_SIGNATURE")
 
         candidates = []
-        for bank_idx, bank_row in enumerate(bank_records):
-            if bank_idx in used_bank or bank_idx in blocked_bank:
-                continue
-            if int(round(float(bank_row.get("_CREDIT_NUM", 0) or 0))) != amount:
-                continue
 
-            core_desc = _britiket_text(bank_row.get("_BANK_CORE_DESC", ""))
-            if len(core_desc) >= 12 and core_desc in fmss_text:
-                candidates.append(bank_idx)
+        # D1 - deterministic signature, tidak bergantung whitespace/deskripsi panjang.
+        if fmss_signature:
+            candidates = [
+                bank_idx
+                for bank_idx, bank_row in enumerate(bank_records)
+                if bank_idx not in used_bank
+                and bank_idx not in blocked_bank
+                and int(round(float(bank_row.get("_CREDIT_NUM", 0) or 0)))
+                == amount
+                and bank_row.get("BANK_TRANSACTION_SIGNATURE")
+                == fmss_signature
+            ]
+
+        # D2 - fallback legacy jika signature tidak ditemukan di salah satu sisi.
+        if len(candidates) == 0:
+            for bank_idx, bank_row in enumerate(bank_records):
+                if bank_idx in used_bank or bank_idx in blocked_bank:
+                    continue
+                if int(round(float(bank_row.get("_CREDIT_NUM", 0) or 0))) != amount:
+                    continue
+
+                core_desc = _britiket_text(
+                    bank_row.get("_BANK_CORE_DESC", "")
+                )
+                if len(core_desc) >= 12 and core_desc in fmss_text:
+                    candidates.append(bank_idx)
 
         if len(candidates) == 1:
             bank_idx = candidates[0]
@@ -7421,6 +7491,21 @@ def reconcile_britiket(fmss_file, bank_files):
             )
             used_fmss.add(fmss_idx)
             used_bank.add(bank_idx)
+
+        elif len(candidates) > 1:
+            # Strong text/signature tetap tidak boleh memilih salah satu bank jika
+            # ternyata duplikat. Karantina agar tidak salah kredit outlet.
+            ambiguous.append(
+                _britiket_make_audit_record(
+                    row,
+                    "AMBIGUOUS_MATCH - BRI TIKET",
+                    "MULTIPLE_DESCRIPTION_SIGNATURE_MATCH",
+                    "LOW",
+                    f"Signature/deskripsi+nominal menemukan {len(candidates)} kandidat bank."
+                )
+            )
+            used_fmss.add(fmss_idx)
+            blocked_bank.update(candidates)
 
     # --------------------------------------------------------
     # D2. DUPLICATE TICKET WINDOW COLLISION GUARD
