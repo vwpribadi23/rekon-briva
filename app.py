@@ -6595,7 +6595,7 @@ def fast_match(
 #   BANK_ONLY untuk tanggal D.
 # ============================================================
 
-BRITIKET_ENGINE_VERSION = "V6-2026-10-06-DIAGNOSTIC"
+BRITIKET_ENGINE_VERSION = "V7-2026-10-07-STRONG-PREMATCH"
 BRITIKET_VALIDITY_MINUTES = 120
 
 # Fingerprint golden dataset yang dipakai untuk acceptance test 04 Oct 2026.
@@ -7429,6 +7429,85 @@ def reconcile_britiket(fmss_file, bank_files):
         blocked_bank.update(bank_candidates)
 
     # --------------------------------------------------------
+    # C0. NON-ESB SIGNATURE PRE-MATCH — BEFORE ANY ESB CONSUMPTION
+    # --------------------------------------------------------
+    # Diagnostic V6 membuktikan bahwa pada runtime Streamlit terdapat kasus
+    # signature+nominal yang unik tetapi row bank sudah tidak tersedia saat
+    # fallback D dijalankan. Untuk menghilangkan ketergantungan pada urutan
+    # konsumsi bank, strong evidence non-ESB diproses lebih dahulu.
+    #
+    # Rule konservatif:
+    # - hanya FMSS BRIFMNCORPORATE tanpa ESB,
+    # - exact nominal penuh,
+    # - exact transaction signature,
+    # - key harus 1 FMSS : 1 bank,
+    # - duplicate tidak dipaksa match.
+
+    fmss_signature_index = defaultdict(list)
+    bank_signature_index = defaultdict(list)
+
+    for fmss_idx, row in enumerate(fmss_records):
+        if fmss_idx in used_fmss:
+            continue
+        if not row.get("_BRI_CONFIRMED"):
+            continue
+        if row.get("FMSS_BANK_REFERENCE"):
+            # ESB mempunyai jalur strong match sendiri di tahap C.
+            continue
+
+        signature = row.get("FMSS_BANK_SIGNATURE")
+        if not signature:
+            continue
+
+        amount = int(round(float(row.get("NOMINAL_ASLI", 0) or 0)))
+        fmss_signature_index[(amount, str(signature))].append(fmss_idx)
+
+    for bank_idx, bank_row in enumerate(bank_records):
+        if bank_idx in used_bank or bank_idx in blocked_bank:
+            continue
+
+        signature = bank_row.get("BANK_TRANSACTION_SIGNATURE")
+        if not signature:
+            continue
+
+        amount = int(round(float(bank_row.get("_CREDIT_NUM", 0) or 0)))
+        bank_signature_index[(amount, str(signature))].append(bank_idx)
+
+    for key, fmss_indexes in fmss_signature_index.items():
+        bank_indexes = bank_signature_index.get(key, [])
+
+        if len(fmss_indexes) == 1 and len(bank_indexes) == 1:
+            fmss_idx = fmss_indexes[0]
+            bank_idx = bank_indexes[0]
+
+            results.append(
+                _britiket_pair_record(
+                    fmss_records[fmss_idx],
+                    bank_records[bank_idx],
+                    "BANK_SIGNATURE_NOMINAL_PREMATCH",
+                    "HIGH"
+                )
+            )
+            used_fmss.add(fmss_idx)
+            used_bank.add(bank_idx)
+
+        elif len(bank_indexes) > 0:
+            # Exact signature tetapi duplicate di salah satu sisi: jangan tebak.
+            for fmss_idx in fmss_indexes:
+                ambiguous.append(
+                    _britiket_make_audit_record(
+                        fmss_records[fmss_idx],
+                        "AMBIGUOUS_MATCH - BRI TIKET",
+                        "DUPLICATE_SIGNATURE_NOMINAL",
+                        "LOW",
+                        "Signature+nominal non-ESB tidak unique 1-to-1."
+                    )
+                )
+                used_fmss.add(fmss_idx)
+
+            blocked_bank.update(bank_indexes)
+
+    # --------------------------------------------------------
     # C. STRONG MATCH: REFERENCE + NOMINAL
     # --------------------------------------------------------
     for fmss_idx, row in enumerate(fmss_records):
@@ -8058,7 +8137,7 @@ def reconcile_britiket(fmss_file, bank_files):
     )
 
     # --------------------------------------------------------
-    # V6 DIAGNOSTIC — NON-ESB SYSTEM API CANDIDATES
+    # V7 DIAGNOSTIC — NON-ESB SYSTEM API CANDIDATES
     # --------------------------------------------------------
     diagnostic_rows = []
     fmss_diag_mask = (
@@ -8196,7 +8275,10 @@ def reconcile_britiket(fmss_file, bank_files):
         ) if (not result_df.empty and "MATCH_METHOD" in result_df.columns) else 0,
         "auto_success_description_count": int(
             ((result_df["STATUS_MATCH"] == "AUTO_SUCCESS")
-             & (result_df["MATCH_METHOD"] == "BANK_DESCRIPTION_NOMINAL")).sum()
+             & result_df["MATCH_METHOD"].isin({
+                 "BANK_SIGNATURE_NOMINAL_PREMATCH",
+                 "BANK_DESCRIPTION_NOMINAL"
+             })).sum()
         ) if (not result_df.empty and "MATCH_METHOD" in result_df.columns) else 0,
         "diagnostic_runtime": {
             "python_version": sys.version.split()[0],
@@ -8357,7 +8439,7 @@ def render_britiket_dashboard():
     # ========================================================
     # V6 DIAGNOSTIC — INPUT / RUNTIME / NON-ESB FALLBACK
     # ========================================================
-    with st.expander("🧪 V6 Diagnostic — Verifikasi File & Fallback", expanded=True):
+    with st.expander("🧪 V7 Diagnostic — Verifikasi File & Strong Pre-Match", expanded=True):
         runtime_diag = meta.get("diagnostic_runtime", {})
         st.caption(
             f"Runtime: Python **{runtime_diag.get('python_version', '-')}** | "
@@ -8425,7 +8507,10 @@ def render_britiket_dashboard():
                 non_esb_diag.get(
                     "RESULT_METHOD",
                     pd.Series(dtype="object")
-                ).astype(str).eq("BANK_DESCRIPTION_NOMINAL").sum()
+                ).astype(str).isin({
+                    "BANK_SIGNATURE_NOMINAL_PREMATCH",
+                    "BANK_DESCRIPTION_NOMINAL"
+                }).sum()
             )
 
             st.caption(
@@ -8437,7 +8522,7 @@ def render_britiket_dashboard():
             if expected_signature_matches > actual_description_matches:
                 st.error(
                     "🚨 Runtime menemukan kandidat signature yang seharusnya aman, tetapi "
-                    "tidak semuanya masuk `BANK_DESCRIPTION_NOMINAL`. Screenshot tabel ini "
+                    "tidak semuanya masuk strong non-ESB fallback. Screenshot tabel ini "
                     "cukup untuk menentukan titik logic berikutnya tanpa menebak file."
                 )
         else:
