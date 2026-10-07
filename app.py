@@ -6595,7 +6595,7 @@ def fast_match(
 #   BANK_ONLY untuk tanggal D.
 # ============================================================
 
-BRITIKET_ENGINE_VERSION = "V7-2026-10-07-STRONG-PREMATCH"
+BRITIKET_ENGINE_VERSION = "V8-2026-10-07-PANDAS3-NA-SAFE"
 BRITIKET_VALIDITY_MINUTES = 120
 
 # Fingerprint golden dataset yang dipakai untuk acceptance test 04 Oct 2026.
@@ -6638,8 +6638,23 @@ BRITIKET_TRANSACTION_SIGNATURE_REGEX = re.compile(
 )
 
 
+def _britiket_has_value(value):
+    """NA-safe presence check; compatible dengan pandas 2.x dan 3.x."""
+    if value is None:
+        return False
+    try:
+        if pd.isna(value):
+            return False
+    except (TypeError, ValueError):
+        pass
+    text_value = str(value).strip()
+    if text_value == "":
+        return False
+    return text_value.upper() not in {"NAN", "NONE", "<NA>", "NAT"}
+
+
 def _britiket_text(value):
-    if value is None or pd.isna(value):
+    if not _britiket_has_value(value):
         return ""
     return re.sub(r"\s+", " ", str(value)).strip().upper()
 
@@ -6683,7 +6698,7 @@ def _britiket_core_description_value(value):
 
 
 def britiket_reference_equivalent(left, right):
-    if not left or not right:
+    if not _britiket_has_value(left) or not _britiket_has_value(right):
         return False
     a = re.sub(r"\s+", "", str(left).upper())
     b = re.sub(r"\s+", "", str(right).upper())
@@ -6797,12 +6812,22 @@ def prepare_britiket_fmss_dataframe(uploaded_file):
     df["FMSS_BANK_REFERENCE"] = (
         df["_FMSS_KETERANGAN"]
         .apply(extract_britiket_reference_value)
+        .astype("object")
     )
+    df.loc[
+        ~df["FMSS_BANK_REFERENCE"].map(_britiket_has_value),
+        "FMSS_BANK_REFERENCE"
+    ] = None
 
     df["FMSS_BANK_SIGNATURE"] = (
         df["_FMSS_KETERANGAN"]
         .apply(extract_britiket_transaction_signature_value)
+        .astype("object")
     )
+    df.loc[
+        ~df["FMSS_BANK_SIGNATURE"].map(_britiket_has_value),
+        "FMSS_BANK_SIGNATURE"
+    ] = None
 
     df["_FMSS_SOURCE_DATE"] = (
         df["_FMSS_KETERANGAN"]
@@ -6998,14 +7023,24 @@ def prepare_britiket_bank_dataframe(
         out["BANK_REFERENCE"] = (
             reference_source
             .apply(extract_britiket_reference_value)
+            .astype("object")
         )
+        out.loc[
+            ~out["BANK_REFERENCE"].map(_britiket_has_value),
+            "BANK_REFERENCE"
+        ] = None
 
         # Signature non-ESB dibaca dari gabungan seluruh field deskripsi bank.
         # Ini sengaja tidak bergantung pada satu kolom tertentu (TRREMK/DESK_TRAN).
         out["BANK_TRANSACTION_SIGNATURE"] = (
             reference_source
             .apply(extract_britiket_transaction_signature_value)
+            .astype("object")
         )
+        out.loc[
+            ~out["BANK_TRANSACTION_SIGNATURE"].map(_britiket_has_value),
+            "BANK_TRANSACTION_SIGNATURE"
+        ] = None
 
         if col_trremk is not None:
             core_desc = df[col_trremk].fillna("").astype(str)
@@ -7395,7 +7430,7 @@ def reconcile_britiket(fmss_file, bank_files):
         if not row.get("_BRI_CONFIRMED"):
             continue
         reference = row.get("FMSS_BANK_REFERENCE")
-        if reference:
+        if _britiket_has_value(reference):
             reference_groups[str(reference)].append(fmss_idx)
 
     for reference, indexes in reference_groups.items():
@@ -7451,12 +7486,12 @@ def reconcile_britiket(fmss_file, bank_files):
             continue
         if not row.get("_BRI_CONFIRMED"):
             continue
-        if row.get("FMSS_BANK_REFERENCE"):
+        if _britiket_has_value(row.get("FMSS_BANK_REFERENCE")):
             # ESB mempunyai jalur strong match sendiri di tahap C.
             continue
 
         signature = row.get("FMSS_BANK_SIGNATURE")
-        if not signature:
+        if not _britiket_has_value(signature):
             continue
 
         amount = int(round(float(row.get("NOMINAL_ASLI", 0) or 0)))
@@ -7467,7 +7502,7 @@ def reconcile_britiket(fmss_file, bank_files):
             continue
 
         signature = bank_row.get("BANK_TRANSACTION_SIGNATURE")
-        if not signature:
+        if not _britiket_has_value(signature):
             continue
 
         amount = int(round(float(bank_row.get("_CREDIT_NUM", 0) or 0)))
@@ -7517,7 +7552,7 @@ def reconcile_britiket(fmss_file, bank_files):
             continue
 
         reference = row.get("FMSS_BANK_REFERENCE")
-        if not reference:
+        if not _britiket_has_value(reference):
             continue
 
         amount = int(round(float(row.get("NOMINAL_ASLI", 0) or 0)))
@@ -8144,7 +8179,7 @@ def reconcile_britiket(fmss_file, bank_files):
         fmss["_BRI_CONFIRMED"].fillna(False)
         & fmss["_FMSS_STATUS"].astype(str).eq("SUKSES")
         & fmss["_FMSS_USER"].astype(str).str.strip().str.lower().eq("system api")
-        & fmss["FMSS_BANK_REFERENCE"].isna()
+        & (~fmss["FMSS_BANK_REFERENCE"].map(_britiket_has_value))
     )
 
     for _, frow in fmss.loc[fmss_diag_mask].iterrows():
@@ -8439,7 +8474,7 @@ def render_britiket_dashboard():
     # ========================================================
     # V6 DIAGNOSTIC — INPUT / RUNTIME / NON-ESB FALLBACK
     # ========================================================
-    with st.expander("🧪 V7 Diagnostic — Verifikasi File & Strong Pre-Match", expanded=True):
+    with st.expander("🧪 V8 Diagnostic — Pandas 3 NA-Safe & Strong Pre-Match", expanded=True):
         runtime_diag = meta.get("diagnostic_runtime", {})
         st.caption(
             f"Runtime: Python **{runtime_diag.get('python_version', '-')}** | "
