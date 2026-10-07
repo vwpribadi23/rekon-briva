@@ -6595,7 +6595,8 @@ def fast_match(
 #   BANK_ONLY untuk tanggal D.
 # ============================================================
 
-BRITIKET_ENGINE_VERSION = "V8-2026-10-07-PANDAS3-NA-SAFE"
+BRITIKET_ENGINE_VERSION = "BRITIKET-PROD-2026-10-07"
+SHOW_BRITIKET_DEBUG = False
 BRITIKET_VALIDITY_MINUTES = 120
 
 # Fingerprint golden dataset yang dipakai untuk acceptance test 04 Oct 2026.
@@ -8340,79 +8341,15 @@ def reconcile_britiket(fmss_file, bank_files):
 
 
 def render_britiket_dashboard():
-    """Dedicated UI BRI Tiket. Existing dashboard VA tidak disentuh."""
+    """Production UI BRI Tiket. Matching engine dan engine VA lain tidak disentuh."""
     results = st.session_state.df_britiket_results
     bank_review = st.session_state.df_britiket_bank_review
     ambiguous = st.session_state.df_britiket_ambiguous
     meta = st.session_state.britiket_meta
 
-    st.divider()
-    st.subheader("🎫 Ringkasan Rekonsiliasi BRI Tiket")
-    # Jangan pernah menampilkan versi engine CURRENT untuk hasil session lama.
-    # Jika meta tidak menyimpan engine_version, hasil tersebut dianggap legacy/stale.
-    rendered_engine_version = (
-        meta.get("engine_version")
-        if isinstance(meta, dict)
-        else None
-    )
-    if not rendered_engine_version:
-        rendered_engine_version = "LEGACY/STALE RESULT"
-
-    st.caption(
-        "Tanggal request FMSS yang terdeteksi: "
-        f"**{safe_date_string(meta.get('recon_dates', []))}** | "
-        "Masa berlaku tiket: **2 jam** | "
-        f"Engine hasil: **{rendered_engine_version}**"
-    )
-
-    if meta.get("recon_mode") == "H0":
-        st.info(
-            "🟦 **Mode H0 / Intraday.** Hasil mengikuti snapshot FMSS dan mutasi "
-            "BRI yang di-upload. Mutasi yang lebih baru daripada snapshot FMSS "
-            "ditahan sebagai Pending FMSS Snapshot, bukan langsung dianggap issue."
-        )
-
-    coverage_dates = meta.get("bank_coverage_dates", [])
-    if coverage_dates:
-        st.caption(
-            "Coverage tanggal mutasi BRI yang terbaca: **"
-            + ", ".join(
-                pd.Timestamp(value).strftime("%d/%m/%Y")
-                for value in coverage_dates
-            )
-            + "**"
-        )
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric(
-        "✅ Auto Success",
-        f"{meta.get('auto_success_count', 0):,} Trx"
-    )
-    m2.metric(
-        "🛠️ Manual Recovered",
-        f"{meta.get('manual_recovered_count', 0):,} Trx"
-    )
-    m3.metric(
-        "🚨 Bank Hit / FMSS Issue",
-        f"{meta.get('critical_count', 0):,} Trx"
-    )
-    m4.metric(
-        "🟠 Cutoff / Late",
-        f"{meta.get('cutoff_late_count', 0):,} Trx"
-    )
-
-    st.metric(
-        "💰 Nominal Bank Hit tetapi FMSS bermasalah",
-        format_rupiah(meta.get("critical_nominal", 0))
-    )
-
-    st.caption(
-        "Auto Success breakdown: "
-        f"**{meta.get('auto_success_esb_count', 0):,} via ESB/reference** + "
-        f"**{meta.get('auto_success_description_count', 0):,} via bank-description fallback** "
-        f"= **{meta.get('auto_success_count', 0):,} transaksi**."
-    )
-
+    # ========================================================
+    # PREPARE GROUPS
+    # ========================================================
     critical_statuses = {
         "BANK_HIT_FMSS_PENDING",
         "BANK_HIT_FMSS_EXPIRED",
@@ -8460,111 +8397,122 @@ def render_britiket_dashboard():
         coverage_review = pd.DataFrame()
         auto_success = pd.DataFrame()
 
-    rv1, rv2, rv3 = st.columns(3)
-    rv1.metric("🔎 Coverage / Data Review", f"{len(coverage_review):,} Trx")
-    rv2.metric("🏦 Bank Review", f"{len(bank_review):,} Trx")
-    rv3.metric("⚠️ Ambiguous", f"{len(ambiguous):,} Trx")
-
-    if len(coverage_review) or len(bank_review) or len(ambiguous):
-        st.warning(
-            "Critical Bank Hit/FMSS Issue boleh 0, tetapi rekonsiliasi belum boleh "
-            "dianggap sepenuhnya clean sebelum transaksi Review/Ambiguous di bawah diperiksa."
-        )
-
     # ========================================================
-    # V6 DIAGNOSTIC — INPUT / RUNTIME / NON-ESB FALLBACK
+    # HEADER PRODUKSI
     # ========================================================
-    with st.expander("🧪 V8 Diagnostic — Pandas 3 NA-Safe & Strong Pre-Match", expanded=True):
-        runtime_diag = meta.get("diagnostic_runtime", {})
+    st.divider()
+    st.subheader("🎫 Rekonsiliasi BRI Tiket")
+
+    st.caption(
+        "Periode request FMSS: "
+        f"**{safe_date_string(meta.get('recon_dates', []))}** | "
+        "Masa berlaku tiket: **2 jam**"
+    )
+
+    coverage_dates = meta.get("bank_coverage_dates", [])
+    if coverage_dates:
         st.caption(
-            f"Runtime: Python **{runtime_diag.get('python_version', '-')}** | "
-            f"pandas **{runtime_diag.get('pandas_version', '-')}**"
+            "Coverage mutasi BRI: **"
+            + ", ".join(
+                pd.Timestamp(value).strftime("%d/%m/%Y")
+                for value in coverage_dates
+            )
+            + "**"
         )
 
-        exact_dataset = bool(meta.get("diagnostic_acceptance_dataset_match", False))
-        if exact_dataset:
-            st.success(
-                "✅ File yang dibaca Streamlit **byte-for-byte sama** dengan golden dataset "
-                "04 Oktober yang dipakai untuk regression test (hash + jumlah row cocok)."
-            )
-        else:
-            st.warning(
-                "⚠️ File yang dibaca Streamlit **tidak identik** dengan golden dataset "
-                "04 Oktober yang dipakai untuk regression test, atau salah satu fingerprint/row count berbeda."
-            )
-
-        fmss_diag = meta.get("diagnostic_fmss_input", {})
-        bank_diag = meta.get("diagnostic_bank_sources", [])
-
-        input_rows = [{
-            "TYPE": "FMSS",
-            "FILE": fmss_diag.get("file_name", ""),
-            "SIZE_BYTES": fmss_diag.get("size_bytes", 0),
-            "SHA256": fmss_diag.get("sha256", ""),
-            "RAW_ROWS": meta.get("fmss_total_rows", 0),
-            "GOLDEN_MATCH": bool(meta.get("diagnostic_acceptance_fmss_match", False)),
-        }]
-        for item in bank_diag:
-            input_rows.append({
-                "TYPE": "BRI",
-                "FILE": item.get("file_name", ""),
-                "SIZE_BYTES": item.get("size_bytes", 0),
-                "SHA256": item.get("sha256", ""),
-                "RAW_ROWS": item.get("raw_rows", 0),
-                "GOLDEN_MATCH": bool(
-                    item.get("sha256") == BRITIKET_ACCEPTANCE_BANK_SHA256
-                    and int(item.get("raw_rows", -1)) == BRITIKET_ACCEPTANCE_BANK_ROWS
-                ),
-            })
-
-        st.dataframe(
-            pd.DataFrame(input_rows),
-            use_container_width=True,
-            hide_index=True
+    if meta.get("recon_mode") == "H0":
+        st.info(
+            "🟦 **Mode H0 / Intraday.** Hasil mengikuti snapshot FMSS dan mutasi "
+            "BRI yang di-upload. Data yang belum tercakup snapshot bank tidak langsung "
+            "dianggap sebagai issue."
         )
 
-        non_esb_diag = meta.get("diagnostic_non_esb", pd.DataFrame())
-        if isinstance(non_esb_diag, pd.DataFrame) and not non_esb_diag.empty:
-            st.markdown("**Diagnostic transaksi `Sukses + system api + BRIFMNCORPORATE` tanpa ESB:**")
-            st.dataframe(
-                non_esb_diag,
-                use_container_width=True,
-                hide_index=True
-            )
+    # ========================================================
+    # STATUS REKONSILIASI
+    # ========================================================
+    critical_count = int(meta.get("critical_count", 0))
+    critical_nominal = float(meta.get("critical_nominal", 0) or 0)
+    ambiguous_count = int(len(ambiguous))
+    review_count = int(
+        len(cutoff_late)
+        + len(coverage_review)
+        + len(bank_review)
+    )
 
-            expected_signature_matches = int(
-                pd.to_numeric(
-                    non_esb_diag.get("BANK_SIGNATURE_MATCHES", 0),
-                    errors="coerce"
-                ).fillna(0).eq(1).sum()
-            )
-            actual_description_matches = int(
-                non_esb_diag.get(
-                    "RESULT_METHOD",
-                    pd.Series(dtype="object")
-                ).astype(str).isin({
-                    "BANK_SIGNATURE_NOMINAL_PREMATCH",
-                    "BANK_DESCRIPTION_NOMINAL"
-                }).sum()
-            )
+    if critical_count > 0:
+        st.error(
+            "🚨 **Perlu tindakan CS.** Ditemukan transaksi yang sudah masuk BRI "
+            "tetapi FMSS belum normal. Prioritaskan tabel Bank Hit / FMSS Issue di bawah."
+        )
+    elif ambiguous_count > 0:
+        st.warning(
+            "⚠️ **Tidak ada critical bank-hit yang terkonfirmasi, tetapi ada transaksi ambiguous.** "
+            "Jangan lakukan atribusi outlet sebelum review manual selesai."
+        )
+    elif review_count > 0:
+        st.warning(
+            "🟡 **Tidak ada critical Bank Hit / FMSS Issue.** Namun masih ada transaksi "
+            "review yang perlu diperiksa sebelum rekonsiliasi dinyatakan clean."
+        )
+    else:
+        st.success(
+            "✅ **Rekonsiliasi clean.** Tidak ditemukan critical issue, ambiguous, "
+            "cutoff/late, coverage review, maupun bank review."
+        )
 
-            st.caption(
-                "Diagnostic check: "
-                f"**{expected_signature_matches} row** mempunyai tepat 1 signature bank+nominal; "
-                f"**{actual_description_matches} row** benar-benar masuk fallback pada hasil engine."
-            )
+    # ========================================================
+    # 1. PERLU TINDAKAN CS
+    # ========================================================
+    st.markdown("### 🚨 Perlu Tindakan CS")
+    a1, a2, a3 = st.columns(3)
+    a1.metric(
+        "Bank Hit / FMSS Issue",
+        f"{critical_count:,} Trx"
+    )
+    a2.metric(
+        "Nominal Terdampak",
+        format_rupiah(critical_nominal)
+    )
+    a3.metric(
+        "Ambiguous",
+        f"{ambiguous_count:,} Trx"
+    )
 
-            if expected_signature_matches > actual_description_matches:
-                st.error(
-                    "🚨 Runtime menemukan kandidat signature yang seharusnya aman, tetapi "
-                    "tidak semuanya masuk strong non-ESB fallback. Screenshot tabel ini "
-                    "cukup untuk menentukan titik logic berikutnya tanpa menebak file."
-                )
-        else:
-            st.info(
-                "Tidak ditemukan transaksi system-api BRIFMNCORPORATE tanpa ESB pada file FMSS ini."
-            )
+    # ========================================================
+    # 2. PERLU REVIEW
+    # ========================================================
+    st.markdown("### ⚠️ Perlu Review")
+    r1, r2, r3 = st.columns(3)
+    r1.metric(
+        "Cutoff / Late",
+        f"{len(cutoff_late):,} Trx"
+    )
+    r2.metric(
+        "Coverage / Data Review",
+        f"{len(coverage_review):,} Trx"
+    )
+    r3.metric(
+        "Bank Review",
+        f"{len(bank_review):,} Trx"
+    )
 
+    # ========================================================
+    # 3. SUDAH SELESAI
+    # ========================================================
+    st.markdown("### ✅ Sudah Selesai")
+    s1, s2 = st.columns(2)
+    s1.metric(
+        "Auto Success",
+        f"{meta.get('auto_success_count', 0):,} Trx"
+    )
+    s2.metric(
+        "Sudah Direcovery Manual",
+        f"{meta.get('manual_recovered_count', 0):,} Trx"
+    )
+
+    # ========================================================
+    # TABLE HELPERS
+    # ========================================================
     def show_fmss_table(frame):
         cols = [
             col
@@ -8594,16 +8542,31 @@ def render_britiket_dashboard():
             hide_index=True
         )
 
+    # ========================================================
+    # ACTION TABLES — URUT BERDASARKAN PRIORITAS OPERASIONAL
+    # ========================================================
     st.divider()
-    st.subheader("🚨 Prioritas CS — Bank Sudah Hit, FMSS Belum Normal")
+    st.subheader("📋 Detail Tindak Lanjut")
+
     if not critical.empty:
         st.error(
-            f"Ditemukan **{len(critical):,} transaksi** di mana uang sudah masuk BRI "
-            "dalam lifecycle tiket tetapi FMSS masih Pending/Gagal/Expired."
+            f"**Prioritas utama: {len(critical):,} transaksi.** Uang sudah masuk BRI "
+            "dalam lifecycle tiket, tetapi FMSS masih Pending/Gagal/Expired."
         )
         show_fmss_table(critical)
     else:
-        st.success("Tidak ada Bank Hit / FMSS Issue yang terkonfirmasi pada data ini.")
+        st.success("Tidak ada transaksi Bank Hit / FMSS Issue yang terkonfirmasi.")
+
+    if not ambiguous.empty:
+        with st.expander(
+            f"⚠️ Ambiguous — wajib review manual ({len(ambiguous):,})",
+            expanded=True
+        ):
+            st.caption(
+                "Engine sengaja tidak memilih outlet ketika kandidat tidak dapat "
+                "dibuktikan secara aman. Jangan melakukan auto-attribution pada transaksi ini."
+            )
+            show_fmss_table(ambiguous)
 
     if not cutoff_late.empty:
         with st.expander(
@@ -8611,38 +8574,31 @@ def render_britiket_dashboard():
             expanded=False
         ):
             st.caption(
-                "POST_CUTOFF_TRANSFER berarti FMSS menutup tiket lebih awal daripada "
-                "window 2 jam dan uang masuk setelah effective close tersebut. "
-                "LATE_TRANSFER_REVIEW berarti transfer ditemukan setelah >2 jam."
+                "POST_CUTOFF_TRANSFER = uang masuk setelah effective close tiket. "
+                "LATE_TRANSFER_REVIEW = transfer ditemukan setelah masa berlaku 2 jam."
             )
             show_fmss_table(cutoff_late)
-
-    if not manual.empty:
-        with st.expander(
-            f"🛠️ Manual Recovered ({len(manual):,})",
-            expanded=False
-        ):
-            show_fmss_table(manual)
 
     if not coverage_review.empty:
         with st.expander(
             f"🔎 Coverage / Data Review ({len(coverage_review):,})",
             expanded=False
         ):
+            st.caption(
+                "Periksa kelengkapan coverage mutasi, carryover, duplicate reference, "
+                "atau anomali waktu sebelum menutup rekonsiliasi."
+            )
             show_fmss_table(coverage_review)
-
-    if not ambiguous.empty:
-        with st.expander(
-            f"⚠️ Ambiguous Match ({len(ambiguous):,})",
-            expanded=False
-        ):
-            show_fmss_table(ambiguous)
 
     if not bank_review.empty:
         with st.expander(
-            f"🏦 Bank Only / Pending Snapshot Review ({len(bank_review):,})",
+            f"🏦 Bank Review ({len(bank_review):,})",
             expanded=False
         ):
+            st.caption(
+                "Ada kredit BRI yang belum menemukan pasangan FMSS yang aman. "
+                "Review apakah transaksi non-ticket, carryover, atau perlu investigasi lebih lanjut."
+            )
             bank_cols = [
                 col
                 for col in [
@@ -8666,6 +8622,23 @@ def render_britiket_dashboard():
                 hide_index=True
             )
 
+    # ========================================================
+    # AUDIT / RESOLVED TABLES — BUKAN PRIORITAS HARIAN
+    # ========================================================
+    st.divider()
+    st.subheader("✅ Transaksi Selesai / Audit")
+
+    if not manual.empty:
+        with st.expander(
+            f"✅ Sudah Direcovery Manual ({len(manual):,})",
+            expanded=False
+        ):
+            st.caption(
+                "Transaksi sudah selesai, tetapi bukan melalui auto-process normal. "
+                "Bagian ini untuk audit proses, bukan antrean tindakan utama CS."
+            )
+            show_fmss_table(manual)
+
     if not auto_success.empty:
         with st.expander(
             f"✅ Auto Success Normal ({len(auto_success):,})",
@@ -8673,9 +8646,53 @@ def render_britiket_dashboard():
         ):
             show_fmss_table(auto_success)
 
-    # --------------------------------------------------------
+    # ========================================================
+    # INFO TEKNIS — DEFAULT OFF DI PRODUCTION
+    # ========================================================
+    if SHOW_BRITIKET_DEBUG:
+        with st.expander("🧪 Info Teknis BRI Tiket", expanded=False):
+            runtime_diag = meta.get("diagnostic_runtime", {})
+            st.caption(
+                f"Engine internal: **{meta.get('engine_version', '-')}** | "
+                f"Python **{runtime_diag.get('python_version', '-')}** | "
+                f"pandas **{runtime_diag.get('pandas_version', '-')}**"
+            )
+
+            fmss_diag = meta.get("diagnostic_fmss_input", {})
+            bank_diag = meta.get("diagnostic_bank_sources", [])
+            input_rows = [{
+                "TYPE": "FMSS",
+                "FILE": fmss_diag.get("file_name", ""),
+                "SIZE_BYTES": fmss_diag.get("size_bytes", 0),
+                "SHA256": fmss_diag.get("sha256", ""),
+                "RAW_ROWS": meta.get("fmss_total_rows", 0),
+            }]
+            for item in bank_diag:
+                input_rows.append({
+                    "TYPE": "BRI",
+                    "FILE": item.get("file_name", ""),
+                    "SIZE_BYTES": item.get("size_bytes", 0),
+                    "SHA256": item.get("sha256", ""),
+                    "RAW_ROWS": item.get("raw_rows", 0),
+                })
+
+            st.dataframe(
+                pd.DataFrame(input_rows),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            non_esb_diag = meta.get("diagnostic_non_esb", pd.DataFrame())
+            if isinstance(non_esb_diag, pd.DataFrame) and not non_esb_diag.empty:
+                st.dataframe(
+                    non_esb_diag,
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+    # ========================================================
     # EXPORT KHUSUS BRI TIKET
-    # --------------------------------------------------------
+    # ========================================================
     st.divider()
     st.subheader("📥 Export Laporan BRI Tiket")
 
@@ -8684,11 +8701,15 @@ def render_britiket_dashboard():
         status_counts = meta.get("status_counts", {})
         summary_rows = [
             ("Mode Rekonsiliasi", meta.get("recon_mode", "")),
+            ("Engine Internal", meta.get("engine_version", "")),
             ("Auto Success", meta.get("auto_success_count", 0)),
+            ("Auto Success - ESB/Reference", meta.get("auto_success_esb_count", 0)),
+            ("Auto Success - Description/Signature", meta.get("auto_success_description_count", 0)),
             ("Manual Recovered", meta.get("manual_recovered_count", 0)),
             ("Critical Bank Hit / FMSS Issue", meta.get("critical_count", 0)),
             ("Critical Nominal", meta.get("critical_nominal", 0)),
             ("Cutoff / Late", meta.get("cutoff_late_count", 0)),
+            ("Coverage / Data Review", len(coverage_review)),
             ("Bank Review", meta.get("bank_review_count", 0)),
             ("Ambiguous", meta.get("ambiguous_count", 0)),
             ("FMSS Snapshot", str(meta.get("fmss_snapshot", ""))),
@@ -8870,10 +8891,9 @@ if pilihan_bank == "BRI TIKET":
         st.session_state.britiket_meta = {}
 
         st.warning(
-            "♻️ **Hasil BRI Tiket dari engine lama sudah di-reset otomatis.** "
-            f"Engine aktif sekarang: **{BRITIKET_ENGINE_VERSION}**. "
-            "File upload boleh tetap digunakan; klik **Proses Rekonsiliasi** "
-            "kembali agar seluruh angka dihitung ulang oleh engine terbaru."
+            "♻️ **Hasil BRI Tiket sebelumnya sudah di-reset otomatis setelah pembaruan sistem.** "
+            "File upload boleh tetap digunakan; klik **Proses Rekonsiliasi** kembali "
+            "agar seluruh angka dihitung ulang."
         )
 
 
