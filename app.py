@@ -4,6 +4,8 @@ import re
 import io
 import csv
 import statistics
+import hashlib
+import sys
 from functools import lru_cache
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
@@ -6593,8 +6595,19 @@ def fast_match(
 #   BANK_ONLY untuk tanggal D.
 # ============================================================
 
-BRITIKET_ENGINE_VERSION = "V5-2026-10-06-SIGNATURE-FALLBACK"
+BRITIKET_ENGINE_VERSION = "V6-2026-10-06-DIAGNOSTIC"
 BRITIKET_VALIDITY_MINUTES = 120
+
+# Fingerprint golden dataset yang dipakai untuk acceptance test 04 Oct 2026.
+# Hanya untuk diagnostic; tidak memengaruhi matching/classification.
+BRITIKET_ACCEPTANCE_FMSS_SHA256 = (
+    "0ef8f749d95186f7441c3f2b869690b2b15cae2569894e7d95a888092d7f3058"
+)
+BRITIKET_ACCEPTANCE_BANK_SHA256 = (
+    "99c5f478525459398b35211a6a6d82abcd665b72e68e7e86d787da1823ef4b59"
+)
+BRITIKET_ACCEPTANCE_FMSS_ROWS = 3443
+BRITIKET_ACCEPTANCE_BANK_ROWS = 4697
 BRITIKET_EARLY_CUTOFF_MARGIN_MINUTES = 10
 BRITIKET_LATE_REVIEW_HOURS = 24
 
@@ -6718,6 +6731,7 @@ def extract_britiket_source_date_value(description_value):
 def prepare_britiket_fmss_dataframe(uploaded_file):
     """Load SEMUA status FMSS untuk BRI Tiket; tidak memakai filter SUKSES global."""
     df = read_uploaded_file(uploaded_file).copy()
+    df["_BRITIKET_FMSS_SOURCE_ROW"] = range(1, len(df) + 1)
 
     col_status = find_column(df, ["status", "STATUS"])
     col_nominal = find_column(df, ["nominal", "NOMINAL", "amount", "AMOUNT"])
@@ -6872,6 +6886,16 @@ def _britiket_read_uploaded_bytes(uploaded_file):
     return raw
 
 
+def _britiket_upload_fingerprint(uploaded_file):
+    """Fingerprint byte-level untuk membuktikan file yang benar-benar dibaca runtime."""
+    raw = _britiket_read_uploaded_bytes(uploaded_file)
+    return {
+        "file_name": str(getattr(uploaded_file, "name", "")),
+        "size_bytes": int(len(raw)),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
 def prepare_britiket_bank_dataframe(
     uploaded_files,
     recon_dates,
@@ -6899,6 +6923,7 @@ def prepare_britiket_bank_dataframe(
     seen_signatures = set()
     snapshot_candidates = []
     source_files = []
+    source_diagnostics = []
 
     for source_id, uploaded_file in enumerate(uploaded_files, start=1):
         raw = _britiket_read_uploaded_bytes(uploaded_file)
@@ -6923,6 +6948,16 @@ def prepare_britiket_bank_dataframe(
             snapshot_candidates.append(pd.Timestamp(snapshot_dt))
 
         df = read_uploaded_file(uploaded_file).copy()
+        source_diagnostics.append({
+            "file_name": source_name,
+            "size_bytes": int(len(raw)),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "raw_rows": int(len(df)),
+            "raw_columns": int(len(df.columns)),
+            "has_TRREMK": bool(any(str(c).strip().upper() == "TRREMK" for c in df.columns)),
+            "has_TLBDS1": bool(any(str(c).strip().upper() == "TLBDS1" for c in df.columns)),
+            "has_TLBDS2": bool(any(str(c).strip().upper() == "TLBDS2" for c in df.columns)),
+        })
 
         col_date = find_column(
             df,
@@ -7047,6 +7082,7 @@ def prepare_britiket_bank_dataframe(
 
     bank.attrs["britiket_bank_meta"] = {
         "source_files": source_files,
+        "source_diagnostics": source_diagnostics,
         "coverage_dates": coverage_dates,
         "snapshot_verified": bool(snapshot_candidates),
         "snapshot_datetime": (
@@ -7268,6 +7304,18 @@ def _britiket_make_audit_record(row, status, method, confidence, note=""):
 
 def reconcile_britiket(fmss_file, bank_files):
     """Main BRI Tiket reconciliation. Return all FMSS-oriented results + bank review."""
+    fmss_input_diag = _britiket_upload_fingerprint(fmss_file)
+    normalized_bank_files = (
+        list(bank_files)
+        if isinstance(bank_files, (list, tuple))
+        else [bank_files]
+    )
+    normalized_bank_files = [item for item in normalized_bank_files if item is not None]
+    bank_input_fingerprints = [
+        _britiket_upload_fingerprint(item)
+        for item in normalized_bank_files
+    ]
+
     fmss = prepare_britiket_fmss_dataframe(fmss_file)
 
     valid_request_dates = (
@@ -8009,6 +8057,103 @@ def reconcile_britiket(fmss_file, bank_files):
         else pd.Series(dtype=bool)
     )
 
+    # --------------------------------------------------------
+    # V6 DIAGNOSTIC — NON-ESB SYSTEM API CANDIDATES
+    # --------------------------------------------------------
+    diagnostic_rows = []
+    fmss_diag_mask = (
+        fmss["_BRI_CONFIRMED"].fillna(False)
+        & fmss["_FMSS_STATUS"].astype(str).eq("SUKSES")
+        & fmss["_FMSS_USER"].astype(str).str.strip().str.lower().eq("system api")
+        & fmss["FMSS_BANK_REFERENCE"].isna()
+    )
+
+    for _, frow in fmss.loc[fmss_diag_mask].iterrows():
+        source_row = int(frow.get("_BRITIKET_FMSS_SOURCE_ROW", 0) or 0)
+        amount = int(round(float(frow.get("NOMINAL_ASLI", 0) or 0)))
+        fmss_signature = frow.get("FMSS_BANK_SIGNATURE")
+        fmss_text = _britiket_text(frow.get("_FMSS_KETERANGAN", ""))
+
+        amount_candidates = bank[
+            pd.to_numeric(bank["_CREDIT_NUM"], errors="coerce")
+            .fillna(0).round().astype("int64").eq(amount)
+        ].copy()
+
+        if fmss_signature:
+            signature_candidates = amount_candidates[
+                amount_candidates["BANK_TRANSACTION_SIGNATURE"]
+                .fillna("").astype(str).eq(str(fmss_signature))
+            ].copy()
+        else:
+            signature_candidates = amount_candidates.iloc[0:0].copy()
+
+        description_candidate_indexes = []
+        for bidx, brow in amount_candidates.iterrows():
+            core_desc = _britiket_text(brow.get("_BANK_CORE_DESC", ""))
+            if len(core_desc) >= 12 and core_desc in fmss_text:
+                description_candidate_indexes.append(bidx)
+        description_candidates = amount_candidates.loc[description_candidate_indexes].copy()
+
+        result_match = result_df[
+            pd.to_numeric(
+                result_df.get(
+                    "_BRITIKET_FMSS_SOURCE_ROW",
+                    pd.Series(index=result_df.index, dtype="float64")
+                ),
+                errors="coerce"
+            ).eq(source_row)
+        ] if not result_df.empty else pd.DataFrame()
+
+        result_status = (
+            str(result_match.iloc[0].get("STATUS_MATCH", ""))
+            if not result_match.empty else "NOT_IN_RESULT"
+        )
+        result_method = (
+            str(result_match.iloc[0].get("MATCH_METHOD", ""))
+            if not result_match.empty else ""
+        )
+
+        best_bank = (
+            signature_candidates.iloc[0]
+            if len(signature_candidates) == 1
+            else description_candidates.iloc[0]
+            if len(description_candidates) == 1
+            else amount_candidates.iloc[0]
+            if len(amount_candidates) == 1
+            else None
+        )
+
+        diagnostic_rows.append({
+            "FMSS_SOURCE_ROW": source_row,
+            "ID_DEPOSIT": frow.get("id_deposit", ""),
+            "ID_OUTLET": frow.get("id_outlet", ""),
+            "NOMINAL": amount,
+            "REQUEST_DT": frow.get("_FMSS_REQUEST_DT"),
+            "FMSS_SIGNATURE": fmss_signature or "",
+            "BANK_AMOUNT_CANDIDATES": int(len(amount_candidates)),
+            "BANK_SIGNATURE_MATCHES": int(len(signature_candidates)),
+            "BANK_DESCRIPTION_MATCHES": int(len(description_candidates)),
+            "BANK_MATCH_DT": (best_bank.get("_TANGGAL_DT") if best_bank is not None else pd.NaT),
+            "BANK_SOURCE_ROW": (best_bank.get("SOURCE_ROW") if best_bank is not None else None),
+            "BANK_SIGNATURE": (best_bank.get("BANK_TRANSACTION_SIGNATURE", "") if best_bank is not None else ""),
+            "RESULT_STATUS": result_status,
+            "RESULT_METHOD": result_method,
+        })
+
+    non_esb_diagnostic_df = pd.DataFrame(diagnostic_rows)
+
+    fmss_acceptance_match = (
+        fmss_input_diag.get("sha256") == BRITIKET_ACCEPTANCE_FMSS_SHA256
+        and int(len(fmss)) == BRITIKET_ACCEPTANCE_FMSS_ROWS
+    )
+    bank_acceptance_match = (
+        len(bank_input_fingerprints) == 1
+        and bank_input_fingerprints[0].get("sha256") == BRITIKET_ACCEPTANCE_BANK_SHA256
+        and bool(bank_meta.get("source_diagnostics"))
+        and int(bank_meta["source_diagnostics"][0].get("raw_rows", -1))
+            == BRITIKET_ACCEPTANCE_BANK_ROWS
+    )
+
     meta = {
         "recon_dates": recon_dates,
         "recon_mode": recon_mode,
@@ -8053,6 +8198,19 @@ def reconcile_britiket(fmss_file, bank_files):
             ((result_df["STATUS_MATCH"] == "AUTO_SUCCESS")
              & (result_df["MATCH_METHOD"] == "BANK_DESCRIPTION_NOMINAL")).sum()
         ) if (not result_df.empty and "MATCH_METHOD" in result_df.columns) else 0,
+        "diagnostic_runtime": {
+            "python_version": sys.version.split()[0],
+            "pandas_version": pd.__version__,
+        },
+        "diagnostic_fmss_input": fmss_input_diag,
+        "diagnostic_bank_inputs": bank_input_fingerprints,
+        "diagnostic_bank_sources": bank_meta.get("source_diagnostics", []),
+        "diagnostic_non_esb": non_esb_diagnostic_df,
+        "diagnostic_acceptance_fmss_match": bool(fmss_acceptance_match),
+        "diagnostic_acceptance_bank_match": bool(bank_acceptance_match),
+        "diagnostic_acceptance_dataset_match": bool(
+            fmss_acceptance_match and bank_acceptance_match
+        ),
         "status_counts": status_counts
     }
 
@@ -8195,6 +8353,97 @@ def render_britiket_dashboard():
             "Critical Bank Hit/FMSS Issue boleh 0, tetapi rekonsiliasi belum boleh "
             "dianggap sepenuhnya clean sebelum transaksi Review/Ambiguous di bawah diperiksa."
         )
+
+    # ========================================================
+    # V6 DIAGNOSTIC — INPUT / RUNTIME / NON-ESB FALLBACK
+    # ========================================================
+    with st.expander("🧪 V6 Diagnostic — Verifikasi File & Fallback", expanded=True):
+        runtime_diag = meta.get("diagnostic_runtime", {})
+        st.caption(
+            f"Runtime: Python **{runtime_diag.get('python_version', '-')}** | "
+            f"pandas **{runtime_diag.get('pandas_version', '-')}**"
+        )
+
+        exact_dataset = bool(meta.get("diagnostic_acceptance_dataset_match", False))
+        if exact_dataset:
+            st.success(
+                "✅ File yang dibaca Streamlit **byte-for-byte sama** dengan golden dataset "
+                "04 Oktober yang dipakai untuk regression test (hash + jumlah row cocok)."
+            )
+        else:
+            st.warning(
+                "⚠️ File yang dibaca Streamlit **tidak identik** dengan golden dataset "
+                "04 Oktober yang dipakai untuk regression test, atau salah satu fingerprint/row count berbeda."
+            )
+
+        fmss_diag = meta.get("diagnostic_fmss_input", {})
+        bank_diag = meta.get("diagnostic_bank_sources", [])
+
+        input_rows = [{
+            "TYPE": "FMSS",
+            "FILE": fmss_diag.get("file_name", ""),
+            "SIZE_BYTES": fmss_diag.get("size_bytes", 0),
+            "SHA256": fmss_diag.get("sha256", ""),
+            "RAW_ROWS": meta.get("fmss_total_rows", 0),
+            "GOLDEN_MATCH": bool(meta.get("diagnostic_acceptance_fmss_match", False)),
+        }]
+        for item in bank_diag:
+            input_rows.append({
+                "TYPE": "BRI",
+                "FILE": item.get("file_name", ""),
+                "SIZE_BYTES": item.get("size_bytes", 0),
+                "SHA256": item.get("sha256", ""),
+                "RAW_ROWS": item.get("raw_rows", 0),
+                "GOLDEN_MATCH": bool(
+                    item.get("sha256") == BRITIKET_ACCEPTANCE_BANK_SHA256
+                    and int(item.get("raw_rows", -1)) == BRITIKET_ACCEPTANCE_BANK_ROWS
+                ),
+            })
+
+        st.dataframe(
+            pd.DataFrame(input_rows),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        non_esb_diag = meta.get("diagnostic_non_esb", pd.DataFrame())
+        if isinstance(non_esb_diag, pd.DataFrame) and not non_esb_diag.empty:
+            st.markdown("**Diagnostic transaksi `Sukses + system api + BRIFMNCORPORATE` tanpa ESB:**")
+            st.dataframe(
+                non_esb_diag,
+                use_container_width=True,
+                hide_index=True
+            )
+
+            expected_signature_matches = int(
+                pd.to_numeric(
+                    non_esb_diag.get("BANK_SIGNATURE_MATCHES", 0),
+                    errors="coerce"
+                ).fillna(0).eq(1).sum()
+            )
+            actual_description_matches = int(
+                non_esb_diag.get(
+                    "RESULT_METHOD",
+                    pd.Series(dtype="object")
+                ).astype(str).eq("BANK_DESCRIPTION_NOMINAL").sum()
+            )
+
+            st.caption(
+                "Diagnostic check: "
+                f"**{expected_signature_matches} row** mempunyai tepat 1 signature bank+nominal; "
+                f"**{actual_description_matches} row** benar-benar masuk fallback pada hasil engine."
+            )
+
+            if expected_signature_matches > actual_description_matches:
+                st.error(
+                    "🚨 Runtime menemukan kandidat signature yang seharusnya aman, tetapi "
+                    "tidak semuanya masuk `BANK_DESCRIPTION_NOMINAL`. Screenshot tabel ini "
+                    "cukup untuk menentukan titik logic berikutnya tanpa menebak file."
+                )
+        else:
+            st.info(
+                "Tidak ditemukan transaksi system-api BRIFMNCORPORATE tanpa ESB pada file FMSS ini."
+            )
 
     def show_fmss_table(frame):
         cols = [
