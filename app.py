@@ -51,6 +51,7 @@ DEFAULT_STATE = {
     "df_bniva_h1_retry": pd.DataFrame(),
     "df_bniva_time_anomaly": pd.DataFrame(),
     "df_mandiriva_pending_bank_update": pd.DataFrame(),
+    "df_mandiriva_bank_unverified": pd.DataFrame(),
     "mandiriva_freshness_meta": {},
     "df_permata_pending_fmss": pd.DataFrame(),
     "df_permata_pending_bank": pd.DataFrame(),
@@ -3670,28 +3671,22 @@ def fast_match_mandiriva(
         )
 
     # ========================================================
-    # ISSUE BANK - MANDIRIVA
+    # ISSUE BANK / H-1 CARRYOVER REVIEW - MANDIRIVA
     # ========================================================
     #
-    # Tujuan rule ini:
-    # 1. Tetap TIDAK menghitung unmatched Bank D-1 / D+1 sebagai
-    #    Issue Bank untuk periode FMSS D karena keduanya hanya search pool.
-    # 2. Unmatched Bank pada tanggal target D harus dapat muncul di
-    #    dashboard sebagai kandidat BANK_ONLY agar kasus uang masuk bank
-    #    tetapi belum tercatat di FMSS tidak tersembunyi.
-    # 3. Tetap melindungi batch carry-over/cutoff H-1 Mandiri yang secara
-    #    historis masuk ke Bank D pada dini hari. Tanpa FMSS D-1, transaksi
-    #    dini hari tersebut belum aman disebut BANK_ONLY.
+    # IMPORTANT - conservative evidence rule:
+    # - Bank D-1 / D+1 tetap hanya search pool dan tidak menjadi issue D.
+    # - Untuk unmatched Bank pada tanggal target D, FMSS D saja TIDAK cukup
+    #   untuk membuktikan bahwa row tersebut adalah current-day Issue Bank.
+    # - Data historis membuktikan carry-over H-1 Mandiri dapat muncul tidak
+    #   hanya dini hari, bahkan dapat muncul jauh setelah pukul 03:00.
+    # - Karena uploader FMSS existing hanya memberikan bukti target D, seluruh
+    #   unmatched Bank D dikarantina sebagai POTENTIAL H-1 / NEED VERIFICATION.
+    # - Row tetap ditampilkan kepada PIC dan diekspor untuk audit, tetapi tidak
+    #   dihitung sebagai confirmed Issue Bank sampai ada bukti tambahan.
     #
-    # Guard operasional:
-    # - Bank D pukul 00:00:00 s.d. sebelum 03:00:00 yang belum match
-    #   dianggap BANK_UNVERIFIED_NEIGHBOR dan TIDAK masuk Issue Bank.
-    # - Bank D mulai 03:00:00 yang belum match dimasukkan sebagai
-    #   BANK_ONLY_CANDIDATE - MANDIRIVA.
-    #
-    # Guard 03:00 dipakai untuk menahan false positive batch cutoff H-1
-    # (contoh historis batch sekitar 01:32-02:xx), tanpa mengubah engine
-    # matching FMSS maupun tampilan dashboard.
+    # Core matching VA + nominal + chronological duplicate resolution di atas
+    # TIDAK berubah. Perubahan hanya pada klasifikasi unmatched bank.
     # ========================================================
 
     unmatched_bank = []
@@ -3700,8 +3695,6 @@ def fast_match_mandiriva(
         pd.to_datetime(d).date()
         for d in recon_dates
     }
-
-    mandiriva_neighbor_guard_hour = 3
 
     for bank_idx, bank_row in enumerate(
         bank_records
@@ -3731,38 +3724,18 @@ def fast_match_mandiriva(
         if bank_date not in target_dates:
             continue
 
-        # ----------------------------------------------------
-        # PROTEKSI CARRY-OVER H-1 DINI HARI
-        # ----------------------------------------------------
-        # Tanpa file FMSS D-1, unmatched Bank D sebelum pukul 03:00
-        # berpotensi besar merupakan settlement/cutoff transaksi D-1.
-        # Jangan naikkan menjadi Issue Bank dashboard.
-        # ----------------------------------------------------
-
-        if bank_datetime.hour < mandiriva_neighbor_guard_hour:
-            continue
-
-        # ----------------------------------------------------
-        # BANK ONLY CANDIDATE
-        # ----------------------------------------------------
-        # Uang sudah benar-benar masuk di Bank tanggal D, tetapi sesudah
-        # seluruh proses matching 1-to-1 tidak ada FMSS D yang memakai
-        # record ini. Masukkan ke Issue Bank agar gangguan internal dapat
-        # terdeteksi oleh dashboard.
-        # ----------------------------------------------------
-
         record = bank_row.copy()
 
         record["STATUS_MATCH"] = (
-            "BANK_ONLY_CANDIDATE - MANDIRIVA"
+            "POTENTIAL H-1 CARRYOVER - MANDIRIVA"
         )
 
         record["MATCH_METHOD"] = (
-            "NO_FMSS_MATCH_TARGET_DATE"
+            "BANK_UNMATCHED_TARGET_DATE_FMSS_D_MINUS_1_NOT_AVAILABLE"
         )
 
         record["MATCH_CONFIDENCE"] = (
-            "MEDIUM"
+            "UNVERIFIED"
         )
 
         bank_credit = float(
@@ -3774,19 +3747,24 @@ def fast_match_mandiriva(
         )
 
         # Estimasi nominal FMSS hanya untuk kebutuhan audit/export.
-        # Dashboard tetap memakai nominal uang yang benar-benar masuk bank.
         if bank_credit > MANDIRIVA_FEE:
             record["EXPECTED_FMSS_NOMINAL"] = (
                 bank_credit - MANDIRIVA_FEE
             )
             record["BANK_ONLY_NOTE"] = (
-                "CREDIT_GT_FEE"
+                "POTENTIAL_H1_CARRYOVER_NEEDS_FMSS_D_MINUS_1"
             )
         else:
             record["EXPECTED_FMSS_NOMINAL"] = None
             record["BANK_ONLY_NOTE"] = (
-                "CREDIT_LE_FEE_REVIEW"
+                "CREDIT_LE_FEE_REVIEW_POTENTIAL_H1"
             )
+
+        record["UNVERIFIED_REASON"] = (
+            "Tidak memiliki pasangan pada FMSS tanggal target. "
+            "FMSS H-1 tidak tersedia pada proses ini, sehingga transaksi "
+            "belum aman dinyatakan sebagai confirmed Issue Bank."
+        )
 
         unmatched_bank.append(
             record
@@ -8826,6 +8804,7 @@ if (
     st.session_state.df_bniva_h1_retry = pd.DataFrame()
     st.session_state.df_bniva_time_anomaly = pd.DataFrame()
     st.session_state.df_mandiriva_pending_bank_update = pd.DataFrame()
+    st.session_state.df_mandiriva_bank_unverified = pd.DataFrame()
     st.session_state.mandiriva_freshness_meta = {}
     st.session_state.df_permata_pending_fmss = pd.DataFrame()
     st.session_state.df_permata_pending_bank = pd.DataFrame()
@@ -9190,6 +9169,7 @@ if can_process:
                 df_bniva_h1_retry = pd.DataFrame()
                 df_bniva_time_anomaly = pd.DataFrame()
                 df_mandiriva_pending_bank_update = pd.DataFrame()
+                df_mandiriva_bank_unverified = pd.DataFrame()
                 mandiriva_freshness_meta = {}
                 df_permata_pending_fmss = pd.DataFrame()
                 df_permata_pending_bank = pd.DataFrame()
@@ -9934,6 +9914,32 @@ if can_process:
                     )
 
                 # =================================================
+                # MANDIRIVA - BANK UNMATCHED / POTENTIAL H-1 REVIEW
+                # =================================================
+                # fast_match_mandiriva tetap mengembalikan unmatched bank untuk
+                # audit. Di layer ini transaksi berstatus POTENTIAL H-1 dipisahkan
+                # dari confirmed Issue Bank agar card Issue Bank tidak false alarm.
+
+                if pilihan_bank == "MANDIRIVA" and not df_selisih_bnk.empty:
+
+                    mandiri_unverified_mask = (
+                        df_selisih_bnk.get(
+                            "STATUS_MATCH",
+                            pd.Series("", index=df_selisih_bnk.index)
+                        )
+                        .astype(str)
+                        .eq("POTENTIAL H-1 CARRYOVER - MANDIRIVA")
+                    )
+
+                    df_mandiriva_bank_unverified = (
+                        df_selisih_bnk.loc[mandiri_unverified_mask].copy()
+                    )
+
+                    df_selisih_bnk = (
+                        df_selisih_bnk.loc[~mandiri_unverified_mask].copy()
+                    )
+
+                # =================================================
                 # MANDIRIVA - H0 FRESHNESS / TRUSTED WINDOW
                 # =================================================
                 # Core fast_match_mandiriva TIDAK diubah. Layer ini hanya
@@ -10106,6 +10112,10 @@ if can_process:
                     df_mandiriva_pending_bank_update
                 )
 
+                st.session_state.df_mandiriva_bank_unverified = (
+                    df_mandiriva_bank_unverified
+                )
+
                 st.session_state.mandiriva_freshness_meta = (
                     mandiriva_freshness_meta
                 )
@@ -10177,6 +10187,10 @@ if st.session_state.sudah_diproses:
 
     df_mandiriva_pending_bank_update = (
         st.session_state.df_mandiriva_pending_bank_update
+    )
+
+    df_mandiriva_bank_unverified = (
+        st.session_state.df_mandiriva_bank_unverified
     )
 
     mandiriva_freshness_meta = (
@@ -10426,6 +10440,55 @@ if st.session_state.sudah_diproses:
 
     if pilihan_bank == "MANDIRIVA":
 
+        mandiri_unverified_count = len(
+            df_mandiriva_bank_unverified
+        )
+
+        mandiri_unverified_nominal = (
+            df_mandiriva_bank_unverified["_CREDIT_NUM"].sum()
+            if (
+                not df_mandiriva_bank_unverified.empty
+                and "_CREDIT_NUM" in df_mandiriva_bank_unverified.columns
+            )
+            else 0
+        )
+
+        if mandiri_unverified_count > 0:
+
+            st.warning(
+                "🟡 **Potential H-1 Carryover / Need Verification — MANDIRIVA.**  \n"
+                f"Terdapat **{mandiri_unverified_count:,} transaksi / "
+                f"{format_rupiah(mandiri_unverified_nominal)}** pada mutasi Mandiri "
+                "yang tidak memiliki pasangan di FMSS tanggal target. "
+                "Karena FMSS H-1 tidak tersedia pada proses ini, transaksi tersebut "
+                "**tidak dihitung sebagai confirmed Issue Bank**. PIC tetap perlu "
+                "melakukan verifikasi bila dibutuhkan."
+            )
+
+            with st.expander(
+                f"🔎 Lihat Potential H-1 Carryover ({mandiri_unverified_count:,})",
+                expanded=False
+            ):
+
+                unverified_cols = [
+                    col
+                    for col in [
+                        "_TANGGAL_DT",
+                        "KODE_VA",
+                        "_CREDIT_NUM",
+                        "EXPECTED_FMSS_NOMINAL",
+                        "STATUS_MATCH",
+                        "UNVERIFIED_REASON"
+                    ]
+                    if col in df_mandiriva_bank_unverified.columns
+                ]
+
+                st.dataframe(
+                    df_mandiriva_bank_unverified[unverified_cols],
+                    use_container_width=True,
+                    hide_index=True
+                )
+
         mandiri_pending_count = len(
             df_mandiriva_pending_bank_update
         )
@@ -10590,8 +10653,16 @@ if st.session_state.sudah_diproses:
         f"{fmss_match_rate:.4f}%"
     )
 
+    bank_rate_label = "📈 Match Rate Bank"
+
+    if (
+        pilihan_bank == "MANDIRIVA"
+        and not df_mandiriva_bank_unverified.empty
+    ):
+        bank_rate_label = "📈 Match Rate Bank (Verified Scope)"
+
     r2.metric(
-        "📈 Match Rate Bank",
+        bank_rate_label,
         f"{bank_match_rate:.4f}%"
     )
 
@@ -10789,7 +10860,17 @@ if st.session_state.sudah_diproses:
             )
 
         else:
-            if pilihan_bank == "PERMATAVA" and not df_permata_pending_bank.empty:
+            if (
+                pilihan_bank == "MANDIRIVA"
+                and not df_mandiriva_bank_unverified.empty
+            ):
+                st.info(
+                    "Tidak ada **confirmed Issue Bank**. "
+                    f"Sebanyak **{len(df_mandiriva_bank_unverified):,} transaksi bank** "
+                    "masih berstatus **Potential H-1 Carryover / Need Verification** "
+                    "karena FMSS H-1 tidak tersedia pada proses ini."
+                )
+            elif pilihan_bank == "PERMATAVA" and not df_permata_pending_bank.empty:
                 st.info(f"Tidak ada Issue Bank pada trusted window; "
                         f"{len(df_permata_pending_bank):,} transaksi masih Pending FMSS Update (H0).")
             else:
@@ -11014,11 +11095,22 @@ if st.session_state.sudah_diproses:
                     else 0
                 )
 
+                unverified_bank_nominal_export = (
+                    df_mandiriva_bank_unverified["_CREDIT_NUM"].sum()
+                    if (
+                        not df_mandiriva_bank_unverified.empty
+                        and "_CREDIT_NUM" in df_mandiriva_bank_unverified.columns
+                    )
+                    else 0
+                )
+
                 extra_summary_rows = pd.DataFrame({
                     "METRIC": [
                         "Mode Rekonsiliasi",
                         "MANDIRIVA Pending Bank Update",
                         "Nominal MANDIRIVA Pending Bank Update",
+                        "MANDIRIVA Potential H-1 / Need Verification",
+                        "Nominal MANDIRIVA Potential H-1",
                         "MANDIRIVA FMSS Snapshot",
                         "MANDIRIVA Bank Snapshot",
                         "MANDIRIVA Trusted FMSS End",
@@ -11030,6 +11122,8 @@ if st.session_state.sudah_diproses:
                         st.session_state.recon_mode,
                         len(df_mandiriva_pending_bank_update),
                         pending_nominal_export,
+                        len(df_mandiriva_bank_unverified),
+                        unverified_bank_nominal_export,
                         str(mandiriva_freshness_meta.get("fmss_snapshot", "")),
                         str(mandiriva_freshness_meta.get("bank_snapshot", "")),
                         str(mandiriva_freshness_meta.get("trusted_fmss_end", "")),
@@ -11224,6 +11318,13 @@ if st.session_state.sudah_diproses:
                     df_mandiriva_pending_bank_update.to_excel(
                         writer,
                         sheet_name="MANDIRI_PENDING_BANK",
+                        index=False
+                    )
+
+                if not df_mandiriva_bank_unverified.empty:
+                    df_mandiriva_bank_unverified.to_excel(
+                        writer,
+                        sheet_name="MANDIRI_H1_UNVERIFIED",
                         index=False
                     )
 
