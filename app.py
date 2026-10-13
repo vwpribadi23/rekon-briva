@@ -5829,18 +5829,27 @@ def fast_match_bcava(
 
 
 # ============================================================
-# PERMATAVA ENGINE (FASPAY 72100) — OWNED, SELF-CONTAINED
+# PERMATAVA ENGINE (FASPAY 72100 + 72101) — OWNED, SELF-CONTAINED
 # ============================================================
 # Regression baseline:
 # 02 Oct 2026: 24/24 matched (Rp24,122,000 FMSS)
 # 03 Oct 2026: 22/22 matched (Rp12,345,000 FMSS)
 # 04 Oct 2026 H0: 13/13 matched (Rp7,372,000 FMSS)
+# 12 Oct 2026: live pattern tambahan 72101xxxxxxxxx tervalidasi exact
+#              pada FMSS + bank dengan fee Rp1.000 dan timestamp berdekatan.
 # Bank credit = FMSS nominal + 1,000, exact VA, one-to-one.
-# None of the functions for the four existing engines are changed.
+# None of the functions for engines lain are changed.
+#
+# Family VA PermataVA yang sudah tervalidasi:
+# - 72100 + 8 digit = 13 digit (baseline FA / family existing)
+# - 72101 + 9 digit = 14 digit (live sample TK, 12 Oct 2026)
+#
+# PERMATAVA_PREFIX tetap 72100 karena dipakai khusus secondary outlet check
+# untuk pola outlet FA existing. Family 72101 tidak dipaksa melalui formula FA.
 
 PERMATAVA_PREFIX = "72100"
 PERMATAVA_FEE = 1000
-PERMATAVA_VA_REGEX = re.compile(r"(?<!\d)(72100\d{8})(?!\d)")
+PERMATAVA_VA_REGEX = re.compile(r"(?<!\d)(72100\d{8}|72101\d{9})(?!\d)")
 PERMATAVA_TIME_REGEX = re.compile(r"(?<!\d)([01]\d|2[0-3]):[0-5]\d:[0-5]\d(?!\d)")
 
 
