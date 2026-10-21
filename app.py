@@ -6150,6 +6150,21 @@ PERMATAVA_VA_REGEX = re.compile(r"(?<!\d)(72100\d{8}|72101\d{9})(?!\d)")
 PERMATAVA_TIME_REGEX = re.compile(r"(?<!\d)([01]\d|2[0-3]):[0-5]\d:[0-5]\d(?!\d)")
 
 
+def parse_permatava_fmss_datetime(series):
+    """
+    Parser timestamp FMSS PERMATAVA yang tahan format campuran.
+
+    Contoh yang sama-sama valid dalam satu file:
+        2026-10-20 12:00:00.123456
+        2026-10-20 12:00:01.123
+        2026-10-20 12:00:02
+
+    Hanya layer parsing FMSS yang diperluas. Rule VA, fee, matching,
+    duplicate resolver, H0 coverage, dan parser mutasi Permata tidak berubah.
+    """
+    return parse_briva_datetime(series)
+
+
 def permatava_unique_va(value):
     """Allow repeated copies of SAME VA in Permata ME descriptions."""
     found = set(PERMATAVA_VA_REGEX.findall(str(value or "")))
@@ -9582,6 +9597,35 @@ if can_process:
 
                     df_int_sukses["_TANGGAL_DT"] = (
                         parse_bcava_fmss_datetime(
+                            fmss_datetime_source
+                        )
+                    )
+
+                elif pilihan_bank == "PERMATAVA":
+
+                    # PERMATAVA juga dapat menerima timestamp FMSS campuran
+                    # dengan microsecond / millisecond / tanpa fractional second.
+                    # Hanya parsing waktu FMSS yang diperluas; rule engine
+                    # PERMATAVA lainnya tetap identik.
+                    df_int_sukses["_TANGGAL_DT"] = (
+                        parse_permatava_fmss_datetime(
+                            fmss_datetime_source
+                        )
+                    )
+
+                elif pilihan_bank == "MANDIRIVA":
+
+                    # MANDIRIVA dapat memiliki timestamp FMSS campuran dalam
+                    # satu file, khususnya saat PIC melakukan proses sukses
+                    # manual. Contoh yang sama-sama valid:
+                    #   2026-10-20 23:59:24.035778
+                    #   2026-10-20 20:05:04
+                    # Parser robust yang sudah tervalidasi pada BRIVA dipakai
+                    # hanya untuk parsing timestamp FMSS MANDIRIVA; rule VA,
+                    # fee, matching, duplicate resolver, dan classifier bank
+                    # MANDIRIVA tidak diubah.
+                    df_int_sukses["_TANGGAL_DT"] = (
+                        parse_briva_datetime(
                             fmss_datetime_source
                         )
                     )
