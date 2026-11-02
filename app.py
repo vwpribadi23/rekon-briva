@@ -52,6 +52,7 @@ DEFAULT_STATE = {
     "df_bniva_time_anomaly": pd.DataFrame(),
     "df_mandiriva_pending_bank_update": pd.DataFrame(),
     "df_mandiriva_bank_unverified": pd.DataFrame(),
+    "df_mandiriva_false_prefix": pd.DataFrame(),
     "mandiriva_freshness_meta": {},
     "df_permata_pending_fmss": pd.DataFrame(),
     "df_permata_pending_bank": pd.DataFrame(),
@@ -2661,15 +2662,58 @@ def fast_match_bniva(
 
 MANDIRIVA_PREFIX = "888984"
 MANDIRIVA_FEE = 1000
-MANDIRIVA_VA_REGEX = r"(888984\d+)"
+
+# VA MANDIRIVA yang sudah tervalidasi pada dataset operasional memiliki
+# panjang total 15-19 digit: prefix 888984 + 9-13 digit berikutnya.
+# Boundary digit kiri/kanan mencegah substring seperti "8889844" yang
+# sebenarnya hanya potongan dari nomor produk/reference lain ikut terbaca VA.
+MANDIRIVA_VA_REGEX = r"(?<!\d)(888984\d{9,13})(?!\d)"
+
+# Prefix 888984 yang menempel di tengah rangkaian digit lain adalah collision,
+# bukan transaksi MANDIRIVA. Collision seperti ini dikeluarkan dari scope bank
+# sebelum matching dan tidak dihitung sebagai Invalid VA / Issue Bank.
+MANDIRIVA_NUMERIC_PREFIX_COLLISION_REGEX = r"(?:(?<=\d)888984|888984(?=\d))"
+
+
+def extract_mandiriva_false_prefix_full_number(value):
+    """
+    Ambil token angka UTUH pada raw Remarks yang mengandung substring 888984
+    tetapi gagal menjadi VA MANDIRIVA valid.
+
+    Contoh:
+        UBP...888981008889844... -> 888981008889844
+
+    Tujuannya murni audit/display. Nilai ini TIDAK pernah dipakai sebagai VA
+    dan tidak ikut matching MANDIRIVA. Bila ada lebih dari satu token kandidat,
+    seluruh kandidat unik ditampilkan dipisahkan ` | ` agar tidak ada informasi
+    raw yang hilang.
+    """
+    if value is None or pd.isna(value):
+        return None
+
+    tokens = re.findall(r"\d+", str(value))
+    candidates = []
+
+    for token in tokens:
+        if MANDIRIVA_PREFIX in token and token not in candidates:
+            candidates.append(token)
+
+    if not candidates:
+        return None
+
+    return " | ".join(candidates)
 
 
 def extract_mandiriva_va_series(series):
     """
-    Ekstrak VA MANDIRIVA berdasarkan prefix 888984.
+    Ekstrak full VA MANDIRIVA yang valid.
 
-    Panjang VA tidak di-hardcode karena pada sampel valid
-    ditemukan panjang yang bervariasi.
+    Rule:
+        - prefix 888984,
+        - total panjang 15-19 digit,
+        - bukan substring dari rangkaian digit yang lebih panjang.
+
+    Nominal transaksi tidak memengaruhi validitas VA.
     """
 
     result = (
@@ -2696,8 +2740,8 @@ def classify_mandiriva_va_series(series):
 
     mask_mandiriva = (
         series.astype("string")
-        .str.startswith(
-            MANDIRIVA_PREFIX,
+        .str.fullmatch(
+            r"888984\d{9,13}",
             na=False
         )
     )
@@ -2902,8 +2946,19 @@ def prepare_mandiriva_bank_dataframe(
     ].copy()
 
     # --------------------------------------------------------
-    # HANYA SCOPE PREFIX 888984
+    # SCOPE MANDIRIVA + GUARD FALSE PREFIX COLLISION
     # --------------------------------------------------------
+    # Jangan cukup memakai `contains("888984")`, karena pada mutasi Mandiri
+    # prefix tersebut dapat muncul sebagai substring dari nomor/reference lain.
+    # Contoh temuan operasional: rangkaian digit yang berakhir `...8889844`
+    # sebelumnya salah dibaca sebagai VA `8889844`.
+    #
+    # Rule scope:
+    # - full VA 15-19 digit -> transaksi MANDIRIVA valid,
+    # - prefix 888984 yang menempel pada digit lain tanpa full VA -> collision
+    #   dan dikeluarkan dari scope,
+    # - prefix standalone yang bukan collision tetap dipertahankan agar format
+    #   malformed yang benar-benar berada di scope masih dapat terlihat Invalid VA.
 
     desc_text = (
         df[col_desc]
@@ -2911,7 +2966,11 @@ def prepare_mandiriva_bank_dataframe(
         .fillna("")
     )
 
-    scope_mask = (
+    extracted_va = extract_mandiriva_va_series(
+        desc_text
+    )
+
+    contains_prefix_mask = (
         desc_text.str.contains(
             MANDIRIVA_PREFIX,
             regex=False,
@@ -2919,14 +2978,58 @@ def prepare_mandiriva_bank_dataframe(
         )
     )
 
-    df = df[
-        scope_mask
-    ].copy()
+    numeric_collision_mask = (
+        extracted_va.isna()
+        & desc_text.str.contains(
+            MANDIRIVA_NUMERIC_PREFIX_COLLISION_REGEX,
+            regex=True,
+            na=False
+        )
+    )
+
+    scope_mask = (
+        contains_prefix_mask
+        & ~numeric_collision_mask
+    )
+
+    # --------------------------------------------------------
+    # FALSE PREFIX / OUT-OF-SCOPE AUDIT BUCKET
+    # --------------------------------------------------------
+    # Collision tetap dikeluarkan dari pool matching MANDIRIVA supaya tidak
+    # menghasilkan false Issue Bank / Invalid VA. Namun row TIDAK dibuang:
+    # disimpan di attrs dan ditampilkan pada card/expander audit terpisah.
+    # Nomor yang ditampilkan adalah full numeric token dari raw Remarks, bukan
+    # potongan pendek seperti `8889844`.
+
+    df_false_prefix = df.loc[numeric_collision_mask].copy()
+
+    if not df_false_prefix.empty:
+        df_false_prefix["FALSE_PREFIX_FULL_NUMBER"] = (
+            df_false_prefix[col_desc].apply(
+                extract_mandiriva_false_prefix_full_number
+            )
+        )
+        df_false_prefix["RAW_REMARKS"] = (
+            df_false_prefix[col_desc].astype(str)
+        )
+        df_false_prefix["STATUS_MATCH"] = (
+            "FALSE_PREFIX_COLLISION - MANDIRIVA"
+        )
+        df_false_prefix["FALSE_PREFIX_REASON"] = (
+            "Mengandung substring 888984 tetapi tidak membentuk full VA "
+            "MANDIRIVA valid 15-19 digit. Dikeluarkan dari matching dan "
+            "tetap ditampilkan untuk audit."
+        )
+        df_false_prefix["SOURCE_BANK"] = source_bank
+        df_false_prefix["_BANK_TYPE"] = "MANDIRIVA_FALSE_PREFIX"
+
+    df = df.loc[scope_mask].copy()
 
     # --------------------------------------------------------
     # VA
     # --------------------------------------------------------
 
+    # Re-extract setelah filter agar index/series tetap konsisten.
     df["KODE_VA"] = (
         extract_mandiriva_va_series(
             df[col_desc]
@@ -2950,6 +3053,11 @@ def prepare_mandiriva_bank_dataframe(
         df[col_desc]
         .astype(str)
     )
+
+    # Data quality bucket sengaja disimpan di attrs agar signature fungsi dan
+    # seluruh core matching existing tidak berubah. Main flow mengambilnya
+    # sebelum concat dataframe bank.
+    df.attrs["mandiriva_false_prefix"] = df_false_prefix.reset_index(drop=True)
 
     return df
 
@@ -9126,6 +9234,7 @@ if (
     st.session_state.df_bniva_time_anomaly = pd.DataFrame()
     st.session_state.df_mandiriva_pending_bank_update = pd.DataFrame()
     st.session_state.df_mandiriva_bank_unverified = pd.DataFrame()
+    st.session_state.df_mandiriva_false_prefix = pd.DataFrame()
     st.session_state.mandiriva_freshness_meta = {}
     st.session_state.df_permata_pending_fmss = pd.DataFrame()
     st.session_state.df_permata_pending_bank = pd.DataFrame()
@@ -9491,6 +9600,7 @@ if can_process:
                 df_bniva_time_anomaly = pd.DataFrame()
                 df_mandiriva_pending_bank_update = pd.DataFrame()
                 df_mandiriva_bank_unverified = pd.DataFrame()
+                df_mandiriva_false_prefix = pd.DataFrame()
                 mandiriva_freshness_meta = {}
                 df_permata_pending_fmss = pd.DataFrame()
                 df_permata_pending_bank = pd.DataFrame()
@@ -10067,6 +10177,15 @@ if can_process:
                         )
                     )
 
+                    # Ambil bucket false-prefix SEBELUM concat agar metadata attrs
+                    # tidak hilang. Bucket ini tidak masuk pool matching.
+                    df_mandiriva_false_prefix = (
+                        df_mandiriva.attrs.get(
+                            "mandiriva_false_prefix",
+                            pd.DataFrame()
+                        ).copy()
+                    )
+
                     bank_sources.append(
                         df_mandiriva
                     )
@@ -10461,6 +10580,10 @@ if can_process:
                     df_mandiriva_bank_unverified
                 )
 
+                st.session_state.df_mandiriva_false_prefix = (
+                    df_mandiriva_false_prefix
+                )
+
                 st.session_state.mandiriva_freshness_meta = (
                     mandiriva_freshness_meta
                 )
@@ -10536,6 +10659,10 @@ if st.session_state.sudah_diproses:
 
     df_mandiriva_bank_unverified = (
         st.session_state.df_mandiriva_bank_unverified
+    )
+
+    df_mandiriva_false_prefix = (
+        st.session_state.df_mandiriva_false_prefix
     )
 
     mandiriva_freshness_meta = (
@@ -10784,6 +10911,73 @@ if st.session_state.sudah_diproses:
     # ========================================================
 
     if pilihan_bank == "MANDIRIVA":
+
+        # ----------------------------------------------------
+        # FALSE PREFIX / OUT OF SCOPE - DATA QUALITY CARD
+        # ----------------------------------------------------
+        # Tidak dihitung sebagai Issue Bank maupun Invalid VA, tetapi sengaja
+        # tetap sangat terlihat agar PIC dapat melakukan audit terhadap raw mutasi.
+
+        mandiri_false_prefix_count = len(df_mandiriva_false_prefix)
+        mandiri_false_prefix_nominal = (
+            df_mandiriva_false_prefix["_CREDIT_NUM"].sum()
+            if (
+                not df_mandiriva_false_prefix.empty
+                and "_CREDIT_NUM" in df_mandiriva_false_prefix.columns
+            )
+            else 0
+        )
+
+        if mandiri_false_prefix_count > 0:
+            with st.container(border=True):
+                st.metric(
+                    "⚪ False Prefix / Out of Scope — MANDIRIVA",
+                    f"{mandiri_false_prefix_count:,} Trx",
+                    delta=f"Audit {format_rupiah(mandiri_false_prefix_nominal)}",
+                    delta_color="off"
+                )
+                st.caption(
+                    "Mutasi mengandung substring 888984 tetapi tidak membentuk "
+                    "full VA MANDIRIVA valid 15-19 digit. Tidak dihitung sebagai "
+                    "Issue Bank/Invalid VA, namun tetap ditampilkan untuk audit PIC."
+                )
+
+            with st.expander(
+                f"🔎 Lihat False Prefix / Out of Scope ({mandiri_false_prefix_count:,})",
+                expanded=False
+            ):
+                false_prefix_cols = [
+                    col
+                    for col in [
+                        "_TANGGAL_DT",
+                        "FALSE_PREFIX_FULL_NUMBER",
+                        "_CREDIT_NUM",
+                        "STATUS_MATCH",
+                        "RAW_REMARKS",
+                        "FALSE_PREFIX_REASON"
+                    ]
+                    if col in df_mandiriva_false_prefix.columns
+                ]
+
+                false_prefix_display = (
+                    df_mandiriva_false_prefix[false_prefix_cols].copy()
+                )
+
+                false_prefix_display = false_prefix_display.rename(
+                    columns={
+                        "_TANGGAL_DT": "TANGGAL_BANK",
+                        "FALSE_PREFIX_FULL_NUMBER": "NOMOR_LENGKAP_RAW",
+                        "_CREDIT_NUM": "NOMINAL_BANK",
+                        "RAW_REMARKS": "REMARKS_ASLI",
+                        "FALSE_PREFIX_REASON": "KETERANGAN"
+                    }
+                )
+
+                st.dataframe(
+                    false_prefix_display,
+                    use_container_width=True,
+                    hide_index=True
+                )
 
         # ----------------------------------------------------
         # HIGH CONFIDENCE ISSUE BANK
@@ -11832,6 +12026,13 @@ if st.session_state.sudah_diproses:
                     df_mandiriva_pending_bank_update.to_excel(
                         writer,
                         sheet_name="MANDIRI_PENDING_BANK",
+                        index=False
+                    )
+
+                if not df_mandiriva_false_prefix.empty:
+                    df_mandiriva_false_prefix.to_excel(
+                        writer,
+                        sheet_name="MANDIRI_FALSE_PREFIX",
                         index=False
                     )
 
