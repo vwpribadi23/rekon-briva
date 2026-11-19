@@ -50,6 +50,12 @@ DEFAULT_STATE = {
     "df_bniva_h1_cutoff": pd.DataFrame(),
     "df_bniva_h1_retry": pd.DataFrame(),
     "df_bniva_time_anomaly": pd.DataFrame(),
+    "df_bniva_fmss_delay": pd.DataFrame(),
+    "df_bniva_delay_time_anomaly": pd.DataFrame(),
+    "df_bniva_coverage_gap": pd.DataFrame(),
+    "df_bniva_pending_fmss": pd.DataFrame(),
+    "bniva_delay_meta": {},
+    "bniva_coverage_meta": {},
     "df_mandiriva_pending_bank_update": pd.DataFrame(),
     "df_mandiriva_bank_unverified": pd.DataFrame(),
     "df_mandiriva_false_prefix": pd.DataFrame(),
@@ -1281,6 +1287,14 @@ def fast_match_briva(
 BNIVA_VA_REGEX = r"(?<!\d)(98876\d{11})(?!\d)"
 BNIVA_REFF_REGEX = r"(?i)reff[_\s-]*number\s*=\s*(\d+)"
 
+# Delay monitor BNIVA hanya berlaku untuk strong same-day match.
+# Sesuai kebutuhan operasional CS, delay <= 3 menit dianggap masih normal.
+BNIVA_FMSS_DELAY_THRESHOLD_SECONDS = 180
+BNIVA_COVERAGE_MIN_BUFFER_SECONDS = 180
+BNIVA_COVERAGE_MAX_BUFFER_SECONDS = 900
+BNIVA_COVERAGE_DYNAMIC_MIN_MATCHES = 30
+BNIVA_BANK_FILE_TRUNCATION_ROW_HINT = 500
+
 
 def extract_bniva_va_series(series):
     """
@@ -1862,6 +1876,11 @@ def prepare_bniva_bank_dataframe(
         uploaded_file
     )
 
+    # Metadata raw file digunakan hanya untuk BNIVA H0 coverage guard.
+    # BNI Transaction Inquiry pada kondisi tertentu memotong hasil ketika
+    # jumlah baris mencapai limit export. Data tetap tidak diubah di sini.
+    bniva_raw_row_count = len(df)
+
     col_credit = find_column(
         df,
         [
@@ -2038,6 +2057,27 @@ def prepare_bniva_bank_dataframe(
         .astype(str)
     )
 
+    valid_bank_dt = pd.to_datetime(
+        df.get("_TANGGAL_DT", pd.Series(dtype="datetime64[ns]")),
+        errors="coerce"
+    ).dropna()
+
+    df.attrs["bniva_meta"] = {
+        "source_filename": bniva_source_filename,
+        "snapshot_datetime": bniva_snapshot_datetime,
+        "raw_row_count": int(bniva_raw_row_count),
+        "bank_coverage_start": (
+            valid_bank_dt.min()
+            if not valid_bank_dt.empty
+            else pd.NaT
+        ),
+        "bank_coverage_end": (
+            valid_bank_dt.max()
+            if not valid_bank_dt.empty
+            else pd.NaT
+        ),
+    }
+
     return df
 
 
@@ -2077,6 +2117,413 @@ def get_bniva_date_relation(
         return "H+1 CUTOFF"
 
     return f"{delta_days:+d} DAY"
+
+
+def analyze_bniva_fmss_delay(df_matched):
+    """
+    Monitor latency posting BNIVA dari Bank -> FMSS.
+
+    HANYA pasangan yang benar-benar kuat yang dipakai sebagai basis latency:
+        - MATCH_METHOD == JOURNAL_VA_NOMINAL
+        - MATCH_CONFIDENCE == STRONG
+        - DATE_RELATION == SAME DAY
+
+    Delay > 3 menit masuk card FMSS Delay. Delay negatif dipisahkan sebagai
+    time anomaly dan tidak ikut statistik delay positif / coverage buffer.
+    """
+
+    empty_meta = {
+        "evaluated_strong_same_day": 0,
+        "positive_delay_count": 0,
+        "delay_count": 0,
+        "delay_nominal": 0,
+        "delay_3_5_count": 0,
+        "delay_5_10_count": 0,
+        "delay_gt_10_count": 0,
+        "delay_median_seconds": None,
+        "delay_p95_seconds": None,
+        "delay_p99_seconds": None,
+        "delay_max_seconds": None,
+        "coverage_buffer_seconds": BNIVA_COVERAGE_MIN_BUFFER_SECONDS,
+    }
+
+    if df_matched is None or df_matched.empty:
+        return pd.DataFrame(), pd.DataFrame(), empty_meta
+
+    required_cols = {
+        "_TANGGAL_DT",
+        "MATCH_BANK_DATE",
+        "MATCH_METHOD",
+        "MATCH_CONFIDENCE",
+        "DATE_RELATION",
+    }
+
+    if not required_cols.issubset(df_matched.columns):
+        return pd.DataFrame(), pd.DataFrame(), empty_meta
+
+    work = df_matched.copy()
+
+    strong_mask = (
+        work["MATCH_METHOD"].astype(str).eq("JOURNAL_VA_NOMINAL")
+        & work["MATCH_CONFIDENCE"].astype(str).eq("STRONG")
+        & work["DATE_RELATION"].astype(str).eq("SAME DAY")
+    )
+
+    work = work.loc[strong_mask].copy()
+
+    if work.empty:
+        return pd.DataFrame(), pd.DataFrame(), empty_meta
+
+    fmss_dt = pd.to_datetime(work["_TANGGAL_DT"], errors="coerce")
+    bank_dt = pd.to_datetime(work["MATCH_BANK_DATE"], errors="coerce")
+
+    valid_time = fmss_dt.notna() & bank_dt.notna()
+    work = work.loc[valid_time].copy()
+    fmss_dt = fmss_dt.loc[valid_time]
+    bank_dt = bank_dt.loc[valid_time]
+
+    if work.empty:
+        return pd.DataFrame(), pd.DataFrame(), empty_meta
+
+    work["FMSS_DELAY_SECONDS"] = (
+        fmss_dt - bank_dt
+    ).dt.total_seconds()
+    work["FMSS_DELAY_MINUTES"] = (
+        work["FMSS_DELAY_SECONDS"] / 60.0
+    )
+    work["FMSS_BANK_TIME"] = bank_dt
+    work["FMSS_POST_TIME"] = fmss_dt
+
+    # Negative latency secara urutan waktu tidak dianggap FMSS delay.
+    anomaly_mask = work["FMSS_DELAY_SECONDS"] < 0
+    df_time_anomaly = work.loc[anomaly_mask].copy()
+    if not df_time_anomaly.empty:
+        df_time_anomaly["STATUS_MATCH"] = (
+            "MATCHED TIME ANOMALY - BNIVA"
+        )
+        df_time_anomaly["FMSS_DELAY_SEVERITY"] = "NEGATIVE_TIME"
+
+    positive = work.loc[~anomaly_mask].copy()
+    positive_delay = positive["FMSS_DELAY_SECONDS"].dropna()
+
+    # Threshold diminta operasional: hanya LEBIH DARI 3 menit.
+    delay_mask = (
+        positive["FMSS_DELAY_SECONDS"]
+        > BNIVA_FMSS_DELAY_THRESHOLD_SECONDS
+    )
+    df_delay = positive.loc[delay_mask].copy()
+
+    def classify_delay(seconds):
+        if pd.isna(seconds):
+            return "UNKNOWN"
+        if seconds <= 300:
+            return "WARNING_3_5_MIN"
+        if seconds <= 600:
+            return "MAJOR_5_10_MIN"
+        return "CRITICAL_GT_10_MIN"
+
+    if not df_delay.empty:
+        df_delay["FMSS_DELAY_SEVERITY"] = (
+            df_delay["FMSS_DELAY_SECONDS"].apply(classify_delay)
+        )
+        df_delay["STATUS_MATCH"] = "FMSS_DELAY - BNIVA"
+
+    p95 = None
+    p99 = None
+    median = None
+    maximum = None
+
+    if not positive_delay.empty:
+        median = float(positive_delay.median())
+        p95 = float(positive_delay.quantile(0.95))
+        p99 = float(positive_delay.quantile(0.99))
+        maximum = float(positive_delay.max())
+
+    # Dynamic coverage buffer digunakan hanya untuk menghindari false issue
+    # pada batas awal/akhir file H0. P99 dipakai bila sampel strong cukup.
+    coverage_buffer = BNIVA_COVERAGE_MIN_BUFFER_SECONDS
+
+    if len(positive_delay) >= BNIVA_COVERAGE_DYNAMIC_MIN_MATCHES and p99 is not None:
+        coverage_buffer = p99
+    elif len(positive_delay) >= 10 and p95 is not None:
+        coverage_buffer = p95
+
+    coverage_buffer = int(round(max(
+        BNIVA_COVERAGE_MIN_BUFFER_SECONDS,
+        min(BNIVA_COVERAGE_MAX_BUFFER_SECONDS, coverage_buffer)
+    )))
+
+    nominal_col = (
+        "NOMINAL_ASLI"
+        if "NOMINAL_ASLI" in df_delay.columns
+        else None
+    )
+
+    meta = {
+        "evaluated_strong_same_day": int(len(work)),
+        "positive_delay_count": int(len(positive)),
+        "delay_count": int(len(df_delay)),
+        "delay_nominal": float(
+            df_delay[nominal_col].sum()
+            if nominal_col and not df_delay.empty
+            else 0
+        ),
+        "delay_3_5_count": int((
+            (df_delay["FMSS_DELAY_SECONDS"] > 180)
+            & (df_delay["FMSS_DELAY_SECONDS"] <= 300)
+        ).sum()) if not df_delay.empty else 0,
+        "delay_5_10_count": int((
+            (df_delay["FMSS_DELAY_SECONDS"] > 300)
+            & (df_delay["FMSS_DELAY_SECONDS"] <= 600)
+        ).sum()) if not df_delay.empty else 0,
+        "delay_gt_10_count": int((
+            df_delay["FMSS_DELAY_SECONDS"] > 600
+        ).sum()) if not df_delay.empty else 0,
+        "delay_median_seconds": median,
+        "delay_p95_seconds": p95,
+        "delay_p99_seconds": p99,
+        "delay_max_seconds": maximum,
+        "coverage_buffer_seconds": coverage_buffer,
+        "negative_time_anomaly_count": int(len(df_time_anomaly)),
+    }
+
+    return df_delay, df_time_anomaly, meta
+
+
+def apply_bniva_h0_coverage_guard(
+    df_selisih_int,
+    df_selisih_bnk,
+    df_int_valid,
+    df_bank_valid,
+    recon_dates,
+    recon_mode,
+    bniva_delay_meta=None,
+    bniva_source_meta=None,
+):
+    """
+    Guard coverage khusus BNIVA H0.
+
+    Tujuan:
+      1. File BNI H0 dapat terpotong karena batas jumlah row. FMSS_ONLY yang
+         berada sebelum coverage bank yang dapat dipercaya dipindahkan menjadi
+         BANK FILE COVERAGE GAP, bukan confirmed Issue FMSS.
+      2. Bank unmatched di ujung kanan yang masih berada dalam posting-window
+         normal/dinamis dipindahkan menjadi PENDING FMSS UPDATE.
+
+    Tidak mengubah hasil MATCHED. Guard ini STRICT H0 ONLY:
+    hanya aktif bila recon_mode == "H0" (target date = tanggal proses).
+    Pada H+1 / HISTORICAL, Coverage Gap dan Pending FMSS Update wajib OFF
+    walaupun filename/snapshot bank berasal dari target date.
+    """
+
+    out_int = (
+        df_selisih_int.copy()
+        if df_selisih_int is not None
+        else pd.DataFrame()
+    )
+    out_bank = (
+        df_selisih_bnk.copy()
+        if df_selisih_bnk is not None
+        else pd.DataFrame()
+    )
+
+    empty_gap = pd.DataFrame()
+    empty_pending = pd.DataFrame()
+
+    meta = {
+        "guard_active": False,
+        "bank_file_likely_truncated": False,
+        "bank_raw_row_count": None,
+        "bank_coverage_start": pd.NaT,
+        "bank_coverage_end": pd.NaT,
+        "fmss_coverage_end": pd.NaT,
+        "trusted_bank_coverage_start": pd.NaT,
+        "coverage_buffer_seconds": BNIVA_COVERAGE_MIN_BUFFER_SECONDS,
+        "coverage_gap_count": 0,
+        "pending_fmss_count": 0,
+    }
+
+    target_dates = {
+        pd.to_datetime(d).date()
+        for d in (recon_dates or [])
+    }
+
+    if len(target_dates) != 1:
+        return out_int, out_bank, empty_gap, empty_pending, meta
+
+    target_date = next(iter(target_dates))
+    source_meta = dict(bniva_source_meta or {})
+    delay_meta = dict(bniva_delay_meta or {})
+
+    # PRODUCTION HARDENING BNIVA:
+    # Coverage Gap dan Pending FMSS Update adalah konsep snapshot H0 saja.
+    # Jangan aktifkan kembali guard hanya karena filename/snapshot bank
+    # memiliki tanggal yang sama dengan target reconciliation. Saat target
+    # date sudah historical (mis. data 19 diproses tanggal 20), seluruh
+    # unmatched harus kembali dinilai sebagai Issue FMSS / Issue Bank normal.
+    h0_like = (
+        str(recon_mode).strip().upper() == "H0"
+    )
+
+    if not h0_like:
+        return out_int, out_bank, empty_gap, empty_pending, meta
+
+    if df_bank_valid is None or df_bank_valid.empty:
+        return out_int, out_bank, empty_gap, empty_pending, meta
+
+    bank_dt_all = pd.to_datetime(
+        df_bank_valid.get("_TANGGAL_DT"),
+        errors="coerce"
+    )
+    target_bank_mask = (
+        bank_dt_all.notna()
+        & bank_dt_all.dt.date.eq(target_date)
+    )
+    target_bank_dt = bank_dt_all.loc[target_bank_mask]
+
+    if target_bank_dt.empty:
+        return out_int, out_bank, empty_gap, empty_pending, meta
+
+    bank_start = target_bank_dt.min()
+    bank_end = target_bank_dt.max()
+
+    fmss_dt_all = pd.to_datetime(
+        df_int_valid.get("_TANGGAL_DT"),
+        errors="coerce"
+    ) if df_int_valid is not None and not df_int_valid.empty else pd.Series(dtype="datetime64[ns]")
+
+    target_fmss_dt = fmss_dt_all.loc[
+        fmss_dt_all.notna()
+        & fmss_dt_all.dt.date.eq(target_date)
+    ] if not fmss_dt_all.empty else pd.Series(dtype="datetime64[ns]")
+
+    fmss_end = (
+        target_fmss_dt.max()
+        if not target_fmss_dt.empty
+        else pd.NaT
+    )
+
+    buffer_seconds = int(
+        delay_meta.get(
+            "coverage_buffer_seconds",
+            BNIVA_COVERAGE_MIN_BUFFER_SECONDS
+        )
+        or BNIVA_COVERAGE_MIN_BUFFER_SECONDS
+    )
+    buffer_seconds = max(
+        BNIVA_COVERAGE_MIN_BUFFER_SECONDS,
+        min(BNIVA_COVERAGE_MAX_BUFFER_SECONDS, buffer_seconds)
+    )
+    buffer_delta = pd.Timedelta(seconds=buffer_seconds)
+
+    raw_row_count = source_meta.get("raw_row_count")
+    try:
+        raw_row_count_int = int(raw_row_count)
+    except Exception:
+        raw_row_count_int = 0
+
+    # Evidence tambahan: ada banyak FMSS_ONLY target-date sebelum bank mulai.
+    pre_bank_fmss_only_count = 0
+    if not out_int.empty and "_TANGGAL_DT" in out_int.columns:
+        int_dt = pd.to_datetime(out_int["_TANGGAL_DT"], errors="coerce")
+        int_status = out_int.get(
+            "STATUS_MATCH",
+            pd.Series("", index=out_int.index)
+        ).astype(str)
+        pre_bank_fmss_only_count = int((
+            int_dt.notna()
+            & int_dt.dt.date.eq(target_date)
+            & (int_dt < bank_start)
+            & int_status.eq("FMSS_ONLY")
+        ).sum())
+
+    bank_file_likely_truncated = (
+        raw_row_count_int >= BNIVA_BANK_FILE_TRUNCATION_ROW_HINT
+        or pre_bank_fmss_only_count >= 5
+    )
+
+    trusted_bank_start = bank_start + buffer_delta
+
+    df_coverage_gap = pd.DataFrame()
+
+    if bank_file_likely_truncated and not out_int.empty:
+        int_dt = pd.to_datetime(out_int["_TANGGAL_DT"], errors="coerce")
+        int_status = out_int.get(
+            "STATUS_MATCH",
+            pd.Series("", index=out_int.index)
+        ).astype(str)
+
+        gap_mask = (
+            int_dt.notna()
+            & int_dt.dt.date.eq(target_date)
+            & (int_dt <= trusted_bank_start)
+            & int_status.eq("FMSS_ONLY")
+        )
+
+        if gap_mask.any():
+            df_coverage_gap = out_int.loc[gap_mask].copy()
+            df_coverage_gap["STATUS_MATCH"] = (
+                "BANK FILE COVERAGE GAP - BNIVA"
+            )
+            df_coverage_gap["COVERAGE_REASON"] = (
+                "FMSS berada sebelum trusted start file BNI H0; "
+                "file bank terindikasi terpotong / tidak mencakup awal hari."
+            )
+            df_coverage_gap["BNI_BANK_COVERAGE_START"] = bank_start
+            df_coverage_gap["BNI_TRUSTED_BANK_START"] = trusted_bank_start
+            df_coverage_gap["BNI_COVERAGE_BUFFER_SECONDS"] = buffer_seconds
+            out_int = out_int.loc[~gap_mask].copy()
+
+    # Bank unmatched di ujung coverage FMSS: jangan langsung Issue Bank.
+    df_pending_fmss = pd.DataFrame()
+
+    if not out_bank.empty and pd.notna(fmss_end):
+        bank_unmatched_dt = pd.to_datetime(
+            out_bank.get("_TANGGAL_DT"),
+            errors="coerce"
+        )
+
+        pending_start = fmss_end - buffer_delta
+        pending_mask = (
+            bank_unmatched_dt.notna()
+            & bank_unmatched_dt.dt.date.eq(target_date)
+            & (bank_unmatched_dt >= pending_start)
+        )
+
+        if pending_mask.any():
+            df_pending_fmss = out_bank.loc[pending_mask].copy()
+            df_pending_fmss["STATUS_MATCH"] = (
+                "PENDING_FMSS_UPDATE - BNIVA"
+            )
+            df_pending_fmss["PENDING_REASON"] = (
+                "Bank sudah masuk tetapi masih berada dalam dynamic FMSS "
+                "posting window pada ujung snapshot H0."
+            )
+            df_pending_fmss["BNI_FMSS_COVERAGE_END"] = fmss_end
+            df_pending_fmss["BNI_COVERAGE_BUFFER_SECONDS"] = buffer_seconds
+            out_bank = out_bank.loc[~pending_mask].copy()
+
+    meta.update({
+        "guard_active": True,
+        "bank_file_likely_truncated": bool(bank_file_likely_truncated),
+        "bank_raw_row_count": raw_row_count_int,
+        "bank_coverage_start": bank_start,
+        "bank_coverage_end": bank_end,
+        "fmss_coverage_end": fmss_end,
+        "trusted_bank_coverage_start": trusted_bank_start,
+        "coverage_buffer_seconds": buffer_seconds,
+        "pre_bank_fmss_only_count": pre_bank_fmss_only_count,
+        "coverage_gap_count": int(len(df_coverage_gap)),
+        "pending_fmss_count": int(len(df_pending_fmss)),
+    })
+
+    return (
+        out_int,
+        out_bank,
+        df_coverage_gap,
+        df_pending_fmss,
+        meta,
+    )
 
 
 def fast_match_bniva(
@@ -9232,6 +9679,12 @@ if (
     st.session_state.df_bniva_h1_cutoff = pd.DataFrame()
     st.session_state.df_bniva_h1_retry = pd.DataFrame()
     st.session_state.df_bniva_time_anomaly = pd.DataFrame()
+    st.session_state.df_bniva_fmss_delay = pd.DataFrame()
+    st.session_state.df_bniva_delay_time_anomaly = pd.DataFrame()
+    st.session_state.df_bniva_coverage_gap = pd.DataFrame()
+    st.session_state.df_bniva_pending_fmss = pd.DataFrame()
+    st.session_state.bniva_delay_meta = {}
+    st.session_state.bniva_coverage_meta = {}
     st.session_state.df_mandiriva_pending_bank_update = pd.DataFrame()
     st.session_state.df_mandiriva_bank_unverified = pd.DataFrame()
     st.session_state.df_mandiriva_false_prefix = pd.DataFrame()
@@ -9598,6 +10051,12 @@ if can_process:
                 df_bniva_h1_cutoff = pd.DataFrame()
                 df_bniva_h1_retry = pd.DataFrame()
                 df_bniva_time_anomaly = pd.DataFrame()
+                df_bniva_fmss_delay = pd.DataFrame()
+                df_bniva_delay_time_anomaly = pd.DataFrame()
+                df_bniva_coverage_gap = pd.DataFrame()
+                df_bniva_pending_fmss = pd.DataFrame()
+                bniva_delay_meta = {}
+                bniva_coverage_meta = {}
                 df_mandiriva_pending_bank_update = pd.DataFrame()
                 df_mandiriva_bank_unverified = pd.DataFrame()
                 df_mandiriva_false_prefix = pd.DataFrame()
@@ -10125,6 +10584,15 @@ if can_process:
                         "BNIVA"
                     )
 
+                    # Ambil metadata sebelum concat karena DataFrame.attrs dapat
+                    # hilang saat penggabungan dengan source bank lain.
+                    bniva_coverage_meta = dict(
+                        df_bniva.attrs.get(
+                            "bniva_meta",
+                            {}
+                        )
+                    )
+
                     bank_sources.append(
                         df_bniva
                     )
@@ -10383,6 +10851,45 @@ if can_process:
                     )
 
                 # =================================================
+                # BNIVA - FMSS POSTING DELAY MONITOR + H0 COVERAGE GUARD
+                # =================================================
+                # Delay card tidak mengubah MATCHED menjadi issue. Hanya strong
+                # Journal+VA+Nominal same-day match yang dipakai untuk latency.
+                # Coverage guard hanya mengklasifikasikan edge H0 agar file BNI
+                # yang terpotong tidak menghasilkan false Issue FMSS/Bank.
+
+                if pilihan_bank == "BNIVA":
+
+                    (
+                        df_bniva_fmss_delay,
+                        df_bniva_delay_time_anomaly,
+                        bniva_delay_meta
+                    ) = analyze_bniva_fmss_delay(
+                        df_matched
+                    )
+
+                    (
+                        df_selisih_int,
+                        df_selisih_bnk,
+                        df_bniva_coverage_gap,
+                        df_bniva_pending_fmss,
+                        bniva_h0_coverage_meta
+                    ) = apply_bniva_h0_coverage_guard(
+                        df_selisih_int=df_selisih_int,
+                        df_selisih_bnk=df_selisih_bnk,
+                        df_int_valid=df_int_valid,
+                        df_bank_valid=df_bank_valid,
+                        recon_dates=recon_dates,
+                        recon_mode=st.session_state.recon_mode,
+                        bniva_delay_meta=bniva_delay_meta,
+                        bniva_source_meta=bniva_coverage_meta
+                    )
+
+                    bniva_coverage_meta.update(
+                        bniva_h0_coverage_meta
+                    )
+
+                # =================================================
                 # MANDIRIVA - BANK UNMATCHED SETTLEMENT REGIME CLASSIFIER
                 # =================================================
                 # Core fast_match_mandiriva() TIDAK diubah. Seluruh unmatched Bank D
@@ -10572,6 +11079,30 @@ if can_process:
                     df_bniva_time_anomaly
                 )
 
+                st.session_state.df_bniva_fmss_delay = (
+                    df_bniva_fmss_delay
+                )
+
+                st.session_state.df_bniva_delay_time_anomaly = (
+                    df_bniva_delay_time_anomaly
+                )
+
+                st.session_state.df_bniva_coverage_gap = (
+                    df_bniva_coverage_gap
+                )
+
+                st.session_state.df_bniva_pending_fmss = (
+                    df_bniva_pending_fmss
+                )
+
+                st.session_state.bniva_delay_meta = (
+                    bniva_delay_meta
+                )
+
+                st.session_state.bniva_coverage_meta = (
+                    bniva_coverage_meta
+                )
+
                 st.session_state.df_mandiriva_pending_bank_update = (
                     df_mandiriva_pending_bank_update
                 )
@@ -10651,6 +11182,30 @@ if st.session_state.sudah_diproses:
 
     df_bniva_time_anomaly = (
         st.session_state.df_bniva_time_anomaly
+    )
+
+    df_bniva_fmss_delay = (
+        st.session_state.df_bniva_fmss_delay
+    )
+
+    df_bniva_delay_time_anomaly = (
+        st.session_state.df_bniva_delay_time_anomaly
+    )
+
+    df_bniva_coverage_gap = (
+        st.session_state.df_bniva_coverage_gap
+    )
+
+    df_bniva_pending_fmss = (
+        st.session_state.df_bniva_pending_fmss
+    )
+
+    bniva_delay_meta = (
+        st.session_state.bniva_delay_meta
+    )
+
+    bniva_coverage_meta = (
+        st.session_state.bniva_coverage_meta
     )
 
     df_mandiriva_pending_bank_update = (
@@ -10905,6 +11460,220 @@ if st.session_state.sudah_diproses:
                         use_container_width=True,
                         hide_index=True
                     )
+
+    # ========================================================
+    # BNIVA - FMSS DELAY / H0 COVERAGE INDICATORS
+    # ========================================================
+
+    if pilihan_bank == "BNIVA":
+
+        bniva_delay_count = len(df_bniva_fmss_delay)
+        bniva_delay_nominal = (
+            df_bniva_fmss_delay["NOMINAL_ASLI"].sum()
+            if (
+                not df_bniva_fmss_delay.empty
+                and "NOMINAL_ASLI" in df_bniva_fmss_delay.columns
+            )
+            else 0
+        )
+
+        if bniva_delay_count > 0:
+            with st.container(border=True):
+                st.metric(
+                    "⏱️ FMSS Delay — BNIVA",
+                    f"{bniva_delay_count:,} Trx",
+                    delta="> 3 menit",
+                    delta_color="off"
+                )
+
+                delay_3_5 = int(bniva_delay_meta.get("delay_3_5_count", 0) or 0)
+                delay_5_10 = int(bniva_delay_meta.get("delay_5_10_count", 0) or 0)
+                delay_gt_10 = int(bniva_delay_meta.get("delay_gt_10_count", 0) or 0)
+                delay_max = bniva_delay_meta.get("delay_max_seconds")
+
+                delay_caption = (
+                    f"Strong match Journal + VA + nominal yang baru tercatat di FMSS "
+                    f"lebih dari 3 menit setelah uang masuk BNI. "
+                    f"Nominal audit: **{format_rupiah(bniva_delay_nominal)}**. "
+                    f"3–5 menit: **{delay_3_5:,}** | "
+                    f"5–10 menit: **{delay_5_10:,}** | "
+                    f">10 menit: **{delay_gt_10:,}**."
+                )
+
+                if delay_max is not None:
+                    delay_caption += (
+                        f" Max observed: **{float(delay_max) / 60:.2f} menit**."
+                    )
+
+                st.caption(delay_caption)
+
+                if (delay_5_10 + delay_gt_10) > 0:
+                    st.warning(
+                        "🟠 **FMSS Delay Spike terdeteksi.** "
+                        f"Ada **{delay_5_10 + delay_gt_10:,} transaksi** dengan delay "
+                        "lebih dari 5 menit. Transaksi tetap berstatus MATCHED; "
+                        "indikator ini ditujukan untuk monitoring potensi komplain."
+                    )
+
+                with st.expander(
+                    f"🔎 Lihat detail FMSS Delay ({bniva_delay_count:,})",
+                    expanded=False
+                ):
+                    delay_cols = [
+                        col
+                        for col in [
+                            "FMSS_BANK_TIME",
+                            "FMSS_POST_TIME",
+                            "FMSS_DELAY_MINUTES",
+                            "KODE_VA",
+                            "FMSS_JOURNAL",
+                            "BANK_JOURNAL",
+                            "NOMINAL_ASLI",
+                            "FMSS_DELAY_SEVERITY",
+                            "MATCH_METHOD",
+                            "MATCH_CONFIDENCE"
+                        ]
+                        if col in df_bniva_fmss_delay.columns
+                    ]
+
+                    delay_display = df_bniva_fmss_delay[delay_cols].copy()
+                    delay_display = delay_display.rename(columns={
+                        "FMSS_BANK_TIME": "WAKTU_BANK",
+                        "FMSS_POST_TIME": "WAKTU_FMSS",
+                        "FMSS_DELAY_MINUTES": "DELAY_MENIT",
+                        "NOMINAL_ASLI": "NOMINAL"
+                    })
+
+                    if "DELAY_MENIT" in delay_display.columns:
+                        delay_display["DELAY_MENIT"] = (
+                            pd.to_numeric(
+                                delay_display["DELAY_MENIT"],
+                                errors="coerce"
+                            ).round(3)
+                        )
+
+                    st.dataframe(
+                        delay_display,
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+        coverage_gap_count = len(df_bniva_coverage_gap)
+        coverage_gap_nominal = (
+            df_bniva_coverage_gap["NOMINAL_ASLI"].sum()
+            if (
+                not df_bniva_coverage_gap.empty
+                and "NOMINAL_ASLI" in df_bniva_coverage_gap.columns
+            )
+            else 0
+        )
+
+        if coverage_gap_count > 0:
+            bank_start = bniva_coverage_meta.get("bank_coverage_start")
+            trusted_start = bniva_coverage_meta.get("trusted_bank_coverage_start")
+            raw_rows = bniva_coverage_meta.get("bank_raw_row_count")
+            buffer_seconds = bniva_coverage_meta.get("coverage_buffer_seconds")
+
+            info_parts = [
+                f"**{coverage_gap_count:,} transaksi / "
+                f"{format_rupiah(coverage_gap_nominal)}** dipindahkan dari Issue FMSS "
+                "menjadi **Bank File Coverage Gap** karena file mutasi BNI H0 "
+                "tidak mencakup awal hari secara penuh."
+            ]
+
+            if raw_rows:
+                info_parts.append(f"Raw row file BNI: **{int(raw_rows):,}**.")
+            if pd.notna(bank_start):
+                info_parts.append(
+                    "Bank coverage start: **"
+                    f"{pd.Timestamp(bank_start).strftime('%H:%M:%S')} WIB**."
+                )
+            if pd.notna(trusted_start):
+                info_parts.append(
+                    "Trusted bank start setelah dynamic lag buffer: **"
+                    f"{pd.Timestamp(trusted_start).strftime('%H:%M:%S')} WIB**."
+                )
+            if buffer_seconds:
+                info_parts.append(
+                    f"Dynamic buffer: **{int(buffer_seconds)} detik**."
+                )
+
+            st.info(
+                "📄 **BNI File Coverage Gap — H0.**  \n"
+                + "  \n".join(info_parts)
+            )
+
+            with st.expander(
+                f"🔎 Lihat Bank File Coverage Gap ({coverage_gap_count:,})",
+                expanded=False
+            ):
+                gap_cols = [
+                    col
+                    for col in [
+                        "_TANGGAL_DT",
+                        "KODE_VA",
+                        "FMSS_JOURNAL",
+                        "NOMINAL_ASLI",
+                        "STATUS_MATCH",
+                        "COVERAGE_REASON"
+                    ]
+                    if col in df_bniva_coverage_gap.columns
+                ]
+                st.dataframe(
+                    df_bniva_coverage_gap[gap_cols],
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+        pending_fmss_count = len(df_bniva_pending_fmss)
+        pending_fmss_nominal = (
+            df_bniva_pending_fmss["_CREDIT_NUM"].sum()
+            if (
+                not df_bniva_pending_fmss.empty
+                and "_CREDIT_NUM" in df_bniva_pending_fmss.columns
+            )
+            else 0
+        )
+
+        if pending_fmss_count > 0:
+            st.info(
+                "⏳ **Pending FMSS Update — BNIVA.**  \n"
+                f"**{pending_fmss_count:,} transaksi / "
+                f"{format_rupiah(pending_fmss_nominal)}** sudah terlihat di mutasi BNI, "
+                "tetapi masih berada di dalam dynamic posting window pada ujung "
+                "snapshot H0. Transaksi tidak dihitung sebagai confirmed Issue Bank."
+            )
+
+            with st.expander(
+                f"🔎 Lihat Pending FMSS Update ({pending_fmss_count:,})",
+                expanded=False
+            ):
+                pending_cols = [
+                    col
+                    for col in [
+                        "_TANGGAL_DT",
+                        "KODE_VA",
+                        "BANK_JOURNAL",
+                        "_CREDIT_NUM",
+                        "STATUS_MATCH",
+                        "PENDING_REASON"
+                    ]
+                    if col in df_bniva_pending_fmss.columns
+                ]
+                st.dataframe(
+                    df_bniva_pending_fmss[pending_cols],
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+        if not df_bniva_delay_time_anomaly.empty:
+            st.warning(
+                "🕒 **Matched Time Anomaly — BNIVA.** "
+                f"Ada **{len(df_bniva_delay_time_anomaly):,} transaksi strong match** "
+                "dengan timestamp FMSS lebih awal daripada Post Date bank. "
+                "Transaksi dikeluarkan dari perhitungan FMSS Delay dan tetap "
+                "tersedia pada Excel audit."
+            )
 
     # ========================================================
     # MANDIRIVA BANK ISSUE / H-1 / FRESHNESS INDICATOR
@@ -11303,6 +12072,9 @@ if st.session_state.sudah_diproses:
     ) or (
         pilihan_bank == "PERMATAVA"
         and not df_permata_pending_fmss.empty
+    ) or (
+        pilihan_bank == "BNIVA"
+        and not df_bniva_coverage_gap.empty
     ):
         fmss_rate_label = "📈 Match Rate FMSS (Trusted Window)"
 
@@ -11316,6 +12088,9 @@ if st.session_state.sudah_diproses:
     if (
         pilihan_bank == "MANDIRIVA"
         and not df_mandiriva_bank_unverified.empty
+    ) or (
+        pilihan_bank == "BNIVA"
+        and not df_bniva_pending_fmss.empty
     ):
         bank_rate_label = "📈 Match Rate Bank (Verified Scope)"
 
@@ -11466,6 +12241,12 @@ if st.session_state.sudah_diproses:
                     f"Sebanyak {len(df_permata_pending_fmss):,} transaksi masih "
                     "Pending Bank Coverage Review (H0)."
                 )
+            elif pilihan_bank == "BNIVA" and not df_bniva_coverage_gap.empty:
+                st.info(
+                    "Tidak ada confirmed Issue FMSS di dalam trusted bank coverage. "
+                    f"Sebanyak **{len(df_bniva_coverage_gap):,} transaksi** dipisahkan "
+                    "sebagai **BNI File Coverage Gap** karena file bank H0 terpotong."
+                )
             else:
 
                 st.success(
@@ -11540,6 +12321,12 @@ if st.session_state.sudah_diproses:
             elif pilihan_bank == "PERMATAVA" and not df_permata_pending_bank.empty:
                 st.info(f"Tidak ada Issue Bank pada trusted window; "
                         f"{len(df_permata_pending_bank):,} transaksi masih Pending FMSS Update (H0).")
+            elif pilihan_bank == "BNIVA" and not df_bniva_pending_fmss.empty:
+                st.info(
+                    "Tidak ada confirmed Issue Bank. "
+                    f"Sebanyak **{len(df_bniva_pending_fmss):,} transaksi** masih "
+                    "berstatus **Pending FMSS Update** pada dynamic posting window H0."
+                )
             else:
                 st.success(
                     "Tidak ada issue Bank. "
@@ -12015,6 +12802,46 @@ if st.session_state.sudah_diproses:
                         sheet_name="BNI_TIME_ANOMALY",
                         index=False
                     )
+
+                if not df_bniva_fmss_delay.empty:
+                    df_bniva_fmss_delay.to_excel(
+                        writer,
+                        sheet_name="BNI_FMSS_DELAY",
+                        index=False
+                    )
+
+                if not df_bniva_delay_time_anomaly.empty:
+                    df_bniva_delay_time_anomaly.to_excel(
+                        writer,
+                        sheet_name="BNI_MATCH_TIME_ANOM",
+                        index=False
+                    )
+
+                if not df_bniva_coverage_gap.empty:
+                    df_bniva_coverage_gap.to_excel(
+                        writer,
+                        sheet_name="BNI_COVERAGE_GAP",
+                        index=False
+                    )
+
+                if not df_bniva_pending_fmss.empty:
+                    df_bniva_pending_fmss.to_excel(
+                        writer,
+                        sheet_name="BNI_PENDING_FMSS",
+                        index=False
+                    )
+
+                pd.DataFrame({
+                    "METRIC": list({**bniva_delay_meta, **bniva_coverage_meta}.keys()),
+                    "VALUE": [
+                        str(v)
+                        for v in {**bniva_delay_meta, **bniva_coverage_meta}.values()
+                    ]
+                }).to_excel(
+                    writer,
+                    sheet_name="BNI_MONITOR_META",
+                    index=False
+                )
 
             # ------------------------------------------------
             # MANDIRIVA H0 PENDING BANK UPDATE
