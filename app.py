@@ -460,6 +460,214 @@ def format_rupiah(value):
     ).replace(",", ".")
 
 
+
+# ============================================================
+# ALL VA - POSTING PERFORMANCE
+# ============================================================
+# Monitoring performa waktu antar pasangan Bank vs FMSS.
+# Fitur ini hanya membaca hasil MATCHED dan TIDAK mengubah core matching,
+# Issue FMSS, Issue Bank, fee, cutoff, H0 guard, maupun engine VA lain.
+#
+# Arah timestamp mengikuti karakteristik engine yang sudah tervalidasi:
+#   BRIVA / BNIVA / PERMATAVA : FMSS - Bank
+#   BCAVA / MANDIRIVA         : Bank - FMSS
+# Hanya pasangan same-day dengan gap non-negatif yang masuk statistik.
+# Cross-day/cutoff dan time anomaly tidak dicampur ke performa harian.
+
+POSTING_PERFORMANCE_SUPPORTED_VA = {
+    "BRIVA",
+    "BNIVA",
+    "BCAVA",
+    "MANDIRIVA",
+    "PERMATAVA",
+}
+
+
+def format_duration_compact(seconds):
+    """Format detik menjadi label ringkas: 12s, 2m 03s, 1h 02m 03s."""
+
+    if seconds is None or pd.isna(seconds):
+        return "-"
+
+    try:
+        total_seconds = max(0, int(round(float(seconds))))
+    except Exception:
+        return "-"
+
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+
+    if hours > 0:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+
+    if minutes > 0:
+        return f"{minutes}m {secs:02d}s"
+
+    return f"{secs}s"
+
+
+def calculate_posting_performance(df_matched, bank_name):
+    """
+    Hitung Posting Performance lintas VA dari transaksi MATCHED saja.
+
+    Guard kualitas:
+      - hanya VA engine yang didukung,
+      - hanya timestamp FMSS + bank yang valid,
+      - hanya same-day supaya cutoff/cross-day tidak mengacaukan statistik,
+      - gap harus non-negatif sesuai arah timestamp masing-masing engine,
+      - BNIVA hanya strong Journal + VA + nominal,
+      - BRIVA mengeluarkan duplicate key VA+nominal dari statistik karena
+        core BRIVA memakai FIFO untuk duplicate dan pairing waktunya tidak
+        cukup kuat untuk dijadikan basis latency.
+
+    Fitur ini bersifat observability/presentation only; hasil matching tidak
+    diubah sama sekali.
+    """
+
+    empty = {
+        "available": False,
+        "sample_count": 0,
+        "average_seconds": None,
+        "median_seconds": None,
+        "p95_seconds": None,
+        "fastest_seconds": None,
+        "slowest_seconds": None,
+        "excluded_cross_day": 0,
+        "excluded_time_anomaly": 0,
+        "excluded_duplicate_pairing": 0,
+    }
+
+    if bank_name not in POSTING_PERFORMANCE_SUPPORTED_VA:
+        return empty
+
+    if df_matched is None or df_matched.empty:
+        return empty
+
+    work = df_matched.copy()
+
+    if "STATUS_MATCH" in work.columns:
+        work = work[
+            work["STATUS_MATCH"].astype(str).str.upper().eq("MATCHED")
+        ].copy()
+
+    if work.empty or "_TANGGAL_DT" not in work.columns:
+        return empty
+
+    bank_datetime_candidates = {
+        "BRIVA": ["MATCH_BANK_DATETIME", "BANK_MATCH_DATETIME", "MATCH_BANK_DATE"],
+        "BNIVA": ["MATCH_BANK_DATE", "MATCH_BANK_DATETIME", "BANK_MATCH_DATETIME"],
+        "BCAVA": ["BANK_MATCH_DATETIME", "MATCH_BANK_DATETIME", "MATCH_BANK_DATE"],
+        "MANDIRIVA": ["BANK_MATCH_DATETIME", "MATCH_BANK_DATETIME", "MATCH_BANK_DATE"],
+        "PERMATAVA": ["MATCH_BANK_DATETIME", "BANK_MATCH_DATETIME", "MATCH_BANK_DATE"],
+    }
+
+    bank_dt_col = next(
+        (
+            col
+            for col in bank_datetime_candidates.get(bank_name, [])
+            if col in work.columns
+        ),
+        None,
+    )
+
+    if bank_dt_col is None:
+        return empty
+
+    # BNIVA: latency hanya menggunakan strong exact Journal + VA + nominal.
+    if bank_name == "BNIVA":
+        if "MATCH_METHOD" in work.columns:
+            work = work[
+                work["MATCH_METHOD"].astype(str).eq("JOURNAL_VA_NOMINAL")
+            ].copy()
+        if "MATCH_CONFIDENCE" in work.columns:
+            work = work[
+                work["MATCH_CONFIDENCE"].astype(str).eq("STRONG")
+            ].copy()
+
+    if work.empty:
+        return empty
+
+    # BRIVA: duplicate VA+nominal masih valid untuk rekonsiliasi, tetapi FIFO
+    # tidak cukup presisi untuk mengukur latency per occurrence. Exclude hanya
+    # dari Posting Performance; transaksi tetap MATCHED di engine utama.
+    excluded_duplicate_pairing = 0
+    if (
+        bank_name == "BRIVA"
+        and "KODE_VA" in work.columns
+        and "EXPECTED_BANK" in work.columns
+    ):
+        duplicate_mask = work.duplicated(
+            subset=["KODE_VA", "EXPECTED_BANK"],
+            keep=False,
+        )
+        excluded_duplicate_pairing = int(duplicate_mask.sum())
+        work = work.loc[~duplicate_mask].copy()
+
+    if work.empty:
+        result = dict(empty)
+        result["excluded_duplicate_pairing"] = excluded_duplicate_pairing
+        return result
+
+    fmss_dt = pd.to_datetime(work["_TANGGAL_DT"], errors="coerce")
+    bank_dt = pd.to_datetime(work[bank_dt_col], errors="coerce")
+
+    valid_dt = fmss_dt.notna() & bank_dt.notna()
+    work = work.loc[valid_dt].copy()
+    fmss_dt = fmss_dt.loc[valid_dt]
+    bank_dt = bank_dt.loc[valid_dt]
+
+    if work.empty:
+        result = dict(empty)
+        result["excluded_duplicate_pairing"] = excluded_duplicate_pairing
+        return result
+
+    same_day = (
+        fmss_dt.dt.date == bank_dt.dt.date
+    )
+
+    excluded_cross_day = int((~same_day).sum())
+
+    work = work.loc[same_day].copy()
+    fmss_dt = fmss_dt.loc[same_day]
+    bank_dt = bank_dt.loc[same_day]
+
+    if work.empty:
+        result = dict(empty)
+        result["excluded_cross_day"] = excluded_cross_day
+        result["excluded_duplicate_pairing"] = excluded_duplicate_pairing
+        return result
+
+    if bank_name in {"BRIVA", "BNIVA", "PERMATAVA"}:
+        gap_seconds = (fmss_dt - bank_dt).dt.total_seconds()
+    else:
+        # BCAVA dan MANDIRIVA menggunakan timestamp FMSS sebagai upstream
+        # reference dan timestamp bank sebagai downstream posting evidence.
+        gap_seconds = (bank_dt - fmss_dt).dt.total_seconds()
+
+    valid_gap = gap_seconds.notna() & gap_seconds.ge(0)
+    excluded_time_anomaly = int((~valid_gap).sum())
+    gap_seconds = gap_seconds.loc[valid_gap].astype(float)
+
+    if gap_seconds.empty:
+        result = dict(empty)
+        result["excluded_cross_day"] = excluded_cross_day
+        result["excluded_time_anomaly"] = excluded_time_anomaly
+        result["excluded_duplicate_pairing"] = excluded_duplicate_pairing
+        return result
+
+    return {
+        "available": True,
+        "sample_count": int(len(gap_seconds)),
+        "average_seconds": float(gap_seconds.mean()),
+        "median_seconds": float(gap_seconds.median()),
+        "p95_seconds": float(gap_seconds.quantile(0.95)),
+        "fastest_seconds": float(gap_seconds.min()),
+        "slowest_seconds": float(gap_seconds.max()),
+        "excluded_cross_day": excluded_cross_day,
+        "excluded_time_anomaly": excluded_time_anomaly,
+        "excluded_duplicate_pairing": excluded_duplicate_pairing,
+    }
+
 def classify_issue_bank(description):
 
     category = classify_bank_transaction(
@@ -12029,6 +12237,55 @@ if st.session_state.sudah_diproses:
                     use_container_width=True,
                     hide_index=True
                 )
+
+
+
+    # ========================================================
+    # ALL VA - POSTING PERFORMANCE
+    # ========================================================
+    # Observability only. Tidak mengubah hasil matching/issue.
+
+    posting_performance = calculate_posting_performance(
+        df_matched,
+        pilihan_bank
+    )
+
+    if posting_performance.get("available"):
+
+        with st.container(border=True):
+            st.markdown(
+                "**⚡ Posting Performance**  \n"
+                f"Avg **{format_duration_compact(posting_performance.get('average_seconds'))}** · "
+                f"Median **{format_duration_compact(posting_performance.get('median_seconds'))}** · "
+                f"P95 **{format_duration_compact(posting_performance.get('p95_seconds'))}** · "
+                f"Fastest **{format_duration_compact(posting_performance.get('fastest_seconds'))}** · "
+                f"Slowest **{format_duration_compact(posting_performance.get('slowest_seconds'))}**"
+            )
+
+            perf_notes = [
+                f"Basis **{posting_performance.get('sample_count', 0):,} matched same-day** "
+                "dengan timestamp Bank dan FMSS yang valid."
+            ]
+
+            if posting_performance.get("excluded_cross_day", 0) > 0:
+                perf_notes.append(
+                    f"Cross-day/cutoff dikeluarkan: "
+                    f"**{posting_performance.get('excluded_cross_day', 0):,}**."
+                )
+
+            if posting_performance.get("excluded_time_anomaly", 0) > 0:
+                perf_notes.append(
+                    f"Time anomaly dikeluarkan: "
+                    f"**{posting_performance.get('excluded_time_anomaly', 0):,}**."
+                )
+
+            if posting_performance.get("excluded_duplicate_pairing", 0) > 0:
+                perf_notes.append(
+                    f"Duplicate pairing BRIVA tidak dipakai untuk latency: "
+                    f"**{posting_performance.get('excluded_duplicate_pairing', 0):,}**."
+                )
+
+            st.caption(" ".join(perf_notes))
 
     # ========================================================
     # MATCH RATE
