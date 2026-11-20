@@ -468,9 +468,9 @@ def format_rupiah(value):
 # Fitur ini hanya membaca hasil MATCHED dan TIDAK mengubah core matching,
 # Issue FMSS, Issue Bank, fee, cutoff, H0 guard, maupun engine VA lain.
 #
-# Arah timestamp mengikuti karakteristik engine yang sudah tervalidasi:
-#   BRIVA / BNIVA / PERMATAVA : FMSS - Bank
-#   BCAVA / MANDIRIVA         : Bank - FMSS
+# Arah timestamp mengikuti urutan posting masing-masing engine:
+#   BRIVA / BNIVA / BCAVA / PERMATAVA : FMSS - Bank
+#   MANDIRIVA                         : Bank - FMSS
 # Hanya pasangan same-day dengan gap non-negatif yang masuk statistik.
 # Cross-day/cutoff dan time anomaly tidak dicampur ke performa harian.
 
@@ -480,6 +480,17 @@ POSTING_PERFORMANCE_SUPPORTED_VA = {
     "BCAVA",
     "MANDIRIVA",
     "PERMATAVA",
+}
+
+# Arah latency dibuat eksplisit per engine supaya perubahan pada satu VA tidak
+# tanpa sengaja memengaruhi VA lain. Nilai positif selalu berarti waktu posting
+# downstream setelah event upstream yang menjadi basis monitoring.
+POSTING_PERFORMANCE_DIRECTION = {
+    "BRIVA": "FMSS_MINUS_BANK",
+    "BNIVA": "FMSS_MINUS_BANK",
+    "BCAVA": "FMSS_MINUS_BANK",
+    "MANDIRIVA": "BANK_MINUS_FMSS",
+    "PERMATAVA": "FMSS_MINUS_BANK",
 }
 
 
@@ -535,6 +546,11 @@ def calculate_posting_performance(df_matched, bank_name):
         "excluded_cross_day": 0,
         "excluded_time_anomaly": 0,
         "excluded_duplicate_pairing": 0,
+        "matched_input_count": 0,
+        "valid_timestamp_count": 0,
+        "same_day_count": 0,
+        "direction": POSTING_PERFORMANCE_DIRECTION.get(bank_name),
+        "bank_datetime_column": None,
     }
 
     if bank_name not in POSTING_PERFORMANCE_SUPPORTED_VA:
@@ -552,6 +568,8 @@ def calculate_posting_performance(df_matched, bank_name):
 
     if work.empty or "_TANGGAL_DT" not in work.columns:
         return empty
+
+    empty["matched_input_count"] = int(len(work))
 
     bank_datetime_candidates = {
         "BRIVA": ["MATCH_BANK_DATETIME", "BANK_MATCH_DATETIME", "MATCH_BANK_DATE"],
@@ -572,6 +590,8 @@ def calculate_posting_performance(df_matched, bank_name):
 
     if bank_dt_col is None:
         return empty
+
+    empty["bank_datetime_column"] = bank_dt_col
 
     # BNIVA: latency hanya menggunakan strong exact Journal + VA + nominal.
     if bank_name == "BNIVA":
@@ -612,6 +632,7 @@ def calculate_posting_performance(df_matched, bank_name):
     bank_dt = pd.to_datetime(work[bank_dt_col], errors="coerce")
 
     valid_dt = fmss_dt.notna() & bank_dt.notna()
+    empty["valid_timestamp_count"] = int(valid_dt.sum())
     work = work.loc[valid_dt].copy()
     fmss_dt = fmss_dt.loc[valid_dt]
     bank_dt = bank_dt.loc[valid_dt]
@@ -626,6 +647,7 @@ def calculate_posting_performance(df_matched, bank_name):
     )
 
     excluded_cross_day = int((~same_day).sum())
+    empty["same_day_count"] = int(same_day.sum())
 
     work = work.loc[same_day].copy()
     fmss_dt = fmss_dt.loc[same_day]
@@ -637,12 +659,19 @@ def calculate_posting_performance(df_matched, bank_name):
         result["excluded_duplicate_pairing"] = excluded_duplicate_pairing
         return result
 
-    if bank_name in {"BRIVA", "BNIVA", "PERMATAVA"}:
+    direction = POSTING_PERFORMANCE_DIRECTION.get(bank_name)
+
+    if direction == "FMSS_MINUS_BANK":
+        # BRIVA / BNIVA / BCAVA / PERMATAVA:
+        # event bank menjadi evidence uang masuk dan latency yang dipantau adalah
+        # waktu sampai transaksi tercatat/posting di FMSS.
         gap_seconds = (fmss_dt - bank_dt).dt.total_seconds()
-    else:
-        # BCAVA dan MANDIRIVA menggunakan timestamp FMSS sebagai upstream
-        # reference dan timestamp bank sebagai downstream posting evidence.
+    elif direction == "BANK_MINUS_FMSS":
+        # MANDIRIVA: timestamp FMSS adalah upstream reference dan timestamp bank
+        # adalah downstream posting evidence sesuai engine existing.
         gap_seconds = (bank_dt - fmss_dt).dt.total_seconds()
+    else:
+        return empty
 
     valid_gap = gap_seconds.notna() & gap_seconds.ge(0)
     excluded_time_anomaly = int((~valid_gap).sum())
@@ -666,6 +695,11 @@ def calculate_posting_performance(df_matched, bank_name):
         "excluded_cross_day": excluded_cross_day,
         "excluded_time_anomaly": excluded_time_anomaly,
         "excluded_duplicate_pairing": excluded_duplicate_pairing,
+        "matched_input_count": int(empty.get("matched_input_count", 0)),
+        "valid_timestamp_count": int(empty.get("valid_timestamp_count", 0)),
+        "same_day_count": int(empty.get("same_day_count", 0)),
+        "direction": direction,
+        "bank_datetime_column": bank_dt_col,
     }
 
 def classify_issue_bank(description):
@@ -6559,8 +6593,11 @@ def fast_match_bcava(
         )
 
         if pd.notna(fmss_dt) and pd.notna(bank_dt):
+            # BCAVA: transaksi bank terjadi lebih dulu, kemudian posting FMSS.
+            # Simpan latency positif sebagai FMSS - Bank agar konsisten dengan
+            # Posting Performance dan mudah diaudit.
             record["TIME_DIFFERENCE_SECONDS"] = (
-                bank_dt - fmss_dt
+                fmss_dt - bank_dt
             ).total_seconds()
         else:
             record["TIME_DIFFERENCE_SECONDS"] = None
@@ -12286,6 +12323,25 @@ if st.session_state.sudah_diproses:
                 )
 
             st.caption(" ".join(perf_notes))
+
+    elif pilihan_bank in POSTING_PERFORMANCE_SUPPORTED_VA:
+        with st.container(border=True):
+            st.markdown("**⚡ Posting Performance**")
+            diagnostic_parts = [
+                f"Matched input: **{posting_performance.get('matched_input_count', 0):,}**",
+                f"timestamp valid: **{posting_performance.get('valid_timestamp_count', 0):,}**",
+                f"same-day: **{posting_performance.get('same_day_count', 0):,}**",
+                f"time anomaly: **{posting_performance.get('excluded_time_anomaly', 0):,}**",
+            ]
+            if posting_performance.get("excluded_duplicate_pairing", 0) > 0:
+                diagnostic_parts.append(
+                    f"duplicate pairing excluded: **{posting_performance.get('excluded_duplicate_pairing', 0):,}**"
+                )
+            st.caption(
+                "Belum ada sampel latency yang lolos guard Posting Performance. "
+                + " · ".join(diagnostic_parts)
+                + ". Ini tidak mengubah hasil rekonsiliasi; hanya statistik latency yang belum dapat dihitung."
+            )
 
     # ========================================================
     # MATCH RATE
