@@ -702,6 +702,456 @@ def calculate_posting_performance(df_matched, bank_name):
         "bank_datetime_column": bank_dt_col,
     }
 
+
+# ============================================================
+# DYNAMIC POSTING REGIME ANALYZER - ALL VA
+# ============================================================
+# Layer observability setelah matching selesai.
+# Tidak mengubah MATCHED / Issue FMSS / Issue Bank / fee / cutoff / H0 guard.
+# Tidak ada hardcode jam cutoff bank. Settlement/cutoff diinfer dari pola latency
+# dan konsentrasi waktu release pada data matched yang tersedia.
+
+POSTING_REGIME_MIN_TOTAL_SAMPLES = 20
+POSTING_REGIME_MIN_SETTLEMENT_SAMPLES = 5
+POSTING_REGIME_MIN_OUTLIER_SHARE_FOR_CLUSTER = 0.60
+POSTING_REGIME_MIN_RELEASE_COMPRESSION = 0.35
+POSTING_REGIME_HIGH_CONFIDENCE_SCORE = 0.80
+POSTING_REGIME_MEDIUM_CONFIDENCE_SCORE = 0.60
+
+
+def _posting_stats(values):
+    values = pd.Series(values, dtype="float64").dropna()
+    if values.empty:
+        return {
+            "count": 0,
+            "average_seconds": None,
+            "median_seconds": None,
+            "p95_seconds": None,
+            "fastest_seconds": None,
+            "slowest_seconds": None,
+        }
+    return {
+        "count": int(len(values)),
+        "average_seconds": float(values.mean()),
+        "median_seconds": float(values.median()),
+        "p95_seconds": float(values.quantile(0.95)),
+        "fastest_seconds": float(values.min()),
+        "slowest_seconds": float(values.max()),
+    }
+
+
+def _prepare_posting_latency_frame(df_matched, bank_name):
+    """Bangun frame canonical untuk analisis performa tanpa mengubah df_matched."""
+    empty = pd.DataFrame()
+
+    if bank_name not in POSTING_PERFORMANCE_SUPPORTED_VA:
+        return empty
+    if df_matched is None or df_matched.empty:
+        return empty
+
+    work = df_matched.copy()
+    if "STATUS_MATCH" in work.columns:
+        work = work[
+            work["STATUS_MATCH"].astype(str).str.upper().eq("MATCHED")
+        ].copy()
+    if work.empty or "_TANGGAL_DT" not in work.columns:
+        return empty
+
+    bank_datetime_candidates = {
+        "BRIVA": ["MATCH_BANK_DATETIME", "BANK_MATCH_DATETIME", "MATCH_BANK_DATE"],
+        "BNIVA": ["MATCH_BANK_DATE", "MATCH_BANK_DATETIME", "BANK_MATCH_DATETIME"],
+        "BCAVA": ["BANK_MATCH_DATETIME", "MATCH_BANK_DATETIME", "MATCH_BANK_DATE"],
+        "MANDIRIVA": ["BANK_MATCH_DATETIME", "MATCH_BANK_DATETIME", "MATCH_BANK_DATE"],
+        "PERMATAVA": ["MATCH_BANK_DATETIME", "BANK_MATCH_DATETIME", "MATCH_BANK_DATE"],
+    }
+    bank_dt_col = next(
+        (c for c in bank_datetime_candidates.get(bank_name, []) if c in work.columns),
+        None,
+    )
+    if bank_dt_col is None:
+        return empty
+
+    # Kualitas pairing mengikuti Posting Performance existing.
+    if bank_name == "BNIVA":
+        if "MATCH_METHOD" in work.columns:
+            work = work[work["MATCH_METHOD"].astype(str).eq("JOURNAL_VA_NOMINAL")].copy()
+        if "MATCH_CONFIDENCE" in work.columns:
+            work = work[work["MATCH_CONFIDENCE"].astype(str).eq("STRONG")].copy()
+
+    if (
+        bank_name == "BRIVA"
+        and "KODE_VA" in work.columns
+        and "EXPECTED_BANK" in work.columns
+    ):
+        duplicate_mask = work.duplicated(
+            subset=["KODE_VA", "EXPECTED_BANK"], keep=False
+        )
+        work = work.loc[~duplicate_mask].copy()
+
+    if work.empty:
+        return empty
+
+    fmss_dt = pd.to_datetime(work["_TANGGAL_DT"], errors="coerce")
+    bank_dt = pd.to_datetime(work[bank_dt_col], errors="coerce")
+    valid = fmss_dt.notna() & bank_dt.notna()
+    work = work.loc[valid].copy()
+    fmss_dt = fmss_dt.loc[valid]
+    bank_dt = bank_dt.loc[valid]
+    if work.empty:
+        return empty
+
+    same_day = fmss_dt.dt.date.eq(bank_dt.dt.date)
+    work = work.loc[same_day].copy()
+    fmss_dt = fmss_dt.loc[same_day]
+    bank_dt = bank_dt.loc[same_day]
+    if work.empty:
+        return empty
+
+    direction = POSTING_PERFORMANCE_DIRECTION.get(bank_name)
+    if direction == "FMSS_MINUS_BANK":
+        latency = (fmss_dt - bank_dt).dt.total_seconds()
+        source_dt = bank_dt
+        release_dt = fmss_dt
+        source_label = "BANK"
+        release_label = "FMSS"
+    elif direction == "BANK_MINUS_FMSS":
+        latency = (bank_dt - fmss_dt).dt.total_seconds()
+        source_dt = fmss_dt
+        release_dt = bank_dt
+        source_label = "FMSS"
+        release_label = "BANK"
+    else:
+        return empty
+
+    valid_latency = latency.notna() & latency.ge(0)
+    work = work.loc[valid_latency].copy()
+    latency = latency.loc[valid_latency].astype(float)
+    source_dt = source_dt.loc[valid_latency]
+    release_dt = release_dt.loc[valid_latency]
+    if work.empty:
+        return empty
+
+    work["POSTING_LATENCY_SECONDS"] = latency.values
+    work["POSTING_SOURCE_DATETIME"] = source_dt.values
+    work["POSTING_RELEASE_DATETIME"] = release_dt.values
+    work["POSTING_SOURCE_SIDE"] = source_label
+    work["POSTING_RELEASE_SIDE"] = release_label
+    work["PERFORMANCE_CLASS"] = "NORMAL"
+    work["SETTLEMENT_CLUSTER_ID"] = pd.NA
+    work["SETTLEMENT_CONFIDENCE_SCORE"] = 0.0
+    work["SETTLEMENT_CONFIDENCE"] = "NONE"
+    return work.reset_index(drop=True)
+
+
+def _dynamic_slow_threshold(latency_values):
+    """
+    Batas slow sepenuhnya berasal dari distribusi hari itu.
+    Tidak memakai jam cutoff maupun threshold delay bank yang di-hardcode.
+    """
+    s = pd.Series(latency_values, dtype="float64").dropna()
+    if len(s) < 5:
+        return None, {}
+
+    median = float(s.median())
+    q25 = float(s.quantile(0.25))
+    q75 = float(s.quantile(0.75))
+    q95 = float(s.quantile(0.95))
+    iqr = max(0.0, q75 - q25)
+    mad = float((s - median).abs().median())
+    robust_sigma = 1.4826 * mad
+
+    # Dua pagar robust: dispersion-based dan ratio-based.
+    # Ratio guard mencegah distribusi sangat rapat menganggap noise kecil sebagai slow.
+    dispersion_guard = q95 + max(3.0 * iqr, 3.0 * robust_sigma)
+    ratio_guard = median * 2.0
+    threshold = max(dispersion_guard, ratio_guard)
+
+    return float(threshold), {
+        "median": median,
+        "q25": q25,
+        "q75": q75,
+        "q95": q95,
+        "iqr": iqr,
+        "mad": mad,
+        "robust_sigma": robust_sigma,
+    }
+
+
+def _cluster_slow_candidates(slow_df):
+    """Kelompokkan kandidat slow berdasarkan proximity waktu source secara dinamis."""
+    if slow_df is None or slow_df.empty:
+        return []
+
+    ordered = slow_df.sort_values("POSTING_SOURCE_DATETIME").copy()
+    if len(ordered) == 1:
+        return [list(ordered.index)]
+
+    gaps = (
+        ordered["POSTING_SOURCE_DATETIME"]
+        .diff()
+        .dt.total_seconds()
+        .dropna()
+        .clip(lower=0)
+    )
+
+    if gaps.empty:
+        return [list(ordered.index)]
+
+    # Gap pemisah dipelajari dari kandidat slow sendiri. q90 menjaga cluster
+    # settlement yang source-time-nya tersebar, median*3 menghindari split berlebih.
+    median_gap = float(gaps.median())
+    q90_gap = float(gaps.quantile(0.90))
+    split_gap = max(q90_gap, median_gap * 3.0)
+
+    clusters = []
+    current = []
+    prev_time = None
+
+    for idx, row in ordered.iterrows():
+        current_time = row["POSTING_SOURCE_DATETIME"]
+        if prev_time is None:
+            current = [idx]
+        else:
+            gap = (current_time - prev_time).total_seconds()
+            if gap > split_gap and current:
+                clusters.append(current)
+                current = [idx]
+            else:
+                current.append(idx)
+        prev_time = current_time
+
+    if current:
+        clusters.append(current)
+    return clusters
+
+
+def analyze_dynamic_posting_regimes(df_matched, bank_name, recon_mode=""):
+    """
+    Klasifikasi performa matched menjadi NORMAL / INFERRED_SETTLEMENT / OUTLIER.
+
+    Settlement hanya dipromosikan bila terdapat kombinasi:
+      1) latency jauh dari baseline robust,
+      2) slow transaction membentuk cluster source-time,
+      3) release-time lebih terkonsentrasi daripada source-time,
+      4) jumlah bukti cukup,
+      5) cluster menjelaskan porsi signifikan dari slow candidates.
+
+    Tidak ada hardcode jam cutoff bank.
+    """
+    frame = _prepare_posting_latency_frame(df_matched, bank_name)
+    empty = {
+        "available": False,
+        "frame": frame,
+        "normal": _posting_stats([]),
+        "settlement": _posting_stats([]),
+        "outlier": _posting_stats([]),
+        "slow_threshold_seconds": None,
+        "settlement_detected": False,
+        "settlement_count": 0,
+        "outlier_count": 0,
+        "normal_count": 0,
+        "confidence_score": 0.0,
+        "confidence": "NONE",
+        "source_window_start": pd.NaT,
+        "source_window_end": pd.NaT,
+        "release_window_start": pd.NaT,
+        "release_window_end": pd.NaT,
+        "source_side": None,
+        "release_side": None,
+        "provisional": str(recon_mode).upper() == "H0",
+        "reason": "",
+    }
+
+    if frame.empty:
+        empty["reason"] = "Tidak ada matched same-day dengan timestamp valid."
+        return empty
+
+    latency = frame["POSTING_LATENCY_SECONDS"].astype(float)
+    threshold, baseline_meta = _dynamic_slow_threshold(latency)
+    if threshold is None:
+        empty.update({
+            "available": True,
+            "frame": frame,
+            "normal": _posting_stats(latency),
+            "normal_count": int(len(frame)),
+            "reason": "Sampel terlalu sedikit untuk mendeteksi settlement secara dinamis.",
+        })
+        return empty
+
+    slow_mask = latency.gt(threshold)
+    slow_df = frame.loc[slow_mask].copy()
+    frame.loc[slow_mask, "PERFORMANCE_CLASS"] = "OUTLIER"
+
+    # Jika sampel total/slow belum cukup, jangan paksakan settlement.
+    if (
+        len(frame) < POSTING_REGIME_MIN_TOTAL_SAMPLES
+        or len(slow_df) < POSTING_REGIME_MIN_SETTLEMENT_SAMPLES
+    ):
+        empty.update({
+            "available": True,
+            "frame": frame,
+            "normal": _posting_stats(frame.loc[~slow_mask, "POSTING_LATENCY_SECONDS"]),
+            "outlier": _posting_stats(slow_df["POSTING_LATENCY_SECONDS"]),
+            "slow_threshold_seconds": threshold,
+            "normal_count": int((~slow_mask).sum()),
+            "outlier_count": int(slow_mask.sum()),
+            "source_side": frame["POSTING_SOURCE_SIDE"].iloc[0],
+            "release_side": frame["POSTING_RELEASE_SIDE"].iloc[0],
+            "reason": "Slow candidate ada, tetapi bukti cluster belum cukup untuk disebut settlement.",
+        })
+        return empty
+
+    source_clusters = _cluster_slow_candidates(slow_df)
+
+    # Evaluasi seluruh slow candidates sebagai satu candidate lebih dulu.
+    # Ini penting untuk pola settlement batch: source-time dapat tersebar cukup lama
+    # tetapi release-time justru berkumpul sangat rapat. Jika seluruh slow set tidak
+    # menunjukkan release compression, barulah sub-cluster source-time yang diuji.
+    clusters = [list(slow_df.index)]
+    seen_cluster_keys = {tuple(sorted(slow_df.index))}
+    for cluster_indexes in source_clusters:
+        key = tuple(sorted(cluster_indexes))
+        if key not in seen_cluster_keys:
+            clusters.append(cluster_indexes)
+            seen_cluster_keys.add(key)
+
+    candidates = []
+    slow_count = len(slow_df)
+
+    for cluster_no, indexes in enumerate(clusters, start=1):
+        cluster = frame.loc[indexes].copy()
+        n = len(cluster)
+        if n < POSTING_REGIME_MIN_SETTLEMENT_SAMPLES:
+            continue
+
+        source_start = cluster["POSTING_SOURCE_DATETIME"].min()
+        source_end = cluster["POSTING_SOURCE_DATETIME"].max()
+        release_start = cluster["POSTING_RELEASE_DATETIME"].min()
+        release_end = cluster["POSTING_RELEASE_DATETIME"].max()
+
+        source_span = max(0.0, (source_end - source_start).total_seconds())
+        release_span = max(0.0, (release_end - release_start).total_seconds())
+        compression = (
+            1.0 - min(1.0, release_span / source_span)
+            if source_span > 0
+            else 0.0
+        )
+        cluster_share = n / slow_count if slow_count else 0.0
+
+        cluster_latency = cluster["POSTING_LATENCY_SECONDS"].astype(float)
+        cluster_median = float(cluster_latency.median())
+        normal_median = float(baseline_meta.get("median") or 0.0)
+        separation_ratio = (
+            cluster_median / normal_median
+            if normal_median > 0
+            else 0.0
+        )
+
+        # Evidence score 0..1. Tidak bergantung pada jam tertentu.
+        size_score = min(1.0, n / max(POSTING_REGIME_MIN_SETTLEMENT_SAMPLES, 10))
+        share_score = min(1.0, cluster_share / POSTING_REGIME_MIN_OUTLIER_SHARE_FOR_CLUSTER)
+        compression_score = min(1.0, compression / POSTING_REGIME_MIN_RELEASE_COMPRESSION)
+        separation_score = min(1.0, max(0.0, (separation_ratio - 2.0) / 4.0))
+
+        score = (
+            0.20 * size_score
+            + 0.25 * share_score
+            + 0.30 * compression_score
+            + 0.25 * separation_score
+        )
+
+        # Promotion gate: evidence harus multi-dimensi, bukan cuma latency tinggi.
+        qualifies = (
+            cluster_share >= POSTING_REGIME_MIN_OUTLIER_SHARE_FOR_CLUSTER
+            and compression >= POSTING_REGIME_MIN_RELEASE_COMPRESSION
+            and separation_ratio >= 2.0
+            and score >= POSTING_REGIME_MEDIUM_CONFIDENCE_SCORE
+        )
+
+        if qualifies:
+            candidates.append({
+                "cluster_no": cluster_no,
+                "indexes": indexes,
+                "count": n,
+                "score": float(score),
+                "cluster_share": float(cluster_share),
+                "compression": float(compression),
+                "separation_ratio": float(separation_ratio),
+                "source_start": source_start,
+                "source_end": source_end,
+                "release_start": release_start,
+                "release_end": release_end,
+            })
+
+    if candidates:
+        # Pilih cluster dengan score tertinggi; cluster lain tetap OUTLIER agar
+        # label settlement tidak terlalu agresif pada satu hari.
+        best = max(candidates, key=lambda x: (x["score"], x["count"]))
+        idxs = best["indexes"]
+        score = best["score"]
+        confidence = "HIGH" if score >= POSTING_REGIME_HIGH_CONFIDENCE_SCORE else "MEDIUM"
+
+        frame.loc[idxs, "PERFORMANCE_CLASS"] = "INFERRED_SETTLEMENT"
+        frame.loc[idxs, "SETTLEMENT_CLUSTER_ID"] = int(best["cluster_no"])
+        frame.loc[idxs, "SETTLEMENT_CONFIDENCE_SCORE"] = float(score)
+        frame.loc[idxs, "SETTLEMENT_CONFIDENCE"] = confidence
+
+        settlement_mask = frame["PERFORMANCE_CLASS"].eq("INFERRED_SETTLEMENT")
+        outlier_mask = frame["PERFORMANCE_CLASS"].eq("OUTLIER")
+        normal_mask = frame["PERFORMANCE_CLASS"].eq("NORMAL")
+
+        return {
+            "available": True,
+            "frame": frame,
+            "normal": _posting_stats(frame.loc[normal_mask, "POSTING_LATENCY_SECONDS"]),
+            "settlement": _posting_stats(frame.loc[settlement_mask, "POSTING_LATENCY_SECONDS"]),
+            "outlier": _posting_stats(frame.loc[outlier_mask, "POSTING_LATENCY_SECONDS"]),
+            "slow_threshold_seconds": threshold,
+            "settlement_detected": True,
+            "settlement_count": int(settlement_mask.sum()),
+            "outlier_count": int(outlier_mask.sum()),
+            "normal_count": int(normal_mask.sum()),
+            "confidence_score": float(score),
+            "confidence": confidence,
+            "source_window_start": best["source_start"],
+            "source_window_end": best["source_end"],
+            "release_window_start": best["release_start"],
+            "release_window_end": best["release_end"],
+            "source_side": frame["POSTING_SOURCE_SIDE"].iloc[0],
+            "release_side": frame["POSTING_RELEASE_SIDE"].iloc[0],
+            "provisional": str(recon_mode).upper() == "H0",
+            "cluster_share": best["cluster_share"],
+            "release_compression": best["compression"],
+            "separation_ratio": best["separation_ratio"],
+            "reason": "Settlement diinfer dari latency abnormal + cluster waktu + release concentration.",
+        }
+
+    normal_mask = frame["PERFORMANCE_CLASS"].eq("NORMAL")
+    outlier_mask = frame["PERFORMANCE_CLASS"].eq("OUTLIER")
+    empty.update({
+        "available": True,
+        "frame": frame,
+        "normal": _posting_stats(frame.loc[normal_mask, "POSTING_LATENCY_SECONDS"]),
+        "outlier": _posting_stats(frame.loc[outlier_mask, "POSTING_LATENCY_SECONDS"]),
+        "slow_threshold_seconds": threshold,
+        "normal_count": int(normal_mask.sum()),
+        "outlier_count": int(outlier_mask.sum()),
+        "source_side": frame["POSTING_SOURCE_SIDE"].iloc[0],
+        "release_side": frame["POSTING_RELEASE_SIDE"].iloc[0],
+        "reason": "Slow candidate tidak membentuk evidence settlement yang cukup kuat.",
+    })
+    return empty
+
+
+def _format_time_window(start_value, end_value):
+    if pd.isna(start_value) or pd.isna(end_value):
+        return "-"
+    start_ts = pd.Timestamp(start_value)
+    end_ts = pd.Timestamp(end_value)
+    if start_ts.date() == end_ts.date():
+        return f"{start_ts.strftime('%H:%M:%S')}–{end_ts.strftime('%H:%M:%S')}"
+    return f"{start_ts.strftime('%d/%m %H:%M:%S')}–{end_ts.strftime('%d/%m %H:%M:%S')}"
+
 def classify_issue_bank(description):
 
     category = classify_bank_transaction(
@@ -12278,7 +12728,7 @@ if st.session_state.sudah_diproses:
 
 
     # ========================================================
-    # ALL VA - POSTING PERFORMANCE
+    # ALL VA - DYNAMIC POSTING PERFORMANCE
     # ========================================================
     # Observability only. Tidak mengubah hasil matching/issue.
 
@@ -12287,42 +12737,128 @@ if st.session_state.sudah_diproses:
         pilihan_bank
     )
 
-    if posting_performance.get("available"):
+    posting_regime = analyze_dynamic_posting_regimes(
+        df_matched,
+        pilihan_bank,
+        recon_mode=st.session_state.get("recon_mode", "")
+    )
+
+    if posting_regime.get("available"):
+        normal_stats = posting_regime.get("normal", {})
+        settlement_stats = posting_regime.get("settlement", {})
+        outlier_stats = posting_regime.get("outlier", {})
+        total_perf = (
+            posting_regime.get("normal_count", 0)
+            + posting_regime.get("settlement_count", 0)
+            + posting_regime.get("outlier_count", 0)
+        )
 
         with st.container(border=True):
-            st.markdown(
-                "**⚡ Posting Performance**  \n"
-                f"Avg **{format_duration_compact(posting_performance.get('average_seconds'))}** · "
-                f"Median **{format_duration_compact(posting_performance.get('median_seconds'))}** · "
-                f"P95 **{format_duration_compact(posting_performance.get('p95_seconds'))}** · "
-                f"Fastest **{format_duration_compact(posting_performance.get('fastest_seconds'))}** · "
-                f"Slowest **{format_duration_compact(posting_performance.get('slowest_seconds'))}**"
+            st.markdown("**⚡ Normal Posting Performance**")
+            if normal_stats.get("count", 0) > 0:
+                st.markdown(
+                    f"Avg **{format_duration_compact(normal_stats.get('average_seconds'))}** · "
+                    f"Median **{format_duration_compact(normal_stats.get('median_seconds'))}** · "
+                    f"P95 **{format_duration_compact(normal_stats.get('p95_seconds'))}** · "
+                    f"Fastest **{format_duration_compact(normal_stats.get('fastest_seconds'))}** · "
+                    f"Slowest **{format_duration_compact(normal_stats.get('slowest_seconds'))}**"
+                )
+                normal_share = (
+                    posting_regime.get("normal_count", 0) / total_perf * 100
+                    if total_perf > 0 else 0
+                )
+                st.caption(
+                    f"Basis **{posting_regime.get('normal_count', 0):,} transaksi** "
+                    f"(**{normal_share:.1f}%** dari sampel performa). "
+                    "Baseline dan batas slow dihitung otomatis dari distribusi latency hari ini."
+                )
+            else:
+                st.caption("Belum ada transaksi yang dapat membentuk baseline normal.")
+
+        if posting_regime.get("settlement_detected"):
+            confidence = posting_regime.get("confidence", "MEDIUM")
+            score_pct = posting_regime.get("confidence_score", 0) * 100
+            provisional = posting_regime.get("provisional", False)
+            settlement_title = "🌙 Inferred Settlement / Cutoff Pattern"
+            if provisional:
+                settlement_title += " — H0 Provisional"
+
+            with st.container(border=True):
+                st.markdown(f"**{settlement_title}**")
+                st.markdown(
+                    f"**{posting_regime.get('settlement_count', 0):,} trx** · "
+                    f"Median **{format_duration_compact(settlement_stats.get('median_seconds'))}** · "
+                    f"P95 **{format_duration_compact(settlement_stats.get('p95_seconds'))}** · "
+                    f"Slowest **{format_duration_compact(settlement_stats.get('slowest_seconds'))}**"
+                )
+                st.markdown(
+                    f"{posting_regime.get('source_side', 'Source')} window "
+                    f"**{_format_time_window(posting_regime.get('source_window_start'), posting_regime.get('source_window_end'))}** · "
+                    f"{posting_regime.get('release_side', 'Release')} release "
+                    f"**{_format_time_window(posting_regime.get('release_window_start'), posting_regime.get('release_window_end'))}**"
+                )
+                st.caption(
+                    f"Pattern confidence **{confidence} ({score_pct:.0f}%)**. "
+                    "Window diinfer otomatis dari pola latency matched hari ini, bukan dari jam cutoff resmi/hardcode bank."
+                )
+
+                regime_frame = posting_regime.get("frame", pd.DataFrame())
+                settlement_detail = regime_frame[
+                    regime_frame.get("PERFORMANCE_CLASS", pd.Series(dtype=str)).eq("INFERRED_SETTLEMENT")
+                ].copy() if not regime_frame.empty else pd.DataFrame()
+
+                if not settlement_detail.empty:
+                    with st.expander(
+                        f"🔎 Lihat detail inferred settlement ({len(settlement_detail):,})",
+                        expanded=False
+                    ):
+                        settlement_detail["LATENCY"] = settlement_detail[
+                            "POSTING_LATENCY_SECONDS"
+                        ].apply(format_duration_compact)
+                        settlement_cols = [
+                            col for col in [
+                                "KODE_VA",
+                                "POSTING_SOURCE_DATETIME",
+                                "POSTING_RELEASE_DATETIME",
+                                "LATENCY",
+                                "MATCH_METHOD",
+                                "MATCH_CONFIDENCE",
+                            ] if col in settlement_detail.columns
+                        ]
+                        st.dataframe(
+                            settlement_detail[settlement_cols],
+                            use_container_width=True,
+                            hide_index=True
+                        )
+
+        if posting_regime.get("outlier_count", 0) > 0:
+            with st.container(border=True):
+                st.markdown("**⚠️ Other Posting Outliers**")
+                st.markdown(
+                    f"**{posting_regime.get('outlier_count', 0):,} trx** · "
+                    f"Median **{format_duration_compact(outlier_stats.get('median_seconds'))}** · "
+                    f"Slowest **{format_duration_compact(outlier_stats.get('slowest_seconds'))}**"
+                )
+                st.caption(
+                    "Transaksi lambat ini tidak memiliki evidence cluster/release concentration "
+                    "yang cukup untuk diklasifikasikan sebagai settlement."
+                )
+
+        if posting_performance.get("excluded_cross_day", 0) > 0:
+            st.caption(
+                f"Posting Performance hanya memakai same-day. Cross-day yang dikeluarkan: "
+                f"**{posting_performance.get('excluded_cross_day', 0):,}**."
             )
-
-            perf_notes = [
-                f"Basis **{posting_performance.get('sample_count', 0):,} matched same-day** "
-                "dengan timestamp Bank dan FMSS yang valid."
-            ]
-
-            if posting_performance.get("excluded_cross_day", 0) > 0:
-                perf_notes.append(
-                    f"Cross-day/cutoff dikeluarkan: "
-                    f"**{posting_performance.get('excluded_cross_day', 0):,}**."
-                )
-
-            if posting_performance.get("excluded_time_anomaly", 0) > 0:
-                perf_notes.append(
-                    f"Time anomaly dikeluarkan: "
-                    f"**{posting_performance.get('excluded_time_anomaly', 0):,}**."
-                )
-
-            if posting_performance.get("excluded_duplicate_pairing", 0) > 0:
-                perf_notes.append(
-                    f"Duplicate pairing BRIVA tidak dipakai untuk latency: "
-                    f"**{posting_performance.get('excluded_duplicate_pairing', 0):,}**."
-                )
-
-            st.caption(" ".join(perf_notes))
+        if posting_performance.get("excluded_time_anomaly", 0) > 0:
+            st.caption(
+                f"Time anomaly yang dikeluarkan: "
+                f"**{posting_performance.get('excluded_time_anomaly', 0):,}**."
+            )
+        if posting_performance.get("excluded_duplicate_pairing", 0) > 0:
+            st.caption(
+                f"Duplicate pairing BRIVA tidak dipakai untuk latency: "
+                f"**{posting_performance.get('excluded_duplicate_pairing', 0):,}**."
+            )
 
     elif pilihan_bank in POSTING_PERFORMANCE_SUPPORTED_VA:
         with st.container(border=True):
