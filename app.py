@@ -67,7 +67,8 @@ DEFAULT_STATE = {
     "df_britiket_results": pd.DataFrame(),
     "df_britiket_bank_review": pd.DataFrame(),
     "df_britiket_ambiguous": pd.DataFrame(),
-    "britiket_meta": {}
+    "britiket_meta": {},
+    "indomaret_result": {}
 }
 
 for key, value in DEFAULT_STATE.items():
@@ -480,6 +481,7 @@ POSTING_PERFORMANCE_SUPPORTED_VA = {
     "BCAVA",
     "MANDIRIVA",
     "PERMATAVA",
+    "INDOMARET",
 }
 
 # Arah latency dibuat eksplisit per engine supaya perubahan pada satu VA tidak
@@ -491,6 +493,7 @@ POSTING_PERFORMANCE_DIRECTION = {
     "BCAVA": "FMSS_MINUS_BANK",
     "MANDIRIVA": "BANK_MINUS_FMSS",
     "PERMATAVA": "FMSS_MINUS_BANK",
+    "INDOMARET": "FMSS_MINUS_SOURCE",
 }
 
 
@@ -577,6 +580,7 @@ def calculate_posting_performance(df_matched, bank_name):
         "BCAVA": ["BANK_MATCH_DATETIME", "MATCH_BANK_DATETIME", "MATCH_BANK_DATE"],
         "MANDIRIVA": ["BANK_MATCH_DATETIME", "MATCH_BANK_DATETIME", "MATCH_BANK_DATE"],
         "PERMATAVA": ["MATCH_BANK_DATETIME", "BANK_MATCH_DATETIME", "MATCH_BANK_DATE"],
+        "INDOMARET": ["MATCH_FMSS_DATETIME"],
     }
 
     bank_dt_col = next(
@@ -669,6 +673,10 @@ def calculate_posting_performance(df_matched, bank_name):
     elif direction == "BANK_MINUS_FMSS":
         # MANDIRIVA: timestamp FMSS adalah upstream reference dan timestamp bank
         # adalah downstream posting evidence sesuai engine existing.
+        gap_seconds = (bank_dt - fmss_dt).dt.total_seconds()
+    elif direction == "FMSS_MINUS_SOURCE":
+        # INDOMARET: _TANGGAL_DT adalah waktu sukses source INDOMARET,
+        # MATCH_FMSS_DATETIME adalah waktu deposit tercatat di FMSS.
         gap_seconds = (bank_dt - fmss_dt).dt.total_seconds()
     else:
         return empty
@@ -763,6 +771,7 @@ def _prepare_posting_latency_frame(df_matched, bank_name):
         "BCAVA": ["BANK_MATCH_DATETIME", "MATCH_BANK_DATETIME", "MATCH_BANK_DATE"],
         "MANDIRIVA": ["BANK_MATCH_DATETIME", "MATCH_BANK_DATETIME", "MATCH_BANK_DATE"],
         "PERMATAVA": ["MATCH_BANK_DATETIME", "BANK_MATCH_DATETIME", "MATCH_BANK_DATE"],
+        "INDOMARET": ["MATCH_FMSS_DATETIME"],
     }
     bank_dt_col = next(
         (c for c in bank_datetime_candidates.get(bank_name, []) if c in work.columns),
@@ -820,6 +829,12 @@ def _prepare_posting_latency_frame(df_matched, bank_name):
         release_dt = bank_dt
         source_label = "FMSS"
         release_label = "BANK"
+    elif direction == "FMSS_MINUS_SOURCE":
+        latency = (bank_dt - fmss_dt).dt.total_seconds()
+        source_dt = fmss_dt
+        release_dt = bank_dt
+        source_label = "INDOMARET"
+        release_label = "FMSS"
     else:
         return empty
 
@@ -8129,6 +8144,602 @@ def fast_match(
     )
 
 
+
+# ============================================================
+# INDOMARET ENGINE — DEDICATED NON-VA RECONCILIATION
+# ============================================================
+# Matching utama (STRONG):
+#   source.bill_info1 == FMSS ref-1
+#   source.id_transaksi == FMSS ref-2
+#   source.nominal == FMSS.nominal
+#
+# Engine ini sengaja TERPISAH dari KODE_VA dan tidak mengubah engine bank/VA.
+# H0 memakai dynamic posting window dari latency matched hari itu; tidak ada
+# hardcode jam cutoff/scheduler INDOMARET.
+
+INDOMARET_PRODUCT_ID = "SCPIINDMRT"
+INDOMARET_FMSS_REGEX = re.compile(
+    r"(?i)PAYMENT\s*CODE\s*=\s*INDOMARET\s*-\s*(\d+)(?:\s+(\d+))?"
+)
+INDOMARET_PENDING_MIN_SECONDS = 60
+INDOMARET_PENDING_MAX_SECONDS = 900
+INDOMARET_PENDING_FALLBACK_SECONDS = 300
+
+
+def _indomaret_id_text(value):
+    if value is None or pd.isna(value):
+        return None
+    text_value = str(value).strip()
+    if re.fullmatch(r"\d+\.0+", text_value):
+        text_value = text_value.split(".", 1)[0]
+    digits = re.sub(r"\D", "", text_value)
+    return digits or None
+
+
+def _read_indomaret_uploaded_file(uploaded_file):
+    """CSV tolerant terhadap trailing delimiter/extra empty columns; XLSX tetap pandas."""
+    name = str(getattr(uploaded_file, "name", "")).lower()
+    uploaded_file.seek(0)
+    if name.endswith(".xlsx"):
+        return pd.read_excel(uploaded_file)
+
+    raw = uploaded_file.read()
+    uploaded_file.seek(0)
+    if isinstance(raw, bytes):
+        text_value = _bcava_decode_bytes(raw)
+    else:
+        text_value = str(raw)
+
+    # Pilih delimiter dari header agar isi keterangan tidak menipu Sniffer.
+    header = text_value.splitlines()[0] if text_value else ""
+    candidates = [",", ";", "\t", "|"]
+    delimiter = max(candidates, key=lambda d: header.count(d)) if header else ","
+    if header.count(delimiter) == 0:
+        delimiter = ","
+
+    reader = csv.DictReader(io.StringIO(text_value, newline=""), delimiter=delimiter)
+    rows = []
+    for row in reader:
+        clean = {}
+        for key, value in (row or {}).items():
+            if key is None:
+                continue
+            clean[str(key).strip()] = value
+        rows.append(clean)
+    return pd.DataFrame(rows)
+
+
+def _extract_indomaret_fmss_refs(value):
+    if value is None or pd.isna(value):
+        return (None, None)
+    match = INDOMARET_FMSS_REGEX.search(str(value))
+    if not match:
+        return (None, None)
+    return (_indomaret_id_text(match.group(1)), _indomaret_id_text(match.group(2)))
+
+
+def prepare_indomaret_source_dataframe(uploaded_file):
+    df = _read_indomaret_uploaded_file(uploaded_file).copy()
+    if df.empty:
+        raise ValueError("File source INDOMARET kosong.")
+
+    col_id = find_column(df, ["id_transaksi", "ID_TRANSAKSI"])
+    col_ref = find_column(df, ["bill_info1", "BILL_INFO1"])
+    col_nom = find_column(df, ["nominal", "NOMINAL"])
+    col_time = find_column(df, ["time_response", "TIME_RESPONSE"])
+    col_status = find_column(df, ["status", "STATUS"])
+    col_product = find_column(df, ["id_produk", "ID_PRODUK"])
+    col_type = find_column(df, ["jenis_transaksi", "JENIS_TRANSAKSI"])
+    col_resp = find_column(df, ["response_code", "RESPONSE_CODE"], required=False)
+    col_bill17 = find_column(df, ["bill_info17", "BILL_INFO17"], required=False)
+
+    status = normalize_fmss_status_series(df[col_status])
+    product = df[col_product].astype("string").str.strip().str.upper()
+    trx_type = df[col_type].astype("string").str.strip().str.upper()
+    scope = status.eq("SUKSES") & product.eq(INDOMARET_PRODUCT_ID) & trx_type.eq("PAYMENT")
+
+    if col_resp is not None:
+        resp = df[col_resp].astype("string").str.strip().str.upper()
+        resp_num = pd.to_numeric(df[col_resp], errors="coerce")
+        scope &= (resp.isin(["00", "0", "0.0"]) | resp_num.eq(0))
+
+    df = df.loc[scope].copy()
+    if df.empty:
+        raise ValueError("Tidak ada transaksi source INDOMARET sukses dalam file.")
+
+    df["SOURCE_TRANSACTION_ID"] = df[col_id].apply(_indomaret_id_text)
+    df["SOURCE_PAYMENT_REF"] = df[col_ref].apply(_indomaret_id_text)
+    df["NOMINAL_ASLI"] = clean_numeric(df[col_nom])
+    df["_TANGGAL_DT"] = parse_briva_datetime(df[col_time])
+    df["SOURCE_STATUS"] = "SUKSES"
+    df["SOURCE_PRODUCT"] = INDOMARET_PRODUCT_ID
+    df["SOURCE_ROW"] = range(1, len(df) + 1)
+
+    if col_bill17 is not None:
+        df["SOURCE_BILL_INFO17"] = df[col_bill17].apply(_indomaret_id_text)
+    else:
+        df["SOURCE_BILL_INFO17"] = None
+
+    valid = (
+        df["SOURCE_TRANSACTION_ID"].notna()
+        & df["SOURCE_PAYMENT_REF"].notna()
+        & df["_TANGGAL_DT"].notna()
+        & df["NOMINAL_ASLI"].gt(0)
+    )
+    df_valid = df.loc[valid].copy()
+    df_invalid = df.loc[~valid].copy()
+    if not df_invalid.empty:
+        df_invalid["STATUS_MATCH"] = "INVALID_SOURCE - INDOMARET"
+
+    return df_valid.reset_index(drop=True), df_invalid.reset_index(drop=True)
+
+
+def prepare_indomaret_fmss_dataframe(uploaded_file, recon_dates):
+    df = _read_indomaret_uploaded_file(uploaded_file).copy()
+    if df.empty:
+        raise ValueError("File FMSS kosong.")
+
+    col_status = find_column(df, ["status", "STATUS"])
+    col_desc = find_column(df, ["keterangan", "KETERANGAN", "description", "DESKRIPSI"])
+    col_nom = find_column(df, ["nominal", "NOMINAL", "amount", "AMOUNT"])
+    col_dt = find_column(df, ["tanggal_transfer", "TANGGAL_TRANSFER", "tanggal_transaksi", "TANGGAL_TRANSAKSI"])
+    col_dep = find_column(df, ["id_deposit", "ID_DEPOSIT"], required=False)
+    col_outlet = find_column(df, ["id_outlet", "ID_OUTLET"], required=False)
+    col_owner = find_column(df, ["nama_pemilik", "NAMA_PEMILIK"], required=False)
+
+    status = normalize_fmss_status_series(df[col_status])
+    desc = df[col_desc].fillna("").astype(str)
+    scope = status.eq("SUKSES") & desc.str.contains("INDOMARET", case=False, regex=False)
+    df = df.loc[scope].copy()
+    if df.empty:
+        raise ValueError("Tidak ada deposit FMSS INDOMARET sukses dalam file.")
+
+    refs = df[col_desc].apply(_extract_indomaret_fmss_refs)
+    df["FMSS_PAYMENT_REF"] = refs.apply(lambda x: x[0])
+    df["FMSS_TRANSACTION_ID"] = refs.apply(lambda x: x[1])
+    df["FMSS_NOMINAL"] = clean_numeric(df[col_nom])
+    df["FMSS_DATETIME"] = parse_briva_datetime(normalize_fmss_datetime_source(df[col_dt]))
+    df["FMSS_DESCRIPTION"] = df[col_desc].astype(str)
+    df["FMSS_ID_DEPOSIT"] = df[col_dep].astype("string").str.strip() if col_dep else ""
+    df["FMSS_ID_OUTLET"] = df[col_outlet].astype("string").str.strip() if col_outlet else ""
+    df["FMSS_NAMA_PEMILIK"] = df[col_owner].astype("string").str.strip() if col_owner else ""
+    df["FMSS_ROW"] = range(1, len(df) + 1)
+
+    target_dates = {pd.Timestamp(d).date() for d in (recon_dates or [])}
+    search_dates = set(target_dates)
+    for d in target_dates:
+        search_dates.add(d + timedelta(days=1))
+
+    dt_date = pd.to_datetime(df["FMSS_DATETIME"], errors="coerce").dt.date
+    df = df.loc[dt_date.isin(search_dates)].copy()
+
+    valid = (
+        df["FMSS_PAYMENT_REF"].notna()
+        & df["FMSS_DATETIME"].notna()
+        & df["FMSS_NOMINAL"].gt(0)
+    )
+    # ref-2 boleh kosong agar fallback HIGH masih mungkin dijalankan.
+    df_valid = df.loc[valid].copy()
+    df_invalid = df.loc[~valid].copy()
+    if not df_invalid.empty:
+        df_invalid["STATUS_MATCH"] = "INVALID_FMSS_FORMAT - INDOMARET"
+
+    return df_valid.reset_index(drop=True), df_invalid.reset_index(drop=True)
+
+
+def _indomaret_dynamic_pending_window(df_matched):
+    fallback = INDOMARET_PENDING_FALLBACK_SECONDS
+    meta = {"sample_count": 0, "p95": None, "p99": None, "median": None, "source": "FALLBACK"}
+    if df_matched is None or df_matched.empty:
+        return fallback, meta
+
+    source_dt = pd.to_datetime(df_matched.get("_TANGGAL_DT"), errors="coerce")
+    fmss_dt = pd.to_datetime(df_matched.get("MATCH_FMSS_DATETIME"), errors="coerce")
+    lag = (fmss_dt - source_dt).dt.total_seconds()
+    lag = lag[lag.notna() & lag.ge(0) & lag.le(86400)].astype(float)
+    if lag.empty:
+        return fallback, meta
+
+    meta["sample_count"] = int(len(lag))
+    meta["median"] = float(lag.median())
+    meta["p95"] = float(lag.quantile(0.95))
+    meta["p99"] = float(lag.quantile(0.99))
+
+    if len(lag) >= 30:
+        seconds = meta["p99"] + 15
+        meta["source"] = "P99+BUFFER"
+    elif len(lag) >= 10:
+        seconds = meta["p95"] + 30
+        meta["source"] = "P95+BUFFER"
+    elif len(lag) >= 5:
+        mad = float((lag - lag.median()).abs().median())
+        seconds = max(meta["p95"], meta["median"] + 3 * 1.4826 * mad) + 30
+        meta["source"] = "ROBUST_SMALL_SAMPLE"
+    else:
+        seconds = fallback
+
+    seconds = int(round(max(INDOMARET_PENDING_MIN_SECONDS, min(INDOMARET_PENDING_MAX_SECONDS, seconds))))
+    return seconds, meta
+
+
+def reconcile_indomaret(source_file, fmss_file):
+    source, invalid_source = prepare_indomaret_source_dataframe(source_file)
+    recon_dates = sorted(source["_TANGGAL_DT"].dt.date.dropna().unique())
+    if not recon_dates:
+        raise ValueError("Tanggal transaksi INDOMARET tidak ditemukan.")
+
+    fmss, invalid_fmss = prepare_indomaret_fmss_dataframe(fmss_file, recon_dates)
+    recon_now = get_jakarta_now()
+    recon_mode = get_recon_mode(recon_dates, recon_now)
+
+    s_records = source.to_dict("records")
+    f_records = fmss.to_dict("records")
+    used_s, used_f = set(), set()
+    matched, mismatches, conflicts, ambiguous = [], [], [], []
+
+    s_pair = defaultdict(list)
+    f_pair = defaultdict(list)
+    for i, r in enumerate(s_records):
+        s_pair[(r.get("SOURCE_PAYMENT_REF"), r.get("SOURCE_TRANSACTION_ID"))].append(i)
+    for i, r in enumerate(f_records):
+        if r.get("FMSS_PAYMENT_REF") and r.get("FMSS_TRANSACTION_ID"):
+            f_pair[(r.get("FMSS_PAYMENT_REF"), r.get("FMSS_TRANSACTION_ID"))].append(i)
+
+    def add_match(si, fi, method, confidence):
+        srow, frow = s_records[si], f_records[fi]
+        rec = dict(srow)
+        rec.update({
+            "FMSS_PAYMENT_REF": frow.get("FMSS_PAYMENT_REF"),
+            "FMSS_TRANSACTION_ID": frow.get("FMSS_TRANSACTION_ID"),
+            "MATCH_FMSS_DATETIME": frow.get("FMSS_DATETIME"),
+            "MATCH_FMSS_NOMINAL": frow.get("FMSS_NOMINAL"),
+            "FMSS_ID_DEPOSIT": frow.get("FMSS_ID_DEPOSIT"),
+            "FMSS_ID_OUTLET": frow.get("FMSS_ID_OUTLET"),
+            "FMSS_NAMA_PEMILIK": frow.get("FMSS_NAMA_PEMILIK"),
+            "FMSS_DESCRIPTION": frow.get("FMSS_DESCRIPTION"),
+            "MATCH_METHOD": method,
+            "MATCH_CONFIDENCE": confidence,
+            "STATUS_MATCH": "MATCHED",
+        })
+        src_dt = pd.to_datetime(rec.get("_TANGGAL_DT"), errors="coerce")
+        dst_dt = pd.to_datetime(rec.get("MATCH_FMSS_DATETIME"), errors="coerce")
+        rec["POSTING_LATENCY_SECONDS"] = (
+            (dst_dt - src_dt).total_seconds()
+            if pd.notna(src_dt) and pd.notna(dst_dt) else None
+        )
+        rec["DATE_RELATION"] = (
+            "SAME_DAY" if pd.notna(src_dt) and pd.notna(dst_dt) and src_dt.date() == dst_dt.date()
+            else "CROSS_DAY"
+        )
+        matched.append(rec)
+        used_s.add(si); used_f.add(fi)
+
+    # Level A: dual-reference exact. Duplicate exact pair tidak auto-match.
+    for key in set(s_pair).intersection(f_pair):
+        sis, fis = s_pair[key], f_pair[key]
+        if len(sis) != 1 or len(fis) != 1:
+            for fi in fis:
+                rec = dict(f_records[fi]); rec["STATUS_MATCH"] = "AMBIGUOUS_REFERENCE - INDOMARET"; ambiguous.append(rec); used_f.add(fi)
+            continue
+        si, fi = sis[0], fis[0]
+        if float(s_records[si].get("NOMINAL_ASLI", 0)) == float(f_records[fi].get("FMSS_NOMINAL", 0)):
+            add_match(si, fi, "DUAL_REFERENCE_NOMINAL", "STRONG")
+        else:
+            rec = dict(s_records[si])
+            rec.update({
+                "FMSS_PAYMENT_REF": f_records[fi].get("FMSS_PAYMENT_REF"),
+                "FMSS_TRANSACTION_ID": f_records[fi].get("FMSS_TRANSACTION_ID"),
+                "FMSS_NOMINAL": f_records[fi].get("FMSS_NOMINAL"),
+                "FMSS_DATETIME": f_records[fi].get("FMSS_DATETIME"),
+                "STATUS_MATCH": "NOMINAL_MISMATCH - INDOMARET",
+            })
+            mismatches.append(rec); used_s.add(si); used_f.add(fi)
+
+    # Remaining lookup maps for conflict/fallback checks.
+    def remaining_source_map(field):
+        result = defaultdict(list)
+        for i, r in enumerate(s_records):
+            if i not in used_s and r.get(field):
+                result[r.get(field)].append(i)
+        return result
+
+    # Level B/C: fallback hanya bila salah satu FMSS reference benar-benar kosong.
+    for fi, frow in enumerate(f_records):
+        if fi in used_f:
+            continue
+        ref1, ref2 = frow.get("FMSS_PAYMENT_REF"), frow.get("FMSS_TRANSACTION_ID")
+        ref1_map = remaining_source_map("SOURCE_PAYMENT_REF")
+        ref2_map = remaining_source_map("SOURCE_TRANSACTION_ID")
+
+        if ref1 and ref2:
+            a = ref1_map.get(ref1, [])
+            b = ref2_map.get(ref2, [])
+            if a or b:
+                rec = dict(frow)
+                rec["STATUS_MATCH"] = "REFERENCE_CONFLICT - INDOMARET"
+                rec["CONFLICT_REF1_SOURCE_COUNT"] = len(a)
+                rec["CONFLICT_REF2_SOURCE_COUNT"] = len(b)
+                conflicts.append(rec); used_f.add(fi)
+            continue
+
+        candidates = []
+        method = None
+        if ref2 and not ref1:
+            candidates = ref2_map.get(ref2, [])
+            method = "TRANSACTION_ID_NOMINAL_UNIQUE"
+        elif ref1 and not ref2:
+            candidates = ref1_map.get(ref1, [])
+            method = "PAYMENT_REF_NOMINAL_UNIQUE"
+
+        nominal_candidates = [
+            si for si in candidates
+            if float(s_records[si].get("NOMINAL_ASLI", 0)) == float(frow.get("FMSS_NOMINAL", 0))
+        ]
+        if len(nominal_candidates) == 1:
+            add_match(nominal_candidates[0], fi, method, "HIGH")
+        elif len(nominal_candidates) > 1:
+            rec = dict(frow); rec["STATUS_MATCH"] = "AMBIGUOUS_FALLBACK - INDOMARET"; ambiguous.append(rec); used_f.add(fi)
+
+    source_only = []
+    for si, srow in enumerate(s_records):
+        if si not in used_s:
+            rec = dict(srow); rec["STATUS_MATCH"] = "INDOMARET_ONLY"; source_only.append(rec)
+
+    fmss_only = []
+    for fi, frow in enumerate(f_records):
+        if fi not in used_f:
+            rec = dict(frow); rec["STATUS_MATCH"] = "FMSS_ONLY - INDOMARET"; fmss_only.append(rec)
+
+    df_matched = pd.DataFrame(matched)
+    df_source_only = pd.DataFrame(source_only)
+    df_fmss_only = pd.DataFrame(fmss_only)
+    df_mismatch = pd.DataFrame(mismatches)
+    df_conflict = pd.DataFrame(conflicts)
+    df_ambiguous = pd.DataFrame(ambiguous)
+
+    pending_window_seconds, pending_meta = _indomaret_dynamic_pending_window(df_matched)
+    source_snapshot = extract_h0_snapshot_datetime_from_filename(getattr(source_file, "name", ""))
+    fmss_snapshot = extract_h0_snapshot_datetime_from_filename(getattr(fmss_file, "name", ""))
+    if pd.isna(source_snapshot) and not source.empty:
+        source_snapshot = pd.to_datetime(source["_TANGGAL_DT"], errors="coerce").max()
+    if pd.isna(fmss_snapshot) and not fmss.empty:
+        fmss_snapshot = pd.to_datetime(fmss["FMSS_DATETIME"], errors="coerce").max()
+
+    pending_fmss = pd.DataFrame()
+    pending_source = pd.DataFrame()
+    if recon_mode == "H0":
+        if not df_source_only.empty and pd.notna(fmss_snapshot):
+            src_dt = pd.to_datetime(df_source_only["_TANGGAL_DT"], errors="coerce")
+            age = (pd.Timestamp(fmss_snapshot) - src_dt).dt.total_seconds()
+            mask = age.le(pending_window_seconds) | age.lt(0)
+            pending_fmss = df_source_only.loc[mask].copy()
+            if not pending_fmss.empty:
+                pending_fmss["STATUS_MATCH"] = "PENDING_FMSS_POSTING - INDOMARET"
+                pending_fmss["PENDING_REASON"] = "Masih berada dalam dynamic posting window H0."
+            df_source_only = df_source_only.loc[~mask].copy()
+
+        if not df_fmss_only.empty and pd.notna(source_snapshot):
+            fdt = pd.to_datetime(df_fmss_only["FMSS_DATETIME"], errors="coerce")
+            mask = fdt.ge(pd.Timestamp(source_snapshot) - pd.Timedelta(seconds=pending_window_seconds))
+            pending_source = df_fmss_only.loc[mask].copy()
+            if not pending_source.empty:
+                pending_source["STATUS_MATCH"] = "PENDING_SOURCE_COVERAGE - INDOMARET"
+                pending_source["PENDING_REASON"] = "FMSS berada dekat ujung coverage file source INDOMARET H0."
+            df_fmss_only = df_fmss_only.loc[~mask].copy()
+
+    perf = calculate_posting_performance(df_matched, "INDOMARET")
+    regime = analyze_dynamic_posting_regimes(df_matched, "INDOMARET", recon_mode=recon_mode)
+
+    matched_nominal = float(df_matched["NOMINAL_ASLI"].sum()) if not df_matched.empty else 0.0
+    issue_fmss_nominal = float(df_source_only["NOMINAL_ASLI"].sum()) if not df_source_only.empty else 0.0
+    issue_source_nominal = float(df_fmss_only["FMSS_NOMINAL"].sum()) if not df_fmss_only.empty else 0.0
+
+    return {
+        "df_matched": df_matched,
+        "df_issue_fmss": df_source_only,
+        "df_issue_source": df_fmss_only,
+        "df_pending_fmss": pending_fmss,
+        "df_pending_source": pending_source,
+        "df_nominal_mismatch": df_mismatch,
+        "df_reference_conflict": df_conflict,
+        "df_ambiguous": df_ambiguous,
+        "df_invalid_source": invalid_source,
+        "df_invalid_fmss": invalid_fmss,
+        "recon_dates": recon_dates,
+        "recon_mode": recon_mode,
+        "recon_now_label": format_recon_now_label(recon_now),
+        "posting_performance": perf,
+        "posting_regime": regime,
+        "pending_window_seconds": pending_window_seconds,
+        "pending_meta": pending_meta,
+        "source_snapshot": source_snapshot,
+        "fmss_snapshot": fmss_snapshot,
+        "summary": {
+            "matched_count": len(df_matched),
+            "issue_fmss_count": len(df_source_only),
+            "issue_source_count": len(df_fmss_only),
+            "pending_fmss_count": len(pending_fmss),
+            "pending_source_count": len(pending_source),
+            "nominal_mismatch_count": len(df_mismatch),
+            "reference_conflict_count": len(df_conflict),
+            "ambiguous_count": len(df_ambiguous),
+            "invalid_count": len(invalid_source) + len(invalid_fmss),
+            "matched_nominal": matched_nominal,
+            "issue_fmss_nominal": issue_fmss_nominal,
+            "issue_source_nominal": issue_source_nominal,
+        }
+    }
+
+
+def _indomaret_export_xlsx(result):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        pd.DataFrame([result.get("summary", {})]).to_excel(writer, sheet_name="SUMMARY", index=False)
+        sheets = [
+            ("MATCHED", result.get("df_matched")),
+            ("ISSUE_FMSS", result.get("df_issue_fmss")),
+            ("ISSUE_INDOMARET", result.get("df_issue_source")),
+            ("PENDING_FMSS", result.get("df_pending_fmss")),
+            ("PENDING_SOURCE", result.get("df_pending_source")),
+            ("NOMINAL_MISMATCH", result.get("df_nominal_mismatch")),
+            ("REFERENCE_CONFLICT", result.get("df_reference_conflict")),
+            ("AMBIGUOUS", result.get("df_ambiguous")),
+            ("INVALID_SOURCE", result.get("df_invalid_source")),
+            ("INVALID_FMSS", result.get("df_invalid_fmss")),
+        ]
+        for name, frame in sheets:
+            frame = frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+            frame.to_excel(writer, sheet_name=name[:31], index=False)
+    output.seek(0)
+    return output.getvalue()
+
+
+def render_indomaret_dashboard():
+    result = st.session_state.get("indomaret_result", {})
+    if not result:
+        return
+    summary = result.get("summary", {})
+    st.divider()
+    st.subheader("🎯 Ringkasan Rekonsiliasi INDOMARET")
+    st.caption(f"Periode rekonsiliasi: **{safe_date_string(result.get('recon_dates', []))}**")
+
+    if result.get("recon_mode") == "H0":
+        st.info(
+            "🟦 **Rekonsiliasi H0 / Intraday.** Unmatched terbaru tidak langsung "
+            "dinyatakan issue. Dynamic pending window dihitung dari performa matched hari ini."
+        )
+
+    a,b,c,d = st.columns(4)
+    a.metric("✅ Matched Sempurna", f"{summary.get('matched_count',0):,} Trx")
+    b.metric("⚠️ Issue FMSS", f"{summary.get('issue_fmss_count',0):,} Trx")
+    c.metric("⚠️ Issue INDOMARET", f"{summary.get('issue_source_count',0):,} Trx")
+    critical = summary.get('nominal_mismatch_count',0)+summary.get('reference_conflict_count',0)+summary.get('ambiguous_count',0)
+    d.metric("🚨 Critical Review", f"{critical:,} Trx")
+
+    if result.get("recon_mode") == "H0":
+        p1,p2,p3 = st.columns(3)
+        p1.metric("⏳ Pending FMSS", f"{summary.get('pending_fmss_count',0):,} Trx")
+        p2.metric("⏳ Pending Source Coverage", f"{summary.get('pending_source_count',0):,} Trx")
+        p3.metric("Dynamic Posting Window", format_duration_compact(result.get("pending_window_seconds")))
+        meta = result.get("pending_meta", {})
+        st.caption(
+            f"Window source: **{meta.get('source','-')}** · sample **{meta.get('sample_count',0):,} matched** · "
+            f"median **{format_duration_compact(meta.get('median'))}** · "
+            f"P95 **{format_duration_compact(meta.get('p95'))}** · P99 **{format_duration_compact(meta.get('p99'))}**."
+        )
+
+    regime = result.get("posting_regime", {})
+    perf = result.get("posting_performance", {})
+    if regime.get("available"):
+        normal = regime.get("normal", {})
+        with st.container(border=True):
+            st.markdown("**⚡ Normal Posting Performance — INDOMARET → FMSS**")
+            st.markdown(
+                f"Avg **{format_duration_compact(normal.get('average_seconds'))}** · "
+                f"Median **{format_duration_compact(normal.get('median_seconds'))}** · "
+                f"P95 **{format_duration_compact(normal.get('p95_seconds'))}** · "
+                f"Fastest **{format_duration_compact(normal.get('fastest_seconds'))}** · "
+                f"Slowest **{format_duration_compact(normal.get('slowest_seconds'))}**"
+            )
+            st.caption(f"Basis **{regime.get('normal_count',0):,} transaksi NORMAL** dari matched dengan timestamp valid.")
+
+        if regime.get("settlement_detected"):
+            sett = regime.get("settlement", {})
+            with st.container(border=True):
+                title = "🌙 Inferred Settlement / Scheduler Pattern"
+                if regime.get("provisional"):
+                    title += " — H0 Provisional"
+                st.markdown(f"**{title}**")
+                st.markdown(
+                    f"**{regime.get('settlement_count',0):,} trx** · Median **{format_duration_compact(sett.get('median_seconds'))}** · "
+                    f"P95 **{format_duration_compact(sett.get('p95_seconds'))}** · Slowest **{format_duration_compact(sett.get('slowest_seconds'))}**"
+                )
+                st.caption(
+                    f"Confidence **{regime.get('confidence','NONE')} ({regime.get('confidence_score',0)*100:.0f}%)**. "
+                    "Pattern diinfer dari data matched; tidak memakai hardcode jam cutoff."
+                )
+
+        if regime.get("outlier_count",0) > 0:
+            out = regime.get("outlier", {})
+            st.warning(
+                f"⚠️ **Other Posting Outliers: {regime.get('outlier_count',0):,} trx** · "
+                f"Median {format_duration_compact(out.get('median_seconds'))} · "
+                f"Slowest {format_duration_compact(out.get('slowest_seconds'))}."
+            )
+    elif perf.get("available"):
+        st.info(
+            f"⚡ Posting Performance: Avg {format_duration_compact(perf.get('average_seconds'))}, "
+            f"Median {format_duration_compact(perf.get('median_seconds'))}, "
+            f"P95 {format_duration_compact(perf.get('p95_seconds'))}."
+        )
+
+    st.subheader("💰 Ringkasan Nominal")
+    n1,n2,n3 = st.columns(3)
+    n1.metric("Matched", format_rupiah(summary.get("matched_nominal",0)))
+    n2.metric("Issue FMSS", format_rupiah(summary.get("issue_fmss_nominal",0)))
+    n3.metric("Issue INDOMARET", format_rupiah(summary.get("issue_source_nominal",0)))
+
+    matched = result.get("df_matched", pd.DataFrame())
+    if not matched.empty:
+        with st.expander(f"✅ Lihat Matched Detail ({len(matched):,})", expanded=False):
+            detail = matched.copy()
+            detail["POSTING_DELAY"] = detail.get("POSTING_LATENCY_SECONDS", pd.Series(index=detail.index)).apply(format_duration_compact)
+            cols = [c for c in [
+                "SOURCE_PAYMENT_REF","SOURCE_TRANSACTION_ID","NOMINAL_ASLI","_TANGGAL_DT",
+                "MATCH_FMSS_DATETIME","POSTING_DELAY","FMSS_ID_DEPOSIT","FMSS_ID_OUTLET",
+                "MATCH_METHOD","MATCH_CONFIDENCE","DATE_RELATION"
+            ] if c in detail.columns]
+            st.dataframe(detail[cols], use_container_width=True, hide_index=True)
+
+    col1,col2 = st.columns(2)
+    with col1:
+        st.subheader("🚨 Issue FMSS")
+        frame = result.get("df_issue_fmss", pd.DataFrame())
+        if frame.empty:
+            st.success("Tidak ada confirmed Issue FMSS.")
+        else:
+            st.dataframe(frame[[c for c in ["SOURCE_PAYMENT_REF","SOURCE_TRANSACTION_ID","NOMINAL_ASLI","_TANGGAL_DT","STATUS_MATCH"] if c in frame.columns]], use_container_width=True, hide_index=True)
+    with col2:
+        st.subheader("🚨 Issue INDOMARET")
+        frame = result.get("df_issue_source", pd.DataFrame())
+        if frame.empty:
+            st.success("Tidak ada confirmed Issue INDOMARET source.")
+        else:
+            st.dataframe(frame[[c for c in ["FMSS_PAYMENT_REF","FMSS_TRANSACTION_ID","FMSS_NOMINAL","FMSS_DATETIME","FMSS_ID_DEPOSIT","STATUS_MATCH"] if c in frame.columns]], use_container_width=True, hide_index=True)
+
+    pending_fmss = result.get("df_pending_fmss", pd.DataFrame())
+    pending_source = result.get("df_pending_source", pd.DataFrame())
+    if not pending_fmss.empty or not pending_source.empty:
+        with st.expander("⏳ Lihat Pending H0", expanded=False):
+            if not pending_fmss.empty:
+                st.markdown("**Menunggu posting FMSS**")
+                st.dataframe(pending_fmss, use_container_width=True, hide_index=True)
+            if not pending_source.empty:
+                st.markdown("**Menunggu coverage source INDOMARET**")
+                st.dataframe(pending_source, use_container_width=True, hide_index=True)
+
+    critical_frames = [
+        ("Nominal Mismatch", result.get("df_nominal_mismatch", pd.DataFrame())),
+        ("Reference Conflict", result.get("df_reference_conflict", pd.DataFrame())),
+        ("Ambiguous", result.get("df_ambiguous", pd.DataFrame())),
+        ("Invalid Source", result.get("df_invalid_source", pd.DataFrame())),
+        ("Invalid FMSS", result.get("df_invalid_fmss", pd.DataFrame())),
+    ]
+    for label, frame in critical_frames:
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            with st.expander(f"🚨 {label} ({len(frame):,})", expanded=False):
+                st.dataframe(frame, use_container_width=True, hide_index=True)
+
+    st.download_button(
+        "📥 Download Audit INDOMARET (.xlsx)",
+        data=_indomaret_export_xlsx(result),
+        file_name=f"Audit_INDOMARET_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+        use_container_width=True,
+    )
+
+
 # ============================================================
 # BRI TIKET ENGINE — OWNED, SELF-CONTAINED
 # ============================================================
@@ -10323,13 +10934,14 @@ opsi_bank = [
     "BCAVA",
     "MANDIRIVA",
     "PERMATAVA",
+    "INDOMARET",
     "BRI TIKET",
     "BSIVA",
     "MuamalatVA"
 ]
 
 pilihan_bank = st.selectbox(
-    "Pilih Bank Sumber Mutasi:",
+    "Pilih Sumber Rekonsiliasi:",
     opsi_bank
 )
 
@@ -10392,6 +11004,7 @@ if (
     st.session_state.df_britiket_bank_review = pd.DataFrame()
     st.session_state.df_britiket_ambiguous = pd.DataFrame()
     st.session_state.britiket_meta = {}
+    st.session_state.indomaret_result = {}
 
     st.session_state.pilihan_bank_terakhir = (
         pilihan_bank
@@ -10479,7 +11092,7 @@ if pilihan_bank in BANK_ENGINE_BELUM_TERSEDIA:
 
     st.info(
         "Silakan gunakan bank yang engine-nya sudah aktif: "
-        "BRIVA, BNIVA, BCAVA, MANDIRIVA, PERMATAVA, atau BRI TIKET."
+        "BRIVA, BNIVA, BCAVA, MANDIRIVA, PERMATAVA, INDOMARET, atau BRI TIKET."
     )
 
     st.stop()
@@ -10528,6 +11141,29 @@ if pilihan_bank == "BRIVA":
             type=["csv", "xlsx"],
             key="briva_57708"
         )
+
+elif pilihan_bank == "INDOMARET":
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("### 🏪 Source INDOMARET")
+        file_bnk_general = st.file_uploader(
+            "Upload file transaksi INDOMARET",
+            type=["csv", "xlsx"],
+            key="source_indomaret"
+        )
+
+    with col2:
+        st.markdown("### 📄 FMSS")
+        file_int = st.file_uploader(
+            "Upload data deposit FMSS",
+            type=["csv", "xlsx"],
+            key="fmss_indomaret"
+        )
+
+    file_bnk_57888 = None
+    file_bnk_57708 = None
 
 elif pilihan_bank == "BRI TIKET":
 
@@ -10674,6 +11310,34 @@ if can_process:
     ):
 
         st.session_state.sudah_diproses = False
+
+        # =====================================================
+        # INDOMARET — DEDICATED NON-VA PIPELINE
+        # =====================================================
+        if pilihan_bank == "INDOMARET":
+            try:
+                with st.spinner("Sedang memproses rekonsiliasi INDOMARET..."):
+                    result = reconcile_indomaret(
+                        source_file=file_bnk_general,
+                        fmss_file=file_int
+                    )
+                    st.session_state.indomaret_result = result
+                    st.session_state.recon_dates = result.get("recon_dates", [])
+                    st.session_state.recon_mode = result.get("recon_mode", "")
+                    st.session_state.recon_now_label = result.get("recon_now_label", "")
+                    st.session_state.df_matched = pd.DataFrame()
+                    st.session_state.df_selisih_int = pd.DataFrame()
+                    st.session_state.df_selisih_bnk = pd.DataFrame()
+                    st.session_state.df_invalid_int = pd.DataFrame()
+                    st.session_state.df_invalid_bnk = pd.DataFrame()
+                    st.session_state.summary = {}
+                    st.session_state.sudah_diproses = True
+                st.rerun()
+            except Exception as e:
+                st.session_state.sudah_diproses = False
+                st.error("❌ Terjadi kesalahan saat memproses INDOMARET.")
+                st.exception(e)
+                st.stop()
 
         # =====================================================
         # BRI TIKET — DEDICATED PIPELINE
@@ -11838,6 +12502,10 @@ if can_process:
 # ============================================================
 
 if st.session_state.sudah_diproses:
+
+    if pilihan_bank == "INDOMARET":
+        render_indomaret_dashboard()
+        st.stop()
 
     if pilihan_bank == "BRI TIKET":
         render_britiket_dashboard()
